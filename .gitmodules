@@ -84,3 +84,8 @@
 	url = https://github.com/ToolAssisted-run/chimera-core-pcsx2.git
 	branch = main
 	ignore = dirty
+[submodule "extern/cores/pinball"]
+	path = extern/cores/pinball
+	url = https://github.com/Randomno/pinballcore
+	branch = main
+	ignore = dirty
