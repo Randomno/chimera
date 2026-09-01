@@ -86,6 +86,6 @@
 	ignore = dirty
 [submodule "extern/cores/pinball"]
 	path = extern/cores/pinball
-	url = https://github.com/Randomno/pinballcore
+	url = https://github.com/Randomno/pinballcore.git
 	branch = main
 	ignore = dirty
