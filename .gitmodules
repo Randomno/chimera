@@ -93,3 +93,5 @@
 	path = extern/cores/xemu
 	url = https://github.com/ToolAssisted-run/chimera-core-xemu.git
 	branch = main
+[submodule "qemu"]
+	url = https://github.com/Randomno/chimera-core-qemu.git

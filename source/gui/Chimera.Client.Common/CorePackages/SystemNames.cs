@@ -47,6 +47,7 @@ namespace Chimera.Client.Common
 			["NES"] = "Nintendo Entertainment System",
 			["NGP"] = "Neo Geo Pocket",
 			["O2"] = "Magnavox Odyssey 2",
+			["PC"] = "IBM PC (QEMU)",
 			["PCE"] = "PC Engine / TurboGrafx-16",
 			["PCECD"] = "PC Engine CD",
 			["PCFX"] = "PC-FX",
