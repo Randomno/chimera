@@ -308,8 +308,8 @@ namespace Chimera.Emulation.Common.Waterbox
 		// clamped by the engine to the config's buffer; others equal the config.
 		public int BufferWidth => _session.Disposed ? _width : _session.VideoWidth;
 		public int BufferHeight => _session.Disposed ? _height : _session.VideoHeight;
-		public int VirtualWidth => _machine?.VirtualWidth ?? _cfg.Video.VirtualWidth;
-		public int VirtualHeight => _machine?.VirtualHeight ?? _cfg.Video.VirtualHeight;
+		public int VirtualWidth => _machine?.VirtualWidth ?? (_cfg.Video.VirtualWidth != 0 ? _cfg.Video.VirtualWidth : BufferWidth);
+		public int VirtualHeight => _machine?.VirtualHeight ?? (_cfg.Video.VirtualHeight != 0 ? _cfg.Video.VirtualHeight : BufferHeight);
 		public int BackgroundColor => unchecked((int)0xFF000000);
 		public int VsyncNumerator => _session.VsyncNumerator;
 		public int VsyncDenominator => _session.VsyncDenominator;
