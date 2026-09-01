@@ -27,8 +27,12 @@ namespace Chimera.Client.GUI
 		{
 			CloseRomMenuItem.ShortcutKeyDisplayString = Config.HotkeyBindings["Close ROM"];
 
-			// there is one thing to close, and it is the project
-			CloseRomMenuItem.Enabled = _openProject is not null;
+			// There is one thing to close, and it is the project - which is open
+			// exactly when TAStudio is (see CloseProject). Asked of the WINDOW as
+			// well as of the field: closing TAStudio closes the project, so an
+			// item still lit after that window has gone offers to close something
+			// that is not there, and clicking it did nothing except go grey.
+			CloseRomMenuItem.Enabled = _openProject is not null && Tools.IsLoaded<TAStudio>();
 
 			// SAVING IS THE PROJECT'S, and TAStudio is the window it is edited in:
 			// a project is open exactly when TAStudio is, so these ask it. Save is
@@ -76,6 +80,39 @@ namespace Chimera.Client.GUI
 		private void SaveProjectBackupMenuItem_Click(object sender, EventArgs e)
 		{
 			if (Tools.IsLoaded<TAStudio>()) Tools.TAStudio.SaveProjectBackup();
+		}
+
+		/// <summary>
+		/// The saving keys, answered here as well as in TAStudio - the same work
+		/// is reachable from either window, so the keys have to be too.
+		/// </summary>
+		/// <remarks>
+		/// The File menu's items carry these shortcuts already and it was not
+		/// enough: their Enabled state is computed when the menu DROPS DOWN, and
+		/// WinForms does not fire a disabled item's shortcut. So Ctrl+S on the main
+		/// window worked or did nothing depending on whether that menu had last
+		/// been opened with a project loaded - which is no way to save.
+		///
+		/// Answered from the tool rather than from the menu item, so the condition
+		/// is the project's own ("is there anything to save") and not a leftover
+		/// from the last time somebody looked at a menu.
+		/// </remarks>
+		protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+		{
+			var tastudio = Tools.IsLoaded<TAStudio>() ? Tools.TAStudio : null;
+			if (tastudio is not null)
+			{
+				switch (keyData)
+				{
+					case Keys.Control | Keys.S:
+						if (tastudio.HasUnsavedChanges) tastudio.SaveProject();
+						return true;
+					case Keys.Control | Keys.Shift | Keys.S:
+						tastudio.SaveProjectAs();
+						return true;
+				}
+			}
+			return base.ProcessCmdKey(ref msg, keyData);
 		}
 
 		private void CloseRomMenuItem_Click(object sender, EventArgs e)

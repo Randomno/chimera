@@ -1,4 +1,4 @@
-#nullable enable
+﻿#nullable enable
 
 using System;
 using System.Collections.Generic;
@@ -86,6 +86,7 @@ namespace Chimera.Client.GUI
 		private readonly ListView _firmwareList;
 		private readonly Button _firmwareSetButton;
 		private readonly Button _firmwareClearButton;
+		private readonly Func<string?>? _pickFirmwareFolder;
 		private List<FirmwareNeed> _firmwareNeeds = new();
 		private IReadOnlyList<FirmwareLocator.IndexedFile> _firmwareIndex = [ ];
 
@@ -96,7 +97,12 @@ namespace Chimera.Client.GUI
 			public string? ChosenPath; // for a pinned entry, set only when the hash matched exactly
 			public string? ChosenSha1; // the actual hash - equals the pin, or names an unpinned choice
 
-			public bool Satisfied => ChosenPath is not null;
+			/// <summary>
+			/// A file was chosen - or the core said it can start without one
+			/// (Required false), in which case absent is a fine answer and
+			/// the wizard must not stand in the way.
+			/// </summary>
+			public bool Satisfied => ChosenPath is not null || Decl?.Required == false;
 		}
 
 		private readonly Button _backButton;
@@ -120,10 +126,12 @@ namespace Chimera.Client.GUI
 			Func<ProjectSlotDeclaration.Slot, string[]> pickFiles,
 			Func<string, string?>? pickFirmwareFile = null,
 			IReadOnlyList<string>? firmwareSearchDirs = null,
+			Func<string?>? pickFirmwareFolder = null,
 			Func<string, string, string?>? rememberedFirmwarePath = null)
 		{
 			_pickFirmwareFile = pickFirmwareFile ?? (static _ => null);
 			_firmwareSearchDirs = firmwareSearchDirs ?? [ ];
+			_pickFirmwareFolder = pickFirmwareFolder;
 			_rememberedFirmwarePath = rememberedFirmwarePath ?? (static (_, _) => null);
 			_cores = cores.Where(static c => c.Error is null).ToList();
 			_pickFiles = pickFiles;
@@ -163,12 +171,30 @@ namespace Chimera.Client.GUI
 			}
 			p1.Controls.Add(_core);
 
-			p1.Controls.Add(MakeLabel("Renderer:", 8, 84));
-			_renderer = new ComboBox
+			// The core decides the systems, the system decides the renderers: the
+			// combos read top to bottom in the order they inform each other.
+			_machineLabel = MakeLabel("System:", 8, 84);
+			_machine = new ComboBox
 			{
 				Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
 				DropDownStyle = ComboBoxStyle.DropDownList,
 				Location = Pt(110, 80),
+				Width = UIHelper.ScaleX(442),
+			};
+			_machine.SelectedIndexChanged += (_, _) =>
+			{
+				PinMachine();
+				// a package that is several machines may offer different renderers
+				RefreshRendererChoices();
+			};
+			p1.Controls.AddRange([ _machineLabel, _machine ]);
+
+			p1.Controls.Add(MakeLabel("Renderer:", 8, 116));
+			_renderer = new ComboBox
+			{
+				Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
+				DropDownStyle = ComboBoxStyle.DropDownList,
+				Location = Pt(110, 112),
 				Width = UIHelper.ScaleX(442),
 			};
 			_renderer.SelectedIndexChanged += (_, _) =>
@@ -187,26 +213,10 @@ namespace Chimera.Client.GUI
 				Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
 				AutoSize = false,
 				ForeColor = SystemColors.GrayText,
-				Location = Pt(110, 106),
+				Location = Pt(110, 138),
 				Size = new(UIHelper.ScaleX(442), UIHelper.ScaleY(46)),
 			};
 			p1.Controls.Add(_rendererCaveat);
-
-			_machineLabel = MakeLabel("Machine:", 8, 160);
-			_machine = new ComboBox
-			{
-				Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
-				DropDownStyle = ComboBoxStyle.DropDownList,
-				Location = Pt(110, 156),
-				Width = UIHelper.ScaleX(442),
-			};
-			_machine.SelectedIndexChanged += (_, _) =>
-			{
-				PinMachine();
-				// a package that is several machines may offer different renderers
-				RefreshRendererChoices();
-			};
-			p1.Controls.AddRange([ _machineLabel, _machine ]);
 			p1.Controls.Add(MakeIssuesNotice());
 			_core.SelectedIndexChanged += (_, _) => LoadChosenPackage();
 			if (_core.Items.Count is not 0) _core.SelectedIndex = 0;
@@ -266,7 +276,10 @@ namespace Chimera.Client.GUI
 			_firmwareSetButton.Click += (_, _) => SetFirmwareFile();
 			_firmwareClearButton = new Button { AutoSize = true, Location = Pt(110, 344), Text = "Clear" };
 			_firmwareClearButton.Click += (_, _) => ClearFirmwareFile();
-			p4.Controls.AddRange([ _firmwareList, _firmwareSetButton, _firmwareClearButton ]);
+			Button firmwareScanButton = new() { AutoSize = true, Location = Pt(178, 344), Text = "Scan Folder..." };
+			firmwareScanButton.Click += (_, _) => ScanFirmwareFolder();
+			firmwareScanButton.Visible = pickFirmwareFolder is not null;
+			p4.Controls.AddRange([ _firmwareList, _firmwareSetButton, _firmwareClearButton, firmwareScanButton ]);
 
 			// ---- chrome ----------------------------------------------------------
 			// Width is set below, once the buttons have been placed: a fixed one
@@ -400,11 +413,15 @@ namespace Chimera.Client.GUI
 			if (machines is { Count: > 0 })
 			{
 				foreach (var machine in machines) _machine.Items.Add(machine.DisplayName);
-				_machine.SelectedIndex = 0;
 			}
-			var several = _machine.Items.Count > 1;
-			_machine.Visible = several;
-			_machineLabel.Visible = several;
+			else if (core is not null)
+			{
+				// a package that is one machine still says which machine it is
+				_machine.Items.Add(SystemNames.Of(core.Systems));
+			}
+			if (_machine.Items.Count is not 0) _machine.SelectedIndex = 0;
+			// one system is not a choice, and a disabled box still says what it is
+			_machine.Enabled = _machine.Items.Count > 1;
 			PinMachine();
 			RefreshRendererChoices();
 		}
@@ -469,7 +486,7 @@ namespace Chimera.Client.GUI
 			var extension = Path.GetExtension(path).TrimStart('.').ToLowerInvariant();
 			var slots = _declaration!.Slots;
 			var match = slots.FirstOrDefault(slot =>
-				slot.Formats.Any(f => string.Equals(f, extension, StringComparison.OrdinalIgnoreCase)));
+				ForMachine(slot).Formats.Any(f => string.Equals(f, extension, StringComparison.OrdinalIgnoreCase)));
 			return (match ?? slots[0]).Id;
 		}
 
@@ -864,8 +881,19 @@ namespace Chimera.Client.GUI
 			_slotLists.Clear();
 			_slotGroups.Clear();
 			var y = 0;
-			foreach (var slot in _declaration!.Slots)
+			// What the chosen MACHINE exposes, before any file is picked. A slot
+			// only a different sub-system takes is not an option that is greyed -
+			// it is not an option at all, so it is not shown. Slots gated by other
+			// slots' CONTENTS stay: those come back when a file is unloaded, and a
+			// row that vanishes underfoot explains nothing.
+			var machineExposed = EngineSlotsGate.Evaluate(
+				_declaration!.RawJson,
+				CurrentSlotsJson(),
+				Newtonsoft.Json.JsonConvert.SerializeObject(EffectiveSettings()));
+			foreach (var declared in _declaration!.Slots)
 			{
+				if (declared.SettingGatedOnly && !machineExposed.Contains(declared.Id)) continue;
+				var slot = ForMachine(declared);
 				GroupBox group = new()
 				{
 					Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
@@ -934,6 +962,34 @@ namespace Chimera.Client.GUI
 				: new(_settings?.Values ?? new System.Collections.Generic.Dictionary<string, object>());
 
 		/// <summary>
+		/// A slot's formats as the chosen machine has them. A package that is
+		/// several machines declares which rom extensions each machine claims,
+		/// and a slot offering any of them is narrowed to the claimed ones: a
+		/// Famicom Disk System project takes .fds and nothing else, a Genesis
+		/// project does not offer .sms. A slot the machine claims none of (save
+		/// data, patches) is not the machine's to narrow and keeps its own list.
+		/// </summary>
+		private ProjectSlotDeclaration.Slot ForMachine(ProjectSlotDeclaration.Slot slot)
+		{
+			var machine = _cfg?.MachineFor(EffectiveSettings());
+			if (machine?.Extensions is not { Count: > 0 } || slot.Formats.Count is 0) return slot;
+			var claimed = slot.Formats
+				.Where(f => machine.Extensions.ContainsKey("." + f.ToLowerInvariant()))
+				.ToList();
+			if (claimed.Count is 0 || claimed.Count == slot.Formats.Count) return slot;
+			return new()
+			{
+				Id = slot.Id,
+				Title = slot.Title,
+				Min = slot.Min,
+				Max = slot.Max,
+				Formats = claimed,
+				Help = slot.Help,
+				SettingGatedOnly = slot.SettingGatedOnly,
+			};
+		}
+
+		/// <summary>
 		/// The slots themselves join the decision tree: a slot's exposedWhen is
 		/// evaluated over the CURRENT picks, so filling one slot can make
 		/// another unavailable until it is unloaded (a Famicom disk rules out
@@ -958,6 +1014,18 @@ namespace Chimera.Client.GUI
 					? (string)group.Tag!
 					: $"{(string)group.Tag!} - unavailable with the current files";
 			}
+		}
+
+		/// <summary>Whether a slot is on the form at all, for tests: a slot only
+		/// a different machine takes is not rendered, where one ruled out by the
+		/// current FILES stays visible and greyed.</summary>
+		public bool SlotRendered(string slotId) => _slotGroups.ContainsKey(slotId);
+
+		/// <summary>The formats a slot offers as the chosen machine narrows them, for tests.</summary>
+		internal IReadOnlyList<string> OfferedFormats(string slotId)
+		{
+			var slot = _declaration?.Slots.FirstOrDefault(s => s.Id == slotId);
+			return slot is null ? [ ] : ForMachine(slot).Formats;
 		}
 
 		/// <summary>Whether a slot currently accepts files, for tests.</summary>
@@ -1019,7 +1087,8 @@ namespace Chimera.Client.GUI
 			// knows better than this form does. So an unexpected extension is
 			// SAID rather than refused - the complaint a mis-drop would otherwise
 			// become is an engine error at Create, long after the mistake.
-			var slot = _declaration?.Slots.FirstOrDefault(s => s.Id == slotId);
+			var declared = _declaration?.Slots.FirstOrDefault(s => s.Id == slotId);
+			var slot = declared is null ? null : ForMachine(declared);
 			var extension = Path.GetExtension(name).TrimStart('.');
 			_status.Text = slot is { Formats.Count: > 0 }
 				&& !slot.Formats.Any(f => string.Equals(f, extension, StringComparison.OrdinalIgnoreCase))
@@ -1065,7 +1134,9 @@ namespace Chimera.Client.GUI
 		{
 			foreach (var slot in _declaration!.Slots)
 			{
-				var count = _slotLists[slot.Id].Items.Count;
+				// a slot the machine hides was never rendered, and demands nothing
+				if (!_slotLists.TryGetValue(slot.Id, out var list)) continue;
+				var count = list.Items.Count;
 				if (count < slot.Min && SlotAvailable(slot.Id)) return $"{slot.Title}: needs {slot.CardinalityText}, has {count}";
 				if (slot.Max >= 0 && count > slot.Max) return $"{slot.Title}: takes {slot.CardinalityText}, has {count}";
 			}
@@ -1119,9 +1190,9 @@ namespace Chimera.Client.GUI
 			var declarations = exposed
 				.Where(entry => entry.Index >= 0 && entry.Index < all.Count && all[entry.Index].Name == entry.Name)
 				.Select(entry => all[entry.Index])
-				// ...except the renderer, which is asked beside the core on page one
-				// and would only be asked twice here
-				.Where(static decl => decl.Name != RendererSetting)
+				// ...except the renderer and the machine, which are asked beside
+				// the core on page one and would only be asked twice here
+				.Where(decl => decl.Name != RendererSetting && decl.Name != _cfg.MachineSetting)
 				.ToList();
 			var current = _settings.Declarations;
 			if (current is not null && current.Count == declarations.Count
@@ -1226,9 +1297,9 @@ namespace Chimera.Client.GUI
 				};
 				item.SubItems.Add(need.Decl?.Name ?? "");
 				item.SubItems.Add(string.IsNullOrEmpty(need.Decl?.Sha1) ? "(your own dump)" : need.Decl!.Sha1);
-				item.SubItems.Add(need.Satisfied
+				item.SubItems.Add(need.ChosenPath is not null
 					? $"found: {Path.GetFileName(need.ChosenPath)}"
-					: "not found");
+					: need.Satisfied ? "optional - core default used" : "not found");
 				_firmwareList.Items.Add(item);
 			}
 			if (_firmwareNeeds.Count is 0)
@@ -1298,6 +1369,63 @@ namespace Chimera.Client.GUI
 			RenderFirmwareRows();
 		}
 
+		/// <summary>
+		/// "My files are somewhere in here": scans a folder (subfolders
+		/// included) and fills every requirement it can. A hash-pinned
+		/// requirement takes only its exact file, any name; an unpinned one
+		/// takes the file bearing its declared name, hashed and recorded like
+		/// any hand-picked choice. What the user already chose is left alone.
+		/// </summary>
+		private void ScanFirmwareFolder()
+		{
+			var folder = _pickFirmwareFolder?.Invoke();
+			if (folder is null) return;
+			UseWaitCursor = true;
+			try
+			{
+				var found = Chimera.Client.Common.ProjectFolderScan
+					.Enumerate(folder)
+					.Take(Chimera.Client.Common.ProjectFolderScan.MaxFiles)
+					.ToList();
+				// one hashed index answers every pinned requirement
+				var index = FirmwareLocator.BuildIndex([ ], found);
+				_firmwareIndex = _firmwareIndex.Concat(index).ToList();
+				var filled = 0;
+				foreach (var need in _firmwareNeeds)
+				{
+					if (need.ChosenPath is not null || need.Decl is null) continue;
+					if (!string.IsNullOrEmpty(need.Decl.Sha1))
+					{
+						if (FirmwareLocator.FindFor(need.Decl, index) is { } match)
+						{
+							need.ChosenPath = match.Path;
+							need.ChosenSha1 = match.Sha1;
+							filled++;
+						}
+						continue;
+					}
+					// unpinned: the declared file name is the only lead - and it
+					// also reaches files too large for the hash index (a disk
+					// image). ProvideFirmware hashes and records it properly.
+					var name = need.Decl.Name;
+					if (string.IsNullOrEmpty(name)) continue;
+					var named = found.FirstOrDefault(f =>
+						System.IO.Path.GetFileName(f).Equals(name, StringComparison.OrdinalIgnoreCase));
+					if (named is null) continue;
+					ProvideFirmware(need.Id, named);
+					if (need.ChosenPath is not null) filled++;
+				}
+				_status.Text = filled is 0
+					? $"scanned {found.Count} files; nothing new matched"
+					: $"scanned {found.Count} files; {filled} requirement{(filled is 1 ? "" : "s")} resolved";
+			}
+			finally
+			{
+				UseWaitCursor = false;
+			}
+			RenderFirmwareRows();
+		}
+
 		private void ClearFirmwareFile()
 		{
 			if (SelectedFirmwareNeed() is not { } need) return;
@@ -1353,7 +1481,8 @@ namespace Chimera.Client.GUI
 			{
 				foreach (var slot in _declaration!.Slots)
 				{
-					foreach (var file in _slotLists[slot.Id].Items.OfType<PickedFile>())
+					if (!_slotLists.TryGetValue(slot.Id, out var list)) continue;
+					foreach (var file in list.Items.OfType<PickedFile>())
 					{
 						project.FileAdd(file.Name, slot.Id, file.Path);
 					}
@@ -1379,14 +1508,22 @@ namespace Chimera.Client.GUI
 							? value
 							: decl.DefaultValue;
 				}
-				// the renderer is not in that list - it is chosen on page one - but it
-				// is a setting like any other and the project records it the same way
+				// the renderer and the machine are not in that list - both are
+				// chosen on page one - but they are settings like any other and
+				// the project records them the same way; the machine especially,
+				// because the slot gates and the engine's own validation read it
 				if (RendererDecl() is { } rendererDecl)
 				{
 					recorded[rendererDecl.Name] = _settings?.Values is not null
 						&& _settings.Values.TryGetValue(rendererDecl.Name, out var chosen)
 							? chosen
 							: rendererDecl.DefaultValue;
+				}
+				if (_cfg?.MachineSetting is { Length: not 0 } machineSetting
+					&& _settings?.Values is not null
+					&& _settings.Values.TryGetValue(machineSetting, out var pinnedMachine))
+				{
+					recorded[machineSetting] = pinnedMachine;
 				}
 				if (recorded.Count is not 0)
 					project.SetSettingsJson(Newtonsoft.Json.JsonConvert.SerializeObject(recorded));

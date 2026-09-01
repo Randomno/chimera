@@ -85,7 +85,12 @@ namespace Chimera.Client.GUI
 			BeginInvoke((Action) (() =>
 			{
 				if (session != _projectSession) return;
-				if (!Emulator.IsNull()) CloseProject();
+				// Not "is there still a machine": the PROJECT is what is being
+				// let go of, and it can outlive the machine. A queued close that
+				// arrives once the emulator has already gone still has a project
+				// to release, and leaving it held is a file kept open for a
+				// session that ended.
+				if (_openProject is not null || !Emulator.IsNull()) CloseProject();
 			}));
 		}
 
@@ -141,6 +146,14 @@ namespace Chimera.Client.GUI
 					return dialog.ShowDialog(this) is DialogResult.OK ? dialog.FileName : null;
 				},
 				firmwareSearchDirs: [ Config.PathEntries.FirmwareAbsolutePath() ],
+				pickFirmwareFolder: () =>
+				{
+					using FolderBrowserDialog picker = new()
+					{
+						Description = "Scan a folder for firmware files",
+					};
+					return picker.ShowDialog(this) is DialogResult.OK ? picker.SelectedPath : null;
+				},
 				rememberedFirmwarePath: (coreName, id) =>
 					Config.CoreFirmware.TryGetValue(CoreFirmwareStore.KeyFor(coreName, id), out var remembered)
 						? remembered
@@ -223,12 +236,26 @@ namespace Chimera.Client.GUI
 				{
 					using OpenFileDialog picker = new() { Title = title };
 					return picker.ShowDialog(this) is DialogResult.OK ? picker.FileName : null;
+				},
+				locateFolder: () =>
+				{
+					using FolderBrowserDialog picker = new()
+					{
+						Description = "Scan a folder for the project's files",
+					};
+					return picker.ShowDialog(this) is DialogResult.OK ? picker.SelectedPath : null;
 				});
 				if (dialog.ShowDialog(this) is not DialogResult.OK)
 				{
 					project.Dispose();
 					return false;
 				}
+				// The user just did real work in that dialog; it outlives any
+				// failure below (a missing core, missing firmware - the boot can
+				// still refuse for its own reasons). The sidecar is a hint the
+				// next load verifies by hash, so recording it early risks
+				// nothing, and losing it meant answering every row again.
+				local.Save(path, project);
 			}
 
 			// the firmware the project pins is looked for where this machine last
@@ -291,6 +318,13 @@ namespace Chimera.Client.GUI
 			// load, TAStudio open, tasproj load - each a full core init).
 			if (MovieSession.Get(path, loadMovie: saved) is not ITasMovie tasMovie)
 			{
+				// Never end in silence: everything above showed a dialog when it
+				// refused, and a user who just answered the resolution dialog is
+				// owed more than nothing happening (issue #21 was exactly this).
+				ShowMessageBox(
+					owner: null,
+					$"'{Path.GetFileName(path)}' could not be read as a project.",
+					"Cannot open the project");
 				return false;
 			}
 			// the movie adopts the RESOLVED project, so its saves record what

@@ -40,7 +40,13 @@ namespace Chimera.Emulation.Common.Waterbox
 				foreach (var machine in _cfg.Machines)
 				{
 					if (string.IsNullOrEmpty(machine.Id)) throw new InvalidOperationException($"{ConfigFileName}: a machine has no id");
-					if (machine.Input?.Buttons is null) throw new InvalidOperationException($"{ConfigFileName}: machine \"{machine.Id}\" has no controller");
+					// a machine without its own controller uses the package's -
+					// dolphin's GameCube and Wii share one pad - so only a machine
+					// with NO controller anywhere is a broken declaration
+					if (machine.Input?.Buttons is null && _cfg.Input?.Buttons is null)
+					{
+						throw new InvalidOperationException($"{ConfigFileName}: machine \"{machine.Id}\" has no controller, and the package declares none to fall back on");
+					}
 				}
 			}
 			else if (string.IsNullOrEmpty(_cfg.SystemId))
@@ -163,10 +169,17 @@ namespace Chimera.Emulation.Common.Waterbox
 				if (decl is null || decl.Id != id) decl = Firmware.FirstOrDefault(d => d.Id == id);
 				if (decl is null) continue;
 				used.Add(decl);
-				var bytes = ctx.FirmwareProvider?.Invoke(decl)
-					?? throw new MissingFirmwareException(
+				var bytes = ctx.FirmwareProvider?.Invoke(decl);
+				if (bytes is null)
+				{
+					// A declaration may say the core can start without it
+					// (an optional identity file, an expansion rom); absent
+					// simply means not mounted, and the core carries on.
+					if (!decl.Required) continue;
+					throw new MissingFirmwareException(
 						$"{CoreName} needs firmware that has not been provided: {decl.DisplayName}."
 							+ " Open the project again and satisfy its firmware page.");
+				}
 				resolved[decl.Id] = bytes;
 			}
 			return resolved;

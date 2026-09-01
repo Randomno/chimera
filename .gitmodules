@@ -89,3 +89,7 @@
 	url = https://github.com/Randomno/pinballcore.git
 	branch = main
 	ignore = dirty
+[submodule "extern/cores/xemu"]
+	path = extern/cores/xemu
+	url = https://github.com/ToolAssisted-run/chimera-core-xemu.git
+	branch = main

@@ -594,6 +594,13 @@ CE_API int32_t ce_package_is_waterbox(const ce_package *p);
 
 CE_API int32_t ce_package_has_entry(ce_package *p, const char *name);
 
+/* Core-owned asset files: every entry under "assets/", sorted. A waterbox
+ * session mounts each one at its path with the "assets" prefix dropped, so
+ * a package carrying assets/sys/GC/font.bin gives its guest /sys/GC/font.bin.
+ * The names stay valid until the package is freed. */
+CE_API int32_t ce_package_asset_count(ce_package *p);
+CE_API const char *ce_package_asset_name(ce_package *p, int32_t i);
+
 /* The entry's bytes (decompressed from the zip, or the file in the directory
  * form). NULL when absent or unreadable (see _last_error to tell which;
  * absent is ""). Invalidated by the next entry read on the same package. */
@@ -730,6 +737,15 @@ CE_API const char *ce_session_axis_name(const ce_session *s, int64_t index);
  * order are the declaration's, so ce_session_set_button and every core's own
  * wire enum are untouched by any of this. A core that exports neither answer
  * has all of its controls, which is what every core had before this existed. */
+/* Drive lights: one per medium the machine has (a disc, a hard disk), lit on
+ * any frame that drive was read or written. A core that exports none has none,
+ * and the count is zero - which is what a machine with no removable media
+ * should show, rather than an icon that never lights. Names are settled at
+ * load; the light is asked every frame. */
+CE_API int32_t ce_session_drive_count(const ce_session *s);
+CE_API const char *ce_session_drive_name(const ce_session *s, int32_t index);
+CE_API int32_t ce_session_drive_light(const ce_session *s, int32_t index);
+
 CE_API int32_t ce_session_button_active(const ce_session *s, int64_t index);
 CE_API int32_t ce_session_axis_active(const ce_session *s, int64_t index);
 
