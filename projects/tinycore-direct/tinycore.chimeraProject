@@ -1,0 +1,24 @@
+{
+  "title": "TinyCore direct boot",
+  "core": {
+    "name": "qemu",
+    "version": "",
+    "sha1": "ECA395794A9A2AADCDA4BDC6A52FEE68FAB5C752"
+  },
+  "files": [
+    {
+      "name": "vmlinuz64",
+      "sha1": "473C9B42733FB6F95FFABA02F4E4131FC83429F6",
+      "slot": "kernel"
+    },
+    {
+      "name": "corepure64.gz",
+      "sha1": "F7FF3D22DE14BEA22F690604454D2730097040FE",
+      "slot": "initrd"
+    }
+  ],
+  "settings": {
+    "ramMiB": "256"
+  },
+  "input": "[Input]\nLogKey:\n[/Input]\n"
+}
