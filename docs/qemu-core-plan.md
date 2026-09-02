@@ -1,172 +1,172 @@
-# A QEMU core - analysis and plan
+# A QEMU core - status and plan
 
 Mainline QEMU as a Chimera waterbox core, after the xemu port. xemu IS a QEMU
 (10.2.0 base) already proven inside miniBox, so this port is mostly *the same
 mechanisms pointed at a different machine*: instead of an Xbox it is a PC
 (`pc` i440fx, TCG, one vCPU, icount), and instead of copyrighted console
 firmware it boots free software end to end - SeaBIOS bundled as a package
-asset, a small Linux distro as the disc. The goal for now: **boot a small
-Linux distro to a shell inside the Chimera GUI**, deterministically, with
-savestates and movies.
+asset, a small Linux distro as the disc.
 
-- New repository `chimera-core-qemu` (mirrors `chimera-core-xemu`), submodule
-  at `extern/cores/qemu`, nested `extern/qemu` pinned to the same QEMU
-  release family xemu rides (10.2.x) so the xemu patches port near-verbatim.
+**The original goal - boot a small Linux distro to a shell inside the Chimera
+GUI, deterministically, with savestates and movies - is MET.** TinyCore
+CorePure64 17.1 boots to `tc@box:~$` through the real frontend, and the
+frontend's machine is byte-identical to the bare sandbox's at every layer
+checked. What remains is performance (the disc path) and, beyond it, a full
+distro running real software.
+
+- Core repository `chimera-core-qemu` (mirrors `chimera-core-xemu`), submodule
+  at `extern/cores/qemu`, nested `extern/qemu` pinned to the same QEMU release
+  family xemu rides (10.2.x).
 - The frontend's share is one line (`PC` in SystemNames); everything else
   rides the package, like xemu.
 
-## Decisions up front
+## Machine identity (decided, movies cite it)
 
-| Question | Answer | Why |
-|---|---|---|
-| Target binary | `qemu-system-x86_64` (x86_64-softmmu) | modern small distros (Alpine, TinyCore) are x86_64; the port surface (accel/tcg, target/i386 SSE helpers, block, main loop) is the same one xemu proved on i386-softmmu |
-| Machine | `pc` (i440fx), 1 vCPU, fixed `-cpu` (no `rdrand`/`rdseed`), `-icount shift=0,sleep=off`, `-rtc base=2000-01-01,clock=vm` | the xemu argument list, verbatim philosophy; SMP>1 under green threads is scheduling-nondeterminism for nothing |
-| ROM slot | the distro ISO (El Torito), `min 1` | one file = the wizard story; direct `-kernel` boot stays available as a gate leg |
-| Firmware | none from the user - SeaBIOS (`bios-256k.bin`, vgabios, `linuxboot_dma.bin`) rides the package **assets channel** (82aef36), mounted by name at Init | SeaBIOS is LGPL-3.0: the first Chimera machine whose boot firmware can ship in the package. `package-licenses.json` carries the terms |
-| Video | VGA scanout: per-frame `graphic_hw_update(console 0)` → pixman → BGRA | xemu M2's mechanism; text mode included (ui/console renders the glyphs), no GL bridge needed - a distro console is CPU-drawn |
-| Input | PS/2 keyboard: declared buttons in qcode order; keys sent as `qemu_input_event_send_key_qcode` press/release diffs at the frame boundary, machine paused | the device pushes (it does not poll), and the boundary is a pure virtual instant, so delivery order is deterministic; 100+ keys ride `SetButton`, a packed word is useless here (64-bit) |
-| Audio | deferred (AC97/SB16 need the xemu-APU-style virtual-clock treatment) | not needed to boot a distro; `audio.get` omitted until then |
-| systemId | `PC` -> "IBM PC (QEMU)" | no collision in SystemNames; `.iso` already routes to XBOX by first-declared (db0a53f), so the wizard's system picker is the entry |
-| Frame quantum | VGA 60 Hz: `VBLANK_NS 16666667`, vsync `1000000000/16666667` | a PC under `-display none` has no refresh timer either - the driver's one-shot virtual timer IS the vblank, exactly xemu's model |
-| Memory layout | start from xemu's `[512, 16, 128, 256, 2048]`, prove and tune with run-wbx | mainline QEMU minus the Xbox devices is slimmer, but machine RAM (say 256MB) rides the mmap arena like xbox.ram did |
+| Knob | Value |
+|---|---|
+| Machine / CPU | `pc` (i440fx), 1 vCPU, TCG, `-cpu qemu64` (no `rdrand`/`rdseed`) |
+| icount | `shift=2` (a 250MHz-class virtual CPU) - halves firmware poll cost per frame |
+| Governor | period 1ms (`GOVERNOR_NS 1000000`) |
+| Boot order | `-boot order=d` (don't walk floppy/hard disk first) |
+| Frame quantum | VGA 60 Hz: `VBLANK_NS 16666667`, vsync `1000000000/16666667` |
+| RTC | `base=2000-01-01,clock=vm` |
+| RAM | 256 MiB default (`ramMiB` setting: 128/256/512) |
+| Memory layout | `[512, 16, 128, 256, 2048]` MiB (xemu's numbers, proven at this scale) |
+| Video | VGA scanout per frame → pixman → BGRA; text mode included |
+| Input | PS/2 keyboard, buttons in QKeyCode order, press/release diffs at the paused frame boundary |
+| Firmware | SeaBIOS + VGABIOS + linuxboot_dma ride the package **assets channel** (LGPL, shippable) |
 
-## What transfers, what is new
+## What transfers, what is new (from the xemu port - kept for reference)
 
-The xemu port splits cleanly into "core QEMU machinery" (ports near-verbatim)
-and "Xbox devices" (not needed at all). Patch by patch:
+- **Ported near-verbatim:** canonical state (migration/savevm host-clock
+  deltas), the TLS wall (coroutine-tls over pthread keys, `-D__thread=` sweep,
+  PIXMAN_NO_TLS), warp-only-on-halt, MAP_STACK, the headless build ideas.
+- **Copied and adjusted:** `guest-ucontext.c`, `guest-syscalls.c` (yielding
+  ppoll, deterministic getrandom, fake eventfd/pipe/signalfd),
+  `chimera-latency.c` (block requests complete at the NEXT FRAME BOUNDARY,
+  writes to an in-memory COW overlay), the `qemu-waterbox.c` driver itself.
+- **Xbox-only, stayed home:** APU virtual clock, pfifo, the GL bridge,
+  NV2A anything.
+- **New for the PC:** the input push model (i8042 is event-driven; keys are
+  `qemu_input_event_send_key_qcode` diffs pushed after `vm_start` - pushing
+  while paused silently drops events), no-`rdrand` CPUID, direct kernel boot
+  (below), and the QEMU-side determinism fixes found by the gate:
+  - *ram_save_iterate MAX_WAIT*: the save path broke out of the RAM-section
+    loop on a 50ms host wall-clock threshold, splitting the section at
+    host-speed-dependent points (native and sandbox framed the same bytes
+    differently). Patch 0008: the bail-out is compiled out under
+    `CHIMERA_WATERBOX`.
+  - *ATA SRST completion* had to become synchronous (patch 0007).
+  - *The initrd is read, not mapped* (patch 0009): `mmap` of a mounted file is
+    not a thing in the sandbox VFS.
 
-- **0006 canonical state** (migration/savevm.c, system/cpu-timers.c: host-clock
-  deltas canonicalised) - ports verbatim. Also unlocks the gate: a dumpable,
-  comparable migration stream.
-- **0007 the TLS wall** (coroutine-tls over pthread keys, `current_cpu` behind
-  an accessor, `-D__thread=` sweep, PIXMAN_NO_TLS) - ports verbatim; mainline's
-  TLS symbol set is close to xemu's 26. `readelf -sW core.wbx | awk '$4=="TLS"'`
-  stays empty, check-wbx enforces.
-- **0008 warp only on halt + ptimer respin** - the `accel/tcg` half (a merely
-  STOPPED cpu must not count as idle) ports verbatim; the NV2A PTIMER half is
-  Xbox-only.
-- **0010 MAP_STACK** (util/oslib-posix.c: QEMU's stack allocations must say so)
-  - verbatim.
-- **0001-0003 headless build** - mostly unnecessary: mainline builds headless
-  stock (`--disable-sdl`, `-display none`). Only the disk-latency wiring of
-  0003 and small `vl.c`/net tweaks carry ideas over.
-- **0004 (APU virtual clock), 0005 (pfifo), 0009 (GL bridge)** - Xbox devices;
-  not needed for a VGA-console PC.
-- Driver sources: `guest-ucontext.c` (70-line makecontext/swapcontext),
-  `guest-syscalls.c` (fake eventfd/pipe/signalfd, yielding ppoll, preadv/pwrite,
-  deterministic getrandom, sigsetjmp alias), `chimera-latency.c` (every block
-  request completes at the NEXT FRAME BOUNDARY, writes to an in-memory COW
-  overlay) - these are target-agnostic QEMU machinery: copy, then adjust.
-  `det-pow.c`, `samplerate/`, `monitor-null.c`, the whole GL stack: stay home.
-- The driver itself (`qemu-waterbox.c`): the frame loop, warp governor,
-  frame_boundary vm_stop dance, `Init/FrameAdvance/GetStateSize/GetStateData/
-  GetLoadError`, memory domains (`pc.ram` is the real block on a PC - no decoy),
-  video via the console surface - all lift from `xemu-waterbox.c` with the Xbox
-  input/UI hooks deleted and the PC argument list in their place.
+## Two boot legs, two file conventions
 
-New work, none of it novel:
+1. **Direct kernel boot (the fast leg).** The project fills `kernel` and
+   `initrd` slots; `linuxboot_dma` loads them over fw_cfg DMA - no firmware
+   disc traffic at all. TinyCore reaches its shell in 3000 frames (~1 min
+   wall). This is the default project (`~/chimera/projects/tinycore-direct`)
+   and the iteration path.
+2. **Disc boot (El Torito through SeaBIOS).** The project fills the `disc`
+   slot. Deterministic and gated, but slow - see the performance section; this
+   is the blocking work item.
 
-1. **The input push model.** xemu's pads are polled state; the PC's i8042 is
-   event-driven. FrameAdvance diffs the declared key set and emits key events
-   while paused - `qemu_input_event_send_key_qcode` per changed key, scancode
-   set 2 through ps2. Keyboard LEDs and the ctrl-alt-shift mega-keys are the
-   only subtleties; the gate holds a key down and demands the machine diverge
-   from the plain run exactly while held (xemu's input leg, same shape).
-2. **Guest-visible randomness.** `xemu` never hit this: Xbox software does not
-   `rdrand`, Linux does. QEMU's TCG `rdrand` helper draws host randomness -
-   guest-visible nondeterminism, breaking native A == B at the first kernel
-   entropy touch. Two layers: (a) don't expose `rdrand`/`rdseed` in the `-cpu`
-   model; (b) if the kernel then starves CRNG init (boot hangs on `getrandom`),
-   patch the helper under `CHIMERA_GUEST` to a fixed-seed PRNG - the guest-side
-   twin of `guest-syscalls.c`'s deterministic getrandom.
-3. **MXCSR at PC scale.** xemu's lesson 16 applies *more* here: x86-64
-   userspace sets MXCSR constantly (glibc SSE), and TCG's ldmxcsr helper
-   executes on the host, so the emulator's own float math inherits guest
-   rounding on any thread that ran guest code - in the sandbox that is every
-   green thread. Audit QEMU's own float paths (timekeeping, block math) and pin
-   default MXCSR around them, the way `apu_vframe_tick` did.
-4. **SeaBIOS + distro boot determinism audit.** Everything SeaBIOS reads is
-   fw_cfg or the emulated RTC (virtual, base pinned); SMBIOS/UUID defaults are
-   fixed when unspecified. Watch: PIT/HPET periodic timers advancing by
-   ABSOLUTE deadline (xemu mechanism 8), and the El Torito reads completing at
-   frame boundaries through the block filter.
+File-name conventions the driver understands (it parses the mounted `slots`
+map at Init, falling back to the flat names): project files mount under their
+canonical names (`vmlinuz64`), and the engine additionally mounts the first
+non-support file as `rom`/`rom.name` - the driver treats a kernel-slot primary
+as a direct boot, not as a CD, and a project without a disc gets an empty
+drive (an empty drive is a valid machine: SeaBIOS reports no bootable device).
 
-## Milestones
+## Milestones - all done
 
-- **M0 - deps and skeleton.** Repo, submodules, `setup-guest.sh`/
-  `setup-native.sh`/`build-deps.sh` copied from xemu (zlib, glib + pcre2/
-  libffi wraps, pixman - SHA-pinned, static musl). Pin `extern/qemu` at the
-  10.2.x release matching xemu's base; apply-patches.sh starts its numbered
-  series with the four verbatim ports.
-  Gate: guest `qemu-system-x86_64` links, `check-wbx.sh` clean.
-  **DONE (53780b1).** Seven-patch series (four verbatim ports plus the
-  pixman-shareable, ATA-SRST, QAPI-latency and driver-build patches), both
-  builds green, `check-wbx.sh` clean. Guest-deps wrinkle worth remembering:
-  the host's `/usr/include/linux` must be overwritten by QEMU's bundled
-  `linux-headers/` copies or the guest build breaks on iommufd.
-- **M1 - headless boot, native==sandbox.** Driver: frame loop, governor,
-  boundary, migration-stream exports. Boot SeaBIOS (assets) with no disc to
-  the "no bootable device" screen, then `-kernel` a pinned buildroot/busybox
-  image as the simplest Linux leg. `run-gate.sh N`: native A == B ==
-  sandbox, byte for byte, at 60 and 600 frames.
-  **DONE IN SUBSTANCE at 120 frames (chimera-core-qemu 5c78986).** Native
-  A == B == sandbox, byte for byte, state stream and video, savestates
-  exact, with the Alpine ISO attached from frame 0 (SeaBIOS through El
-  Torito - i.e. the M2 disc path too). Two determinism bugs found and fixed
-  on the way: timer-offset canonicalisation needed the `CHIMERA_WATERBOX`
-  guard (patch 0002), and ATA SRST completion had to become synchronous
-  (patch 0007) - found by TB-trace bisection at the first divergent guest
-  instruction. Not yet done to the letter: the 600-frame (and longer) gate
-  points, and the separate no-disc / `-kernel` legs (skipped in favour of
-  the real ISO, which exercises strictly more).
-- **M2 - the distro.** ISO slot + El Torito through the latency filter, PS/2
-  input, `pc.ram` domain, savestate rerecord around every frame, arena
-  snapshot byte-identical. Gate: Alpine (or TinyCore) ISO boots to a busybox
-  shell; a held key changes the machine exactly while held; native ==
-  sandbox under the press.
-  **BOOT TO SHELL GATED (314ecd1).** Direct kernel boot (-kernel via
-  linuxboot_dma, no firmware disc polling) takes TinyCore to `tc@box:~$`
-  in ~30s wall / 3000 frames in the deterministic configuration, and
-  native == sandbox byte-for-byte on state and video at that point. The
-  disc path is gated to 6000 frames (deep into Linux userspace, byte
-  exact) but the shell via the disc still costs ~15-25 min of wall clock:
-  boot firmware polls the IDE status port for the whole boundary-quantized
-  disc latency, and that polling is emulated device traffic. The known
-  structural fix - anchoring disc completions to a short fixed virtual
-  delay measured at the device-instruction instant (IDE-level pacing,
-  not the block filter, whose clock reads are host-fuzzy) - is deferred
-  by design. Machine identity notes: icount shift=2 (a 250MHz-class
-  CPU), governor period 1ms, -boot order=d. Open oddity, parked: under
-  icount the disc path sat at Alpine's ISOLINUX `boot:` prompt for 100
-  virtual seconds where full-speed runs time out in ~20s - unexplained,
-  not blocking (input delivery itself is verified: the scancode reaches
-  ps2 and is read by the guest).
-- **M3 - a real core package.** `waterbox.config` (video buffer cap
-  1280x1024 for VESA modes, 60 Hz vsync from `VBLANK_NS`), `file_slots.json`
-  (the disc), keybinds, licences (GPL-2.0 QEMU + LGPL SeaBIOS), build.json
-  provenance, `SystemNames` line. `run-frontend.sh`: the GUI boots the distro
-  headless (Xvfb), the frontend machine's `pc.ram` slice equals run-wbx's,
-  and a typed key lands in the guest.
+- **M0 - deps and skeleton - DONE (53780b1).** Seven-patch series, both builds
+  green, `check-wbx.sh` clean. Remember: the host's `/usr/include/linux` must
+  be overwritten by QEMU's bundled `linux-headers/` or the guest build breaks
+  on iommufd.
+- **M1 - headless boot, native == sandbox - DONE (5c78986).** Byte-for-byte
+  state stream and video, savestates exact, found by TB-trace bisection at the
+  first divergent guest instruction.
+- **M2 - boot to shell - GATED (314ecd1).** Direct kernel boot: TinyCore
+  `tc@box:~$` at 3000 frames, native == sandbox on state and video. The disc
+  path is gated byte-exact to 6000 frames (deep into Linux userspace); the
+  shell *via disc* was never waited out - that is the performance item below.
+- **M3 - a real core package, booted through the frontend - DONE (0048c24).**
+  `qemu.chimeraCore` (core.wbx + waterbox.config + keybinds + file_slots
+  {disc, kernel, initrd} + SeaBIOS assets + licences + build.json provenance),
+  `PC` in SystemNames. Verified at every layer, each byte-exact against
+  run-wbx's machine: engine `chimera-run` (disc leg: 256 MiB pc.ram at 1200
+  frames; kernel leg: 1 MiB pc.ram at 3000 frames) and the real frontend
+  (mono Chimera.exe headless, `run-frontend.sh`: 3100 frames with a held key,
+  `frontend-dump.lua` driving, pc.ram identical). Interactive typing in the
+  GUI confirmed by the user.
 
-Deferred beyond the goal: audio, mouse/tablet, persistent disk export (the
-COW overlay persists through savestates/movies but is not yet a file), a
-q35/`-machine` setting, i386 distros.
+## Performance: the disc problem (the next work item)
 
-## Frontend share (the whole of it)
+Disc boot is firmware-polling-bound. SeaBIOS (and ISOLINUX) poll the IDE
+status port while every request sits at the frame-boundary latency the
+determinism filter imposes; each poll iteration is emulated device traffic,
+so the wall-clock cost is (poll iterations) x (icount cost), and the whole
+disc phase crawls (~15-25 min to a shell; kernel compute frames are ~8x
+cheaper than firmware poll frames). xemu never paid this tax: the Xbox kernel
+halts on IRQ instead of polling. Raising icount shift halves poll cost but
+stretches virtual boot time; the governor/shift tuning already done took a
+frame from ~2.6s to ~0.63s - further knob-turning has hit diminishing returns.
 
-- `SystemNames.cs`: `["PC"] = "IBM PC (QEMU)"`.
-- The submodule entry in `.gitmodules`.
-- Nothing else: the RomGame SHA1 streaming and optional-firmware handling
-  xemu needed are already home; the assets channel is already home.
+The structural fix, deferred until now by design: **IDE-level pacing** -
+anchor disc completions to a short *fixed virtual delay* measured at the
+device-instruction instant, instead of the block filter's frame-boundary
+quantisation. It must live at the IDE device (the block layer's clock reads
+are host-fuzzy and nondeterministic); the block filter stays for the COW
+overlay and streaming, but stops being the latency source. Design sketch:
+intercept the IDE command write in `hw/ide/core.c`, take `qemu_clock_get_ns(
+QEMU_CLOCK_VIRTUAL)` then, schedule the completion `N` virtual ns out; poll
+loops then spin over a bounded virtual window (~microseconds of virtual time)
+instead of a whole frame boundary. The gate re-verifies everything (A==B==
+sandbox, disc legs re-run byte-exact - machine identity changes, which is
+fine pre-1.0).
 
-## Open questions, with a default each
+Parked oddity from the disc experiments, for the record: under icount the
+disc path sat at Alpine's ISOLINUX `boot:` prompt for 100 virtual seconds
+where full-speed runs time out in ~20s - unexplained, worth revisiting when
+the IDE pacing work touches that path.
 
-- **Which distro is the gate's reference disc?** Default: Alpine x86_64
-  standard ISO (small, boots to login on the VGA console); a buildroot image
-  is the deterministic-minimal alternative if Alpine's userspace entropy
-  (walltime reads are fine - they are virtual) or boot length misbehaves.
-- **Shift.** icount `shift=0` (a ~1GHz machine) boots Linux in minutes of
-  wall clock; if boot-to-shell exceeds ~10k virtual frames, revisit (the
-  frame budget is a settings-time constant, and movies cite it).
-- **`-cpu` model.** Default: `qemu64` + explicit feature additions minus
-  `rdrand`/`rdseed`; pin exactly, because the CPUID set is machine identity.
+## After that: a full distro and software
+
+Once disc boot (or a disc-free equivalent: an installed-to-COW hard disk, or
+a bigger initrd) boots in minutes, the natural ladder is Alpine (or a small
+Debian) with the `kernel`+`initrd`+`disc` slots all filled - the initrd boots,
+the disc mounts as the root filesystem's source - then run something real in
+it (a shell script, a compiler, a game) under movie control. The COW overlay
+already persists across savestates, so "install once, boot the installed
+system" is expressible as a movie even before persistent disk export exists.
+
+## Deferred
+
+Audio (AC97/SB16 need the xemu-APU virtual-clock treatment), mouse/tablet,
+persistent disk export (the COW overlay is not yet a file), q35/`-machine`
+setting, i386 distros.
+
+## Handoff: how to run everything
+
+- **GUI:** `~/chimera/build/ChimeraMono.sh`, Open Project →
+  `~/chimera/projects/tinycore-direct/tinycore.chimeraProject`. Boot is ~1
+  minute; type at the PC's keyboard.
+- **Package:** `sh ~/chimera-core-qemu/waterbox/build-package.sh` →
+  `~/chimera/build/Cores/qemu.chimeraCore` (deterministic zip; sha1 printed).
+- **The gate:** `sh ~/chimera-core-qemu/waterbox/run-gate.sh [frames]` (A==B==
+  sandbox); `CHIMERA_KERNEL=… CHIMERA_INITRD=…` env knobs for the kernel leg
+  on native, `--kernel/--initrd` on run-wbx.
+- **The frontend check:** `sh ~/chimera-core-qemu/waterbox/run-frontend.sh`
+  (mono headless vs run-wbx, pc.ram byte-compare; `--work DIR` keeps dumps).
+- **Engine harness:** `~/chimera/build/meson-linux/chimera-run --project <p>
+  <package> [--frames N] [--dump pc.ram=F] [--screenshot F=F.tga]`. Movie
+  entries are `|` + one char per declared button (161 for this core) + `|`.
+- Native debugging knobs: `CHIMERA_PREVIEW=1` (no icount, direct disc,
+  free-running, NOT deterministic - eyes only; needs a display for SDL),
+  `CHIMERA_SDL=1`, `CHIMERA_TRACE_EXEC=<path>` (+ `CHIMERA_TRACE_SPEC` for
+  IDE events).
+- Boot files for the default project: extract `boot/vmlinuz64` and
+  `boot/corepure64.gz` from the TinyCore ISO (`build/discs/corepure64-17.1.iso`
+  in the core repo; bsdtar) - they are machine inputs, so treat them as
+  pinned.
