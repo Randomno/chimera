@@ -11,8 +11,9 @@ asset, a small Linux distro as the disc.
 GUI, deterministically, with savestates and movies - is MET.** TinyCore
 CorePure64 17.1 boots to `tc@box:~$` through the real frontend, and the
 frontend's machine is byte-identical to the bare sandbox's at every layer
-checked. What remains is performance (the disc path) and, beyond it, a full
-distro running real software.
+checked. The disc path is now fast too: **disc boot to a live shell is ~2
+minutes wall** (was 15-25). What remains is a full distro running real
+software.
 
 - Core repository `chimera-core-qemu` (mirrors `chimera-core-xemu`), submodule
   at `extern/cores/qemu`, nested `extern/qemu` pinned to the same QEMU release
@@ -35,6 +36,7 @@ distro running real software.
 | Video | VGA scanout per frame → pixman → BGRA; text mode included |
 | Input | PS/2 keyboard, buttons in QKeyCode order, press/release diffs at the paused frame boundary |
 | Firmware | SeaBIOS + VGABIOS + linuxboot_dma ride the package **assets channel** (LGPL, shippable) |
+| Disc timing | async IDE completions deliver at (last IDE port access + 100µs virtual); sync ATAPI completes in the port access itself (patch 0010) |
 
 ## What transfers, what is new (from the xemu port - kept for reference)
 
@@ -64,12 +66,15 @@ distro running real software.
 
 1. **Direct kernel boot (the fast leg).** The project fills `kernel` and
    `initrd` slots; `linuxboot_dma` loads them over fw_cfg DMA - no firmware
-   disc traffic at all. TinyCore reaches its shell in 3000 frames (~1 min
+   disc traffic at all. TinyCore reaches its shell in 3000 frames (~30s
    wall). This is the default project (`~/chimera/projects/tinycore-direct`)
    and the iteration path.
 2. **Disc boot (El Torito through SeaBIOS).** The project fills the `disc`
-   slot. Deterministic and gated, but slow - see the performance section; this
-   is the blocking work item.
+   slot. Deterministic, gated, and fast: ISOLINUX's 30s `boot:` timeout
+   fires at frame ~1800 (30 virtual seconds), the 26 MB kernel+initrd load
+   completes in a few hundred more frames, and a live shell answers keys by
+   ~frame 4600 - about 1m50s wall end to end. A movie (or the GUI user) can
+   press Enter at the prompt to skip the 30 virtual-second wait.
 
 File-name conventions the driver understands (it parses the mounted `slots`
 map at Init, falling back to the flat names): project files mount under their
@@ -89,8 +94,8 @@ drive (an empty drive is a valid machine: SeaBIOS reports no bootable device).
   first divergent guest instruction.
 - **M2 - boot to shell - GATED (314ecd1).** Direct kernel boot: TinyCore
   `tc@box:~$` at 3000 frames, native == sandbox on state and video. The disc
-  path is gated byte-exact to 6000 frames (deep into Linux userspace); the
-  shell *via disc* was never waited out - that is the performance item below.
+  path was gated byte-exact to 6000 frames; the shell *via disc* was later
+  booted to completion once the IDE pacing landed (see below).
 - **M3 - a real core package, booted through the frontend - DONE (0048c24).**
   `qemu.chimeraCore` (core.wbx + waterbox.config + keybinds + file_slots
   {disc, kernel, initrd} + SeaBIOS assets + licences + build.json provenance),
@@ -101,45 +106,66 @@ drive (an empty drive is a valid machine: SeaBIOS reports no bootable device).
   `frontend-dump.lua` driving, pc.ram identical). Interactive typing in the
   GUI confirmed by the user.
 
-## Performance: the disc problem (the next work item)
+## Performance: the disc problem - SOLVED (patch 0010)
 
-Disc boot is firmware-polling-bound. SeaBIOS (and ISOLINUX) poll the IDE
-status port while every request sits at the frame-boundary latency the
-determinism filter imposes; each poll iteration is emulated device traffic,
-so the wall-clock cost is (poll iterations) x (icount cost), and the whole
-disc phase crawls (~15-25 min to a shell; kernel compute frames are ~8x
-cheaper than firmware poll frames). xemu never paid this tax: the Xbox kernel
-halts on IRQ instead of polling. Raising icount shift halves poll cost but
-stretches virtual boot time; the governor/shift tuning already done took a
-frame from ~2.6s to ~0.63s - further knob-turning has hit diminishing returns.
+Disc boot *was* firmware-polling-bound: the block filter parked every
+request in a coroutine that only the next frame-boundary vm_stop released,
+so each disc command cost a full frame of firmware polling, and the whole
+disc phase crawled (15-25 min to a shell). The structural fix, IDE-level
+pacing, is now in:
 
-The structural fix, deferred until now by design: **IDE-level pacing** -
-anchor disc completions to a short *fixed virtual delay* measured at the
-device-instruction instant, instead of the block filter's frame-boundary
-quantisation. It must live at the IDE device (the block layer's clock reads
-are host-fuzzy and nondeterministic); the block filter stays for the COW
-overlay and streaming, but stops being the latency source. Design sketch:
-intercept the IDE command write in `hw/ide/core.c`, take `qemu_clock_get_ns(
-QEMU_CLOCK_VIRTUAL)` then, schedule the completion `N` virtual ns out; poll
-loops then spin over a bounded virtual window (~microseconds of virtual time)
-instead of a whole frame boundary. The gate re-verifies everything (A==B==
-sandbox, disc legs re-run byte-exact - machine identity changes, which is
-fine pre-1.0).
+- The filter (`chimera-latency.c`) is COW + streaming only; it no longer
+  imposes latency of any kind.
+- Every async IDE block submission (`ide_buffered_readv`, the disk PIO/DMA
+  paths, flush) is **drained to its host completion at the submission
+  instant** and the completion **parks** in a per-bus queue. A
+  `QEMU_CLOCK_VIRTUAL` timer delivers it at **deadline = (the guest's last
+  IDE port access, or the previous delivery) + 100µs** (`CHIMERA_IDE_LATENCY_NS`).
+  All three anchors are pure virtual instants - a port access runs on the
+  vCPU under icount, the drain and the timer callback run with the vCPU
+  quiescent (icount forces the single-threaded vCPU) - so both builds
+  deliver at the same virtual nanosecond. A firmware poll loop now spins
+  microseconds of virtual time instead of a whole frame boundary; a
+  halted guest reaches the deadline through the warp governor like any
+  other virtual timer.
+- The drain-at-submission is the load-bearing detail, learned the hard way:
+  parking at host completion time let completions *slip* past their
+  deadline (52 slips per disc boot on the reference host - warp steps
+  jumped past 100µs deadlines while I/O was in flight), which made delivery
+  land at host-chosen instants and broke native-vs-native determinism; and
+  the sandbox's cooperative threads cannot service a mid-frame aio
+  completion at all (the guest polls `Status 0xd0` forever - the
+  green-thread main loop only runs block completions at the frame
+  boundary). Draining at submission fixes both: the park is always before
+  the deadline, and no mid-frame aio service is ever needed. The
+  synchronous ATAPI PIO path (`blk_pread` - the SeaBIOS/El Torito reads)
+  always worked this way, which is why firmware disc reads never needed
+  pacing.
+- Resets, cancels and the save path force-deliver first (`chimera_ide_flush_pending`
+  is called by the driver before every snapshot), so a parked completion -
+  a function pointer - can never enter the migration stream. The pacing
+  state lives on `IDEBus` and is deliberately outside any vmstate.
 
-Parked oddity from the disc experiments, for the record: under icount the
-disc path sat at Alpine's ISOLINUX `boot:` prompt for 100 virtual seconds
-where full-speed runs time out in ~20s - unexplained, worth revisiting when
-the IDE pacing work touches that path.
+Result, measured on the reference machine: disc boot (SeaBIOS → El Torito
+→ ISOLINUX loads 26 MB → kernel → live shell answering keys) is **~1m50s
+wall**, native A == B == sandbox byte-exact, savestates round-trip. The
+kernel leg's gate got faster too (~30s wall for 3000 frames).
+
+Parked oddity RESOLVED for TinyCore: the ISOLINUX `boot:` timeout does fire
+under icount (30 virtual seconds = frame ~1800), so the disc boots
+unattended; the earlier Alpine observation (no timeout in 100 virtual
+seconds) remains unexplained but Alpine-specific - revisit if Alpine
+becomes the full-distro vehicle.
 
 ## After that: a full distro and software
 
-Once disc boot (or a disc-free equivalent: an installed-to-COW hard disk, or
-a bigger initrd) boots in minutes, the natural ladder is Alpine (or a small
-Debian) with the `kernel`+`initrd`+`disc` slots all filled - the initrd boots,
-the disc mounts as the root filesystem's source - then run something real in
-it (a shell script, a compiler, a game) under movie control. The COW overlay
-already persists across savestates, so "install once, boot the installed
-system" is expressible as a movie even before persistent disk export exists.
+With disc boot in ~2 minutes, the natural ladder is Alpine (or a small
+Debian) with the `kernel`+`initrd`+`disc` slots all filled - the initrd
+boots, the disc mounts as the root filesystem's source - then run something
+real in it (a shell script, a compiler, a game) under movie control. The COW
+overlay already persists across savestates, so "install once, boot the
+installed system" is expressible as a movie even before persistent disk
+export exists.
 
 ## Deferred
 
