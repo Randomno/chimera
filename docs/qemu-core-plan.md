@@ -125,11 +125,19 @@ New work, none of it novel:
   shell; a held key changes the machine exactly while held; native ==
   sandbox under the press.
   **IN PROGRESS.** Everything through the ISO slot is in place and gated at
-  120 frames; the open work is the long run (thousands of frames, all of
-  Linux boot) native == sandbox, the input leg, and observing the boot to a
-  shell. First long-run attempt found the sandbox binary was stale (built
-  before the QAPI `cow` option; rejected `-blockdev ... cow=on`) - rebuilt;
-  the long run itself was interrupted before concluding.
+  120 frames *with the disc attached* (native == sandbox, state stream and
+  video, byte for byte). Two more determinism bugs found and fixed on the
+  way: a stale sandbox build silently predating the QAPI `cow` option (build
+  hygiene, not a patch), and - the interesting one - `ram_save_iterate`'s
+  MAX_WAIT wall-clock bail-out, which split the saved RAM section's PART
+  records at host-speed-dependent points (patch 0008: under
+  CHIMERA_WATERBOX the flush always runs to completion). At frame 120 the
+  machine sits at ISOLINUX's `boot:` prompt - kernel load has not begun, so
+  the boot-to-shell frame budget is still unmeasured and will be large.
+  `-boot order=d` now skips the doomed hard-disk/floppy probes. Remaining:
+  the long run (thousands of frames) native == sandbox, the input leg
+  (Enter at the `boot:` prompt is exactly what advances Alpine), and
+  observing the boot to a shell.
 - **M3 - a real core package.** `waterbox.config` (video buffer cap
   1280x1024 for VESA modes, 60 Hz vsync from `VBLANK_NS`), `file_slots.json`
   (the disc), keybinds, licences (GPL-2.0 QEMU + LGPL SeaBIOS), build.json
