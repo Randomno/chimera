@@ -177,7 +177,10 @@ setting, i386 distros.
 
 - **GUI:** `~/chimera/build/ChimeraMono.sh`, Open Project →
   `~/chimera/projects/tinycore-direct/tinycore.chimeraProject`. Boot is ~1
-  minute; type at the PC's keyboard.
+  minute; type at the PC's keyboard. For disc boot, copy that project and
+  swap the files to one entry naming the ISO with `"slot": "disc"` - it
+  boots to the shell in ~2 minutes (ISOLINUX waits 30 virtual seconds at
+  its `boot:` prompt unless Enter is pressed).
 - **Package:** `sh ~/chimera-core-qemu/waterbox/build-package.sh` →
   `~/chimera/build/Cores/qemu.chimeraCore` (deterministic zip; sha1 printed).
 - **The gate:** `sh ~/chimera-core-qemu/waterbox/run-gate.sh [frames]` (A==B==
