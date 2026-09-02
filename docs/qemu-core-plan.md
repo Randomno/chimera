@@ -26,7 +26,7 @@ software.
 | Knob | Value |
 |---|---|
 | Machine / CPU | `pc` (i440fx), 1 vCPU, TCG, `-cpu qemu64` (no `rdrand`/`rdseed`) |
-| icount | `shift=2` (a 250MHz-class virtual CPU) - halves firmware poll cost per frame |
+| icount | `shift=0` (a 1GHz-class virtual CPU, 1ns/instruction) - 4x the compute budget per virtual second; env override `CHIMERA_ICOUNT_SHIFT` (native test builds) |
 | Governor | period 1ms (`GOVERNOR_NS 1000000`) |
 | Boot order | `-boot order=d` (don't walk floppy/hard disk first) |
 | Frame quantum | VGA 60 Hz: `VBLANK_NS 16666667`, vsync `1000000000/16666667` |
@@ -36,7 +36,7 @@ software.
 | Video | VGA scanout per frame → pixman → BGRA; text mode included |
 | Input | PS/2 keyboard, buttons in QKeyCode order, press/release diffs at the paused frame boundary |
 | Firmware | SeaBIOS + VGABIOS + linuxboot_dma ride the package **assets channel** (LGPL, shippable) |
-| Disc timing | async IDE completions deliver at (last IDE port access + 100µs virtual); sync ATAPI completes in the port access itself (patch 0010) |
+| Disc timing | async IDE completions deliver at (last IDE port access + 0ns virtual, i.e. effectively synchronous; `CHIMERA_IDE_LATENCY_NS 0`); sync ATAPI completes in the port access itself (patch 0010) |
 
 ## What transfers, what is new (from the xemu port - kept for reference)
 
@@ -120,7 +120,9 @@ pacing, is now in:
   paths, flush) is **drained to its host completion at the submission
   instant** and the completion **parks** in a per-bus queue. A
   `QEMU_CLOCK_VIRTUAL` timer delivers it at **deadline = (the guest's last
-  IDE port access, or the previous delivery) + 100µs** (`CHIMERA_IDE_LATENCY_NS`).
+  IDE port access, or the previous delivery) + `CHIMERA_IDE_LATENCY_NS`, set to 0** -
+  with the drain guaranteeing park-before-deadline, determinism holds at any
+  latency; 0 avoids a ~100k-instruction poll spin per request at shift=0.
   All three anchors are pure virtual instants - a port access runs on the
   vCPU under icount, the drain and the timer callback run with the vCPU
   quiescent (icount forces the single-threaded vCPU) - so both builds
@@ -130,8 +132,8 @@ pacing, is now in:
   other virtual timer.
 - The drain-at-submission is the load-bearing detail, learned the hard way:
   parking at host completion time let completions *slip* past their
-  deadline (52 slips per disc boot on the reference host - warp steps
-  jumped past 100µs deadlines while I/O was in flight), which made delivery
+  deadline (52 slips per disc boot on the reference host at the original 100µs
+  latency - warp steps jumped past deadlines while I/O was in flight), which made delivery
   land at host-chosen instants and broke native-vs-native determinism; and
   the sandbox's cooperative threads cannot service a mid-frame aio
   completion at all (the guest polls `Status 0xd0` forever - the
