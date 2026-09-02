@@ -99,16 +99,37 @@ New work, none of it novel:
   10.2.x release matching xemu's base; apply-patches.sh starts its numbered
   series with the four verbatim ports.
   Gate: guest `qemu-system-x86_64` links, `check-wbx.sh` clean.
+  **DONE (53780b1).** Seven-patch series (four verbatim ports plus the
+  pixman-shareable, ATA-SRST, QAPI-latency and driver-build patches), both
+  builds green, `check-wbx.sh` clean. Guest-deps wrinkle worth remembering:
+  the host's `/usr/include/linux` must be overwritten by QEMU's bundled
+  `linux-headers/` copies or the guest build breaks on iommufd.
 - **M1 - headless boot, native==sandbox.** Driver: frame loop, governor,
   boundary, migration-stream exports. Boot SeaBIOS (assets) with no disc to
   the "no bootable device" screen, then `-kernel` a pinned buildroot/busybox
   image as the simplest Linux leg. `run-gate.sh N`: native A == B ==
   sandbox, byte for byte, at 60 and 600 frames.
+  **DONE IN SUBSTANCE at 120 frames (chimera-core-qemu 5c78986).** Native
+  A == B == sandbox, byte for byte, state stream and video, savestates
+  exact, with the Alpine ISO attached from frame 0 (SeaBIOS through El
+  Torito - i.e. the M2 disc path too). Two determinism bugs found and fixed
+  on the way: timer-offset canonicalisation needed the `CHIMERA_WATERBOX`
+  guard (patch 0002), and ATA SRST completion had to become synchronous
+  (patch 0007) - found by TB-trace bisection at the first divergent guest
+  instruction. Not yet done to the letter: the 600-frame (and longer) gate
+  points, and the separate no-disc / `-kernel` legs (skipped in favour of
+  the real ISO, which exercises strictly more).
 - **M2 - the distro.** ISO slot + El Torito through the latency filter, PS/2
   input, `pc.ram` domain, savestate rerecord around every frame, arena
   snapshot byte-identical. Gate: Alpine (or TinyCore) ISO boots to a busybox
   shell; a held key changes the machine exactly while held; native ==
   sandbox under the press.
+  **IN PROGRESS.** Everything through the ISO slot is in place and gated at
+  120 frames; the open work is the long run (thousands of frames, all of
+  Linux boot) native == sandbox, the input leg, and observing the boot to a
+  shell. First long-run attempt found the sandbox binary was stale (built
+  before the QAPI `cow` option; rejected `-blockdev ... cow=on`) - rebuilt;
+  the long run itself was interrupted before concluding.
 - **M3 - a real core package.** `waterbox.config` (video buffer cap
   1280x1024 for VESA modes, 60 Hz vsync from `VBLANK_NS`), `file_slots.json`
   (the disc), keybinds, licences (GPL-2.0 QEMU + LGPL SeaBIOS), build.json
