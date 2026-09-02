@@ -124,20 +124,23 @@ New work, none of it novel:
   snapshot byte-identical. Gate: Alpine (or TinyCore) ISO boots to a busybox
   shell; a held key changes the machine exactly while held; native ==
   sandbox under the press.
-  **IN PROGRESS.** Everything through the ISO slot is in place and gated at
-  120 frames *with the disc attached* (native == sandbox, state stream and
-  video, byte for byte). Two more determinism bugs found and fixed on the
-  way: a stale sandbox build silently predating the QAPI `cow` option (build
-  hygiene, not a patch), and - the interesting one - `ram_save_iterate`'s
-  MAX_WAIT wall-clock bail-out, which split the saved RAM section's PART
-  records at host-speed-dependent points (patch 0008: under
-  CHIMERA_WATERBOX the flush always runs to completion). At frame 120 the
-  machine sits at ISOLINUX's `boot:` prompt - kernel load has not begun, so
-  the boot-to-shell frame budget is still unmeasured and will be large.
-  `-boot order=d` now skips the doomed hard-disk/floppy probes. Remaining:
-  the long run (thousands of frames) native == sandbox, the input leg
-  (Enter at the `boot:` prompt is exactly what advances Alpine), and
-  observing the boot to a shell.
+  **BOOT TO SHELL GATED (314ecd1).** Direct kernel boot (-kernel via
+  linuxboot_dma, no firmware disc polling) takes TinyCore to `tc@box:~$`
+  in ~30s wall / 3000 frames in the deterministic configuration, and
+  native == sandbox byte-for-byte on state and video at that point. The
+  disc path is gated to 6000 frames (deep into Linux userspace, byte
+  exact) but the shell via the disc still costs ~15-25 min of wall clock:
+  boot firmware polls the IDE status port for the whole boundary-quantized
+  disc latency, and that polling is emulated device traffic. The known
+  structural fix - anchoring disc completions to a short fixed virtual
+  delay measured at the device-instruction instant (IDE-level pacing,
+  not the block filter, whose clock reads are host-fuzzy) - is deferred
+  by design. Machine identity notes: icount shift=2 (a 250MHz-class
+  CPU), governor period 1ms, -boot order=d. Open oddity, parked: under
+  icount the disc path sat at Alpine's ISOLINUX `boot:` prompt for 100
+  virtual seconds where full-speed runs time out in ~20s - unexplained,
+  not blocking (input delivery itself is verified: the scancode reaches
+  ps2 and is read by the guest).
 - **M3 - a real core package.** `waterbox.config` (video buffer cap
   1280x1024 for VESA modes, 60 Hz vsync from `VBLANK_NS`), `file_slots.json`
   (the disc), keybinds, licences (GPL-2.0 QEMU + LGPL SeaBIOS), build.json
