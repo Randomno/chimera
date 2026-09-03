@@ -26,7 +26,7 @@ software.
 | Knob | Value |
 |---|---|
 | Machine / CPU | `pc` (i440fx), 1 vCPU, TCG, `-cpu qemu64` (no `rdrand`/`rdseed`) |
-| icount | `shift=0` (a 1GHz-class virtual CPU, 1ns/instruction) - 4x the compute budget per virtual second; env override `CHIMERA_ICOUNT_SHIFT` (native test builds) |
+| icount | `icountShift` setting (default `0`, a 1GHz-class virtual CPU, 1ns/instruction): each instruction costs 2^shift ns - 0/1/2/3 = 1GHz/500MHz/250MHz/125MHz class; like RAM, part of the movie's identity |
 | Governor | period 1ms (`GOVERNOR_NS 1000000`) |
 | Boot order | `-boot order=d` (don't walk floppy/hard disk first) |
 | Frame quantum | VGA 60 Hz: `VBLANK_NS 16666667`, vsync `1000000000/16666667` |
@@ -36,7 +36,7 @@ software.
 | Video | VGA scanout per frame → pixman → BGRA; text mode included |
 | Input | PS/2 keyboard, buttons in QKeyCode order, press/release diffs at the paused frame boundary |
 | Firmware | SeaBIOS + VGABIOS + linuxboot_dma ride the package **assets channel** (LGPL, shippable) |
-| Disc timing | async IDE completions deliver at (last IDE port access + 0ns virtual, i.e. effectively synchronous; `CHIMERA_IDE_LATENCY_NS 0`); sync ATAPI completes in the port access itself (patch 0010) |
+| Disc timing | `ideLatencyNs` setting (default `0` = effectively synchronous): async IDE completions deliver at (last IDE port access + the setting) virtual ns; sync ATAPI completes in the port access itself (patch 0010). Determinism holds at any value |
 
 ## What transfers, what is new (from the xemu port - kept for reference)
 
