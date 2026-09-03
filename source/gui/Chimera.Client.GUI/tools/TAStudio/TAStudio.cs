@@ -1,4 +1,4 @@
-using System.Collections.Generic;
+﻿using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
 using System.Linq;
@@ -96,7 +96,11 @@ namespace Chimera.Client.GUI
 				ScrollSpeed = 6;
 				FollowCursorAlwaysScroll = false;
 				FollowCursorScrollMethod = "near";
-				AutosaveInterval = 120000;
+				// Thirty minutes. Two was the lineage's, and an autosave writes the
+				// whole project and its greenzone - seconds of pause on a PS2 or a
+				// DOS machine - so it should not come around before there is a
+				// stretch of work worth keeping (issue #34).
+				AutosaveInterval = 1800000;
 				AutosaveAsBackupFile = false;
 				BackupPerFileSave = false;
 				EditInvisibleColumns = true;
@@ -744,6 +748,7 @@ namespace Chimera.Client.GUI
 
 			_engaged = true;
 			Settings.RecentTas.Add(CurrentTasMovie.Filename); // only add if it did load
+			if (CurrentTasMovie.DroppedCacheNote is { } droppedCache) MainForm.AddOnScreenMessage(droppedCache);
 
 			if (startsFromSavestate)
 			{
@@ -1436,6 +1441,14 @@ namespace Chimera.Client.GUI
 			if (Settings.OldControlSchemeForBranches && !TasPlaybackBox.RecordingMode)
 			{
 				GoToFrame(branch.Frame);
+				return;
+			}
+
+			// a branch is its input and its state; the state is cache, and a cache
+			// that was lost or set aside leaves the branch with nothing to jump to
+			if (branch.CoreData is null)
+			{
+				MainForm.AddOnScreenMessage("This branch has no saved state beside the project; it cannot be loaded.");
 				return;
 			}
 

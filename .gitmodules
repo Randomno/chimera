@@ -95,3 +95,7 @@
 	branch = main
 [submodule "qemu"]
 	url = https://github.com/Randomno/chimera-core-qemu.git
+[submodule "extern/cores/dolphin"]
+	path = extern/cores/dolphin
+	url = https://github.com/ToolAssisted-run/chimera-core-dolphin.git
+	branch = main

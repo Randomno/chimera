@@ -1,4 +1,4 @@
-using System.IO;
+﻿using System.IO;
 using System.Linq;
 
 using Chimera.Client.Common;
@@ -194,6 +194,82 @@ namespace Chimera.Tests.Client.Common.Movie
 			CollectionAssert.AreEqual(new byte[] { 1, 2, 3, 4 }, branch.CoreData, "the state came from the cache");
 		}
 
+		/// <summary>
+		/// A savestate is the memory of one exact machine, and the sandbox only
+		/// checks the core binary when it loads one. The cache says which machine
+		/// made its states, and a project whose machine has since changed - a
+		/// setting edited, a file swapped, another core build - gets a clean slate
+		/// from it rather than states that will fall over (issue #26).
+		/// </summary>
+		[TestMethod]
+		public void ACacheMadeByAnotherMachineIsSetAside()
+		{
+			var path = Path.Combine(_dir, "othermachine.chimeraProject");
+			var movie = MakeWorkedMovie(path);
+			Assert.IsFalse(movie.Save().IsError);
+
+			var same = LoadFresh(path);
+			Assert.IsNull(same.DroppedCacheNote, "the same machine uses its cache");
+			CollectionAssert.AreEqual(new byte[] { 1, 2, 3, 4 }, same.Branches[0].CoreData);
+
+			// the project's settings change underneath the cache
+			using (var p = Chimera.Emulation.Common.Engine.EngineProject.Open(path))
+			{
+				p.SetSettingsJson("""{"region":"pal"}""");
+				p.Save(path);
+			}
+			var other = LoadFresh(path);
+			Assert.IsNotNull(other.DroppedCacheNote, "another machine's states are not loaded");
+			StringAssert.Contains(other.DroppedCacheNote, "other settings");
+			Assert.AreEqual(6, other.InputLogLength, "the work is untouched");
+			Assert.AreEqual(1, other.Branches.Count);
+			Assert.IsNull(other.Branches[0].CoreData, "the branch keeps its input and loses its state");
+			Assert.IsNotNull(other.TasStateManager, "and there is a greenzone to start filling");
+
+			// saving from the new machine writes a cache that is its own
+			other.InsertEmptyFrame(0, 1);
+			Assert.IsFalse(other.Save().IsError);
+			var again = LoadFresh(path);
+			Assert.IsNull(again.DroppedCacheNote, "the cache the new machine wrote is used");
+		}
+
+		[TestMethod]
+		public void TheMachineLineDoesNotCareAboutKeyOrderOrCase()
+		{
+			using var a = Chimera.Emulation.Common.Engine.EngineProject.New();
+			using var b = Chimera.Emulation.Common.Engine.EngineProject.New();
+			a.SetCore("core", "v", "abcdef");
+			b.SetCore("core", "v", "ABCDEF");
+			a.SetSettingsJson("""{"x":1,"y":{"q":true,"p":false}}""");
+			b.SetSettingsJson("""{"y":{"p":false,"q":true},"x":1}""");
+			Assert.AreEqual(TasMovie.MachineIdentityOf(a), TasMovie.MachineIdentityOf(b));
+
+			b.SetSettingsJson("""{"y":{"p":true,"q":true},"x":1}""");
+			Assert.AreNotEqual(TasMovie.MachineIdentityOf(a), TasMovie.MachineIdentityOf(b), "a value that differs is a different machine");
+		}
+
+		/// <summary>
+		/// A backup goes to the "Movie backups" folder, which a fresh install does
+		/// not have; the save makes it rather than fail (issue #19).
+		/// </summary>
+		[TestMethod]
+		public void ABackupMakesTheFolderItGoesTo()
+		{
+			var path = Path.Combine(_dir, "backedup.chimeraProject");
+			var movie = MakeWorkedMovie(path);
+			var backups = Path.Combine(_dir, "backups", "nested");
+			((FakeMovieSession) movie.Session).BackupDirectory = backups;
+			Assert.IsFalse(Directory.Exists(backups));
+
+			var result = movie.SaveBackup();
+			Assert.IsFalse(result.IsError, result.Exception?.Message);
+			Assert.IsTrue(Directory.Exists(backups), "the folder was made");
+			var written = Directory.GetFiles(backups, "*.chimeraProject");
+			Assert.AreEqual(1, written.Length, "one backup project in it");
+			StringAssert.StartsWith(Path.GetFileName(written[0]), "backedup.");
+			Assert.AreEqual(0, Directory.GetFiles(backups, "*.chimeraGreenZone").Length, "a backup carries no cache");
+		}
+
 		[TestMethod]
 		public void ALostCacheCostsRecomputationNeverWork()
 		{
@@ -273,6 +349,48 @@ namespace Chimera.Tests.Client.Common.Movie
 			Assert.AreEqual("quickernes", reloaded.CoreName, "the core pin was lost on save");
 			Assert.AreEqual("abc123+local", reloaded.CoreVersion);
 			Assert.AreEqual(new string('B', 40), reloaded.CoreSha1);
+		}
+
+		/// <summary>
+		/// The wizard records every exposed setting at its chosen value, and the
+		/// movie that starts from that project has no settings text of its own -
+		/// the project boot fills headers, never settings. Saving must keep the
+		/// project's answers rather than write the movie's silence over them as
+		/// "{}", which put every setting back to its default on reopen (issue #29).
+		/// </summary>
+		[TestMethod]
+		public void SavingAMovieThatIsSilentAboutSettingsKeepsTheWizardsAnswers()
+		{
+			var path = Path.Combine(_dir, "fresh-settings.chimeraProject");
+			var project = Chimera.Emulation.Common.Engine.EngineProject.New();
+			project.SetCore("pcsx2-shaped", "abc123+local", new string('C', 40));
+			project.SetSettingsJson("""{"fast_boot":false,"memcard1":false,"renderer":"software"}""");
+
+			// the fresh shape: a movie for a project that has never been written -
+			// nothing to load, the resolved project handed over, headers filled
+			// from the machine, settings never mentioned
+			FakeEmulator emu = new();
+			FakeMovieSession session = new(emu);
+			TasMovie movie = new(session, path);
+			session.Movie = movie;
+			movie.Attach(emu);
+			movie.UseResolvedProject(project);
+			movie.HeaderEntries[HeaderKeys.Core] = "pcsx2-shaped";
+			Assert.AreEqual("", movie.SettingsJson, "the fresh movie says nothing about settings");
+			movie.InsertEmptyFrame(0, 2);
+			Assert.IsFalse(movie.Save().IsError);
+
+			using var reloaded = Chimera.Emulation.Common.Engine.EngineProject.Open(path);
+			StringAssert.Contains(reloaded.SettingsJson, "\"fast_boot\":false", "the wizard's answer was lost on save");
+			StringAssert.Contains(reloaded.SettingsJson, "\"memcard1\":false");
+			StringAssert.Contains(reloaded.SettingsJson, "\"renderer\":\"software\"");
+
+			// and a movie that DOES carry settings still has the last word
+			var loaded = LoadFresh(path);
+			loaded.SettingsJson = """{"Values":{"fast_boot":true}}""";
+			Assert.IsFalse(loaded.Save().IsError);
+			using var overwritten = Chimera.Emulation.Common.Engine.EngineProject.Open(path);
+			StringAssert.Contains(overwritten.SettingsJson, "\"fast_boot\":true");
 		}
 	}
 }
