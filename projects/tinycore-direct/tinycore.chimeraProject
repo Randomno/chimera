@@ -3,7 +3,7 @@
   "core": {
     "name": "qemu",
     "version": "",
-    "sha1": "9FCBF1FB71B5C4C37AF4E232D2CCE2A69B019A51"
+    "sha1": "089EF91B85619A78041AB6BC46367BCE39FDB7D9"
   },
   "files": [
     {
