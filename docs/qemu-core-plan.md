@@ -37,6 +37,7 @@ software.
 | Input | PS/2 keyboard, buttons in QKeyCode order, press/release diffs at the paused frame boundary |
 | Firmware | SeaBIOS + VGABIOS + linuxboot_dma ride the package **assets channel** (LGPL, shippable) |
 | Disc timing | `ideLatencyNs` setting (default `0` = effectively synchronous): async IDE completions deliver at (last IDE port access + the setting) virtual ns; sync ATAPI completes in the port access itself (patch 0010). Determinism holds at any value |
+| Kernel cmdline | the `kappend` project file slot: one line, the WHOLE `-append` string (default `loglevel=3`); machine identity like the kernel it boots. E.g. `loglevel=3 vga=794 consoleblank=0` = VBE 1280x1024x16 linear framebuffer |
 
 ## What transfers, what is new (from the xemu port - kept for reference)
 
@@ -161,19 +162,129 @@ becomes the full-distro vehicle.
 
 ## After that: a full distro and software
 
-With disc boot in ~2 minutes, the natural ladder is Alpine (or a small
-Debian) with the `kernel`+`initrd`+`disc` slots all filled - the initrd
-boots, the disc mounts as the root filesystem's source - then run something
-real in it (a shell script, a compiler, a game) under movie control. The COW
-overlay already persists across savestates, so "install once, boot the
-installed system" is expressible as a movie even before persistent disk
-export exists.
+**The first graphical game milestone is MET: DOOM on the VESA linear
+framebuffer, deterministic, movie-controlled.** The ladder as it stands:
+
+- **VBE LFB presentation - DONE, with zero scanout-side code.** QEMU's VGA
+  core already renders VBE linear-framebuffer modes into the console
+  surface, so the existing per-frame `graphic_hw_update` → pixman → BGRA
+  path presents a 1280x1024x16 LFB unmodified; VRAM is a RAM block
+  (`vga.vram`), so it rides the state stream like `pc.ram` and
+  savestates/rewind cover it for free. What WAS missing was a way for the
+  sandbox to boot a VBE mode: the `kappend` file slot (above) now carries
+  the kernel command line as project identity. One vgabios quirk learned
+  the hard way: this VGABIOS's 0x31x block has no 32bpp mode - 794 = the
+  1280x1024x16 that exactly fills the core's scanout cap.
+- **doomgeneric (linuxvt port) is the proof of game** - `~/chimera/
+  projects/doomrun`: doomgeneric built static (gcc, `-gfxmode rgb565`,
+  `DOOMGENERIC_RESX/Y=1280/800` to match the 4x auto-scale), shareware
+  `doom1.wad`, drawing straight into `/dev/fb0`, keyboard over evdev
+  (raw press/release, grabbed). Two guest-side fixes the port needed:
+  the TinyCore kernel has no devtmpfs, so `/init` mknods `fb0` and the
+  `input/event*` nodes from sysfs major:minor; and i_video defaults its
+  OUTPUT format to rgba8888 regardless of the real fb, so rgb565 must be
+  asked for explicitly or the picture is interleaved garbage (diagnosed
+  by measuring 0% horizontal pixel repeats in a supposedly 4x-scaled
+  frame). Boot is ~2300 frames to the title screen; attract-mode E1M1
+  plays unattended; a held Enter at the frame boundary stops the demo
+  and opens the menu. Native == sandbox byte-exact at 3000 frames, state
+  and video.
+- **Then the supporting systems, unchanged:** mouse/tablet (the kernel
+  already probes the i8042's PS/2 mouse port - `ImExPS/2 Generic
+  Explorer Mouse` on serio1), audio (AC97/SB16 need the APU virtual-clock
+  treatment), persistent disk export (COW overlay → file), and the full
+  distro via the disc slot.
+
+## FreeDOS: the disc slot runs real DOS (2026-09-04)
+
+FD14LIVE.iso (FreeDOS 1.4 live CD) through the `disc` slot is the second
+proven disc guest: SeaBIOS → El Torito → ISOLINUX (menu.c32, `TIMEOUT 500`
+= 50 virtual seconds) → memdisk+fdlive.img (1.44 MB FAT12) → FreeDOS live
+environment. All through the standard package, zero core changes.
+
+- **It boots, unattended and assisted.** Unattended the menu timeout fires
+  at ~frame 3060 (menu is up by ~frame 100; POST costs ~2 virtual s), and
+  the settled live-environment screen is up by frame 3600. Holding Enter
+  (bit 34) at frame 700 reaches the SAME screen (byte-identical video) by
+  frame 1800. The screen answers the keyboard: a held "D" (bit 37) at the
+  settled screen renders exactly one 9x16 character cell on the bottom row.
+- **Deterministic at every layer** (gate at 1800 frames, 6/6 PASS): native
+  A == B, native == sandbox on state and scanout, savestate round-trips,
+  input leg native == sandbox. Also verified at frame 3600: the sandbox's
+  settled-screen state is byte-identical to a native 3600-frame run.
+- **DOS-style workloads are the expensive ones.** menu.c32's idle loop
+  busy-polls the BIOS tick instead of halting, and DOS boot phases run
+  flat out, so frames cost full TCG execution: measured 33-370 ms/frame
+  (host-load dependent) vs TinyCore's ~10-25. A settled FreeDOS prompt is
+  cheap again (HLT in the kernel idle loop). Practical upshot: a movie
+  pressing Enter at the menu is worth ~49 virtual seconds of wall time.
+- **vs the DOSBox-X core (bench-dos.sh):** DOSBox-X boots the same
+  FreeDOS (fdlive.img / FD14BOOT.img as `bootDrive a`; native ==
+  sandbox == rerecord, its run-roms gate) to its prompt in **6-11 s wall
+  (~4-8 ms/frame)**; the qemu core's sandbox reaches the settled screen in
+  **7-11 min wall (119-372 ms/frame)** - 50-100x. The gap buys a whole
+  real PC: firmware POST, El Torito, a PC keyboard, and full-system
+  state determinism rather than a DOS-process machine. Benchmark lives at
+  `waterbox/bench-dos.sh` (timings are sleep-fragile; see its header).
 
 ## Deferred
 
-Audio (AC97/SB16 need the xemu-APU virtual-clock treatment), mouse/tablet,
+Audio (AC97/SB16 need the xemu-APU virtual-clock treatment), mouse/tablet
+(the kernel already probes the PS/2 mouse port on serio1),
 persistent disk export (the COW overlay is not yet a file), q35/`-machine`
 setting, i386 distros.
+
+## The per-frame "floor" investigation (2026-09-05) - it was a phantom
+
+Measured on FreeDOS disc boot, native, host-quiet back-to-back runs
+(CHIMERA_TRACE_FRAMES now prints per-frame wall us alongside the late-ns
+overshoot - env-gated diagnostic, inert in the package):
+
+- **The machinery floor is ~1.2 ms/frame** (halted SeaBIOS, no disc,
+  governor parked; 2.6 ms with the 1ms governor). vm_stop/start, scanout,
+  timer arming: all cheap. There is no fat floor to shave.
+- **Halt-based idle is already free.** ISOLINUX menu.c32 halts between
+  ticks: 1.4 ms/frame median at shift=4 with the production 1ms governor.
+  The warp machinery works.
+- **The governor is load-bearing, not overhead.** Parking it
+  (CHIMERA_DEBUG_NOGOV) is machine-identical (state md5 proof) and saves
+  13% on executing phases, but the vCPU then blows frame boundaries by a
+  median ~27 ms (the 1ms ticks are what re-clamp the icount budget to the
+  frame timer). Keep it.
+- **Executing phases are the wall, with a pathological twist:** at
+  shift=3 the DOS prompt runs ~46 ms/frame; at shift=4 (HALF the
+  instruction budget) the same phase costs ~230 ms/frame - ~220 ns per
+  guest instruction, vs ~3 ns for pure TCG and ~22-40 ns at shift=3.
+  Confirmed back-to-back (132 s vs 341 s for the same 4600 frames), so it
+  is not host noise. NOT translation thrash: a `translate_block` trace
+  shows ~599k TBs in POST/menu and then +26 translations while the slow
+  phases grind - the TB cache is stable. Something in the
+  icount/warp/exec-dispatch path (patch 0004 "warp-only-on-halt" territory)
+  makes per-TB dispatch ~2 us at shift=4. That is the follow-up
+  investigation, and it is worth up to ~50x on executing phases.
+
+Practical settings advice unchanged (shift 3-4 for DOS-era guests is
+still right at the menu/idle level, but the shift=4 execution pathology
+argues shift=3 over 4 until understood).
+
+## Known frontend bugs (2026-09-04, both reproduce headless)
+
+- **Movieless projects livelock the run loop.** A project with no movie
+  (or a degenerate zero-row input log) runs ~5 frames, then the frontend
+  spins forever at ~170% CPU in an input-event storm that cascades into
+  an InputRoll layout loop (WinForms); no thread ever reaches the core
+  again. Proven by mono method tracing (`--trace`, 5M lines: HandleButton
+  13k/30s). NOT config/display/greenzone/GL/core-build related - ruled
+  out pairwise; the upstream pre-merge bundle behaves identically, so it
+  predates the merge. **Workaround (what doomrun ships): the project
+  manifest carries a real 57-frame quiet movie** cloned from gamerun's
+  proven shape; rerecord from there. Fix belongs in the frontend's
+  movieless step path (MainForm.StepRunLoop_Core / Input.Update).
+- **The "Locate Project Files" dialog blocks headless runs silently.**
+  ProjectResolutionForm (files not beside the project) is not one of the
+  modals the headless guard exits on - it just pumps forever and looks
+  like a hang. Diagnostic lesson: with DISPLAY visible, check the window
+  list (xwininfo -root -tree) before believing a "deadlock".
 
 ## Handoff: how to run everything
 
@@ -182,12 +293,19 @@ setting, i386 distros.
   minute; type at the PC's keyboard. For disc boot, copy that project and
   swap the files to one entry naming the ISO with `"slot": "disc"` - it
   boots to the shell in ~2 minutes (ISOLINUX waits 30 virtual seconds at
-  its `boot:` prompt unless Enter is pressed).
+  its `boot:` prompt unless Enter is pressed). FreeDOS works the same way
+  (`FD14LIVE.iso` in the disc slot, Enter skips menu.c32's 50 s menu).
 - **Package:** `sh ~/chimera-core-qemu/waterbox/build-package.sh` →
   `~/chimera/build/Cores/qemu.chimeraCore` (deterministic zip; sha1 printed).
 - **The gate:** `sh ~/chimera-core-qemu/waterbox/run-gate.sh [frames]` (A==B==
   sandbox); `CHIMERA_KERNEL=… CHIMERA_INITRD=…` env knobs for the kernel leg
-  on native, `--kernel/--initrd` on run-wbx.
+  on native, `--kernel/--initrd` on run-wbx. `CHIMERA_APPEND` (the WHOLE
+  command line) matches run-wbx `--append` and the project's kappend file.
+- **The eye: `waterbox/shoot-native.sh FRAMES [TAG]`** - one fresh
+  self-describing native run (own directory under build/shots/, video PNG +
+  state + qemu log + md5s), and **`waterbox/bgra.py`** - `png FILE`,
+  `info FILE` (dims/histogram/blit-structure check), `diff A B` (per-pixel
+  change + bounding box). No ad-hoc python, no stale /tmp files.
 - **The frontend check:** `sh ~/chimera-core-qemu/waterbox/run-frontend.sh`
   (mono headless vs run-wbx, pc.ram byte-compare; `--work DIR` keeps dumps).
 - **Engine harness:** `~/chimera/build/meson-linux/chimera-run --project <p>
