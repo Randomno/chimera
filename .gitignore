@@ -54,3 +54,4 @@ mono_crash.*.json
 
 # game data for local testing - never shipped, never committed
 /roms/
+projects/

@@ -94,6 +94,10 @@
 	url = https://github.com/ToolAssisted-run/chimera-core-xemu.git
 	branch = main
 [submodule "qemu"]
+	path = extern/cores/qemu
+	url = https://github.com/Randomno/chimera-core-qemu.git
+	branch = main
+	ignore = dirty
 	url = https://github.com/Randomno/chimera-core-qemu.git
 [submodule "extern/cores/dolphin"]
 	path = extern/cores/dolphin
