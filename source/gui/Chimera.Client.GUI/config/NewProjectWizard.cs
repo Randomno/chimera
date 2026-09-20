@@ -33,7 +33,7 @@ namespace Chimera.Client.GUI
 		private readonly IReadOnlyList<DiscoveredCorePackage> _cores;
 		private readonly Func<ProjectSlotDeclaration.Slot, string[]> _pickFiles;
 
-		private readonly Panel[] _pages = new Panel[4];
+		private readonly Panel[] _pages = new Panel[5];
 		private int _page;
 
 		// page 1
@@ -48,6 +48,26 @@ namespace Chimera.Client.GUI
 		private readonly ComboBox _machine;
 
 		private readonly Label _machineLabel;
+
+		// page 5: what the core must compile for this game before it can run it
+		/// <summary>the config a precompile session must run with, so it sees the same paths</summary>
+		private readonly string? _configPath;
+
+		private ListView _precompileList;
+		private Button _precompileButton;
+		private Label _precompileStatus;
+		private ProgressBar _precompileBar;
+		private CoreCacheManifest? _precompileManifest;
+		private bool _precompiling;
+
+		/// <summary>the game's modules, and how many the sessions have finished</summary>
+		private uint _precompileExpected;
+
+		/// <summary>Cancel was pressed while the sessions were running</summary>
+		private bool _precompileCancelled;
+
+		/// <summary>and the window is to close once they have stopped</summary>
+		private bool _closeAfterPrecompile;
 
 		/// <summary>
 		/// Which renderer draws, for a core that offers a choice. It sits beside the
@@ -68,6 +88,9 @@ namespace Chimera.Client.GUI
 		/// <summary>the package whose declaration <see cref="_cfg"/> holds</summary>
 		private string? _cfgCore;
 		private readonly Dictionary<string, ListBox> _slotLists = new();
+
+		/// <summary>Per slot that orders its files: re-evaluates whether Up and Down apply.</summary>
+		private readonly Dictionary<string, Action> _slotOrderRefresh = new();
 		private readonly Dictionary<string, GroupBox> _slotGroups = new();
 		private readonly ToolTip _tips = new();
 
@@ -83,6 +106,23 @@ namespace Chimera.Client.GUI
 		private readonly Func<string, string?> _pickFirmwareFile;
 		private readonly IReadOnlyList<string> _firmwareSearchDirs;
 		private readonly Func<string, string, string?> _rememberedFirmwarePath;
+
+		/// <summary>
+		/// Every path remembered for a core, whichever dump it was for: a person may
+		/// own several releases of one bios, chosen in Config > Firmware or in an
+		/// earlier project, and the page finds them by hash wherever they lie.
+		/// </summary>
+		private readonly Func<string, IReadOnlyList<string>> _rememberedFirmwarePaths;
+
+		/// <summary>
+		/// Write the firmware chosen HERE into the config, and save it, before the
+		/// precompile sessions start. They are separate processes: they read the
+		/// config from DISK, and their only firmware source is what it remembers
+		/// (CoreFirmwareStore.ProviderFor). The owner remembers these paths too,
+		/// but only after this wizard returns - which is after the sessions have
+		/// already run and failed to find any.
+		/// </summary>
+		private readonly Action<string, IReadOnlyDictionary<string, string>> _rememberFirmwareNow;
 		private readonly ListView _firmwareList;
 		private readonly Button _firmwareSetButton;
 		private readonly Button _firmwareClearButton;
@@ -127,13 +167,21 @@ namespace Chimera.Client.GUI
 			Func<string, string?>? pickFirmwareFile = null,
 			IReadOnlyList<string>? firmwareSearchDirs = null,
 			Func<string?>? pickFirmwareFolder = null,
-			Func<string, string, string?>? rememberedFirmwarePath = null)
+			Func<string, string, string?>? rememberedFirmwarePath = null,
+			Action<string, IReadOnlyDictionary<string, string>>? rememberFirmwareNow = null,
+			string? configPath = null,
+			Func<string, IReadOnlyList<string>>? rememberedFirmwarePaths = null)
 		{
+			_rememberedFirmwarePaths = rememberedFirmwarePaths ?? (static _ => [ ]);
+			_configPath = configPath;
 			_pickFirmwareFile = pickFirmwareFile ?? (static _ => null);
 			_firmwareSearchDirs = firmwareSearchDirs ?? [ ];
 			_pickFirmwareFolder = pickFirmwareFolder;
 			_rememberedFirmwarePath = rememberedFirmwarePath ?? (static (_, _) => null);
-			_cores = cores.Where(static c => c.Error is null).ToList();
+			_rememberFirmwareNow = rememberFirmwareNow ?? (static (_, _) => { });
+			// the versions of one core newest first (issue #67): the picker opens on the latest, and so
+			// does everything below that takes "the first package that ..."
+			_cores = CoreVersionDates.NewestFirst(cores.Where(static c => c.Error is null));
 			_pickFiles = pickFiles;
 
 			SuspendLayout();
@@ -165,9 +213,18 @@ namespace Chimera.Client.GUI
 				Location = Pt(110, 48),
 				Width = UIHelper.ScaleX(442),
 			};
+			// two builds of one core can be installed side by side (issue #63), and the version
+			// alone does not tell them apart when both are local builds of one commit
+			var sharedNames = _cores.GroupBy(static c => c.Name).Where(static g => g.Count() > 1).Select(static g => g.Key).ToList();
 			foreach (var core in _cores)
 			{
-				_core.Items.Add($"{core.Name}  ({SystemNames.Of(core.Systems)}{(string.IsNullOrEmpty(core.Version) ? "" : $", {core.Version}")})");
+				// the version at commit length, not the build script's full bookkeeping:
+				// this is a picker, and "12d65377b7d3-dirty+local" says nothing here
+				// that "12d65377 local" does not
+				var build = sharedNames.Contains(core.Name) && core.Sha1 is { Length: >= 8 } ? $"  [package {core.Sha1.Substring(0, 8)}]" : "";
+				// dated (issue #67): a commit says which version this is, and only a date says which is newer
+				var version = core.DatedVersion;
+				_core.Items.Add($"{core.Name}  ({SystemNames.Of(core.Systems)}{(version.Length is 0 ? "" : $", {version}")}){build}");
 			}
 			p1.Controls.Add(_core);
 
@@ -251,6 +308,11 @@ namespace Chimera.Client.GUI
 				UpdateNavLabels();
 			};
 			p3.Controls.Add(_settingsGrid);
+			// AFTER the page owns it: the box goes in beside the grid, and a grid
+			// with no parent has nowhere to put one. A core describes its settings
+			// in paragraphs (waterbox.config) and the grid's own pane holds two
+			// lines of them (issue #41).
+			_settingsGrid.UseScrollableDescription();
 
 			// ---- page 4: firmware, decided by everything chosen above ------------
 			var p4 = _pages[3];
@@ -272,14 +334,61 @@ namespace Chimera.Client.GUI
 			_firmwareList.Columns.Add("Status", UIHelper.ScaleX(160));
 			_firmwareList.SelectedIndexChanged += (_, _) => UpdateFirmwareButtons();
 			_firmwareList.DoubleClick += (_, _) => SetFirmwareFile();
-			_firmwareSetButton = new Button { AutoSize = true, Location = Pt(8, 344), Text = "Select File..." };
+			_firmwareSetButton = new Button { Anchor = AnchorStyles.Bottom | AnchorStyles.Left, AutoSize = true, Location = Pt(8, 344), Text = "Select File..." };
 			_firmwareSetButton.Click += (_, _) => SetFirmwareFile();
-			_firmwareClearButton = new Button { AutoSize = true, Location = Pt(110, 344), Text = "Clear" };
+			_firmwareClearButton = new Button { Anchor = AnchorStyles.Bottom | AnchorStyles.Left, AutoSize = true, Location = Pt(110, 344), Text = "Clear" };
 			_firmwareClearButton.Click += (_, _) => ClearFirmwareFile();
-			Button firmwareScanButton = new() { AutoSize = true, Location = Pt(178, 344), Text = "Scan Folder..." };
+			Button firmwareScanButton = new() { Anchor = AnchorStyles.Bottom | AnchorStyles.Left, AutoSize = true, Location = Pt(178, 344), Text = "Scan Folder..." };
 			firmwareScanButton.Click += (_, _) => ScanFirmwareFolder();
 			firmwareScanButton.Visible = pickFirmwareFolder is not null;
 			p4.Controls.AddRange([ _firmwareList, _firmwareSetButton, _firmwareClearButton, firmwareScanButton ]);
+
+			// ---- page 5: the code the core compiles for this game -----------------
+			var p5 = _pages[4];
+			p5.Controls.Add(MakeHeading("This game's code must be recompiled before it can be played."));
+			p5.Controls.Add(new Label
+			{
+				AutoSize = false,
+				Location = Pt(8, 52),
+				Size = new(UIHelper.ScaleX(544), UIHelper.ScaleY(44)),
+				Text = "This core translates the console's code into your machine's before running it. "
+					+ "Doing it once now, in parallel, is what makes the game fast enough to work on; "
+					+ "otherwise every session pays for it again. It can take several minutes. The result "
+					+ "depends only on the game and this core, so it is the same on every machine and is "
+					+ "not part of the run.",
+			});
+			_precompileList = new ListView
+			{
+				Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right,
+				FullRowSelect = true,
+				HideSelection = false,
+				Location = Pt(8, 100),
+				MultiSelect = false,
+				ShowItemToolTips = true,
+				Size = new(UIHelper.ScaleX(544), UIHelper.ScaleY(216)),
+				View = View.Details,
+			};
+			_precompileList.Columns.Add("Compiled Module", UIHelper.ScaleX(300));
+			_precompileList.Columns.Add("SHA1", UIHelper.ScaleX(180));
+			_precompileList.Columns.Add("State", UIHelper.ScaleX(72));
+			_precompileBar = new ProgressBar
+			{
+				Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right,
+				Location = Pt(8, 322),
+				Maximum = 1,
+				Size = new(UIHelper.ScaleX(544), UIHelper.ScaleY(14)),
+				Visible = false,
+			};
+			_precompileButton = new Button { Anchor = AnchorStyles.Bottom | AnchorStyles.Left, AutoSize = true, Location = Pt(8, 344), Text = "Compile" };
+			_precompileButton.Click += (_, _) => RunPrecompile();
+			_precompileStatus = new Label
+			{
+				Anchor = AnchorStyles.Bottom | AnchorStyles.Left,
+				AutoEllipsis = true,
+				Location = Pt(96, 349),
+				Size = new(UIHelper.ScaleX(456), UIHelper.ScaleY(16)),
+			};
+			p5.Controls.AddRange([ _precompileList, _precompileBar, _precompileButton, _precompileStatus ]);
 
 			// ---- chrome ----------------------------------------------------------
 			// Width is set below, once the buttons have been placed: a fixed one
@@ -292,9 +401,9 @@ namespace Chimera.Client.GUI
 				Location = Pt(8, 386),
 				Size = new(UIHelper.ScaleX(360), UIHelper.ScaleY(16)),
 			};
-			_backButton = MakeNavButton("< Back", () => ShowPage(_page - 1));
+			_backButton = MakeNavButton("< Back", GoBack);
 			_nextButton = MakeNavButton("Next >", Advance);
-			Button cancel = MakeNavButton("Cancel", () => { DialogResult = DialogResult.Cancel; Close(); });
+			Button cancel = MakeNavButton("Cancel", CancelPressed);
 			// laid out from the RIGHT EDGE inward, with the same margin the page
 			// content has on the left: hand-placed x positions plus an auto-sized
 			// button had Cancel hanging over the window's edge
@@ -383,6 +492,11 @@ namespace Chimera.Client.GUI
 			b.Click += (_, _) => onClick();
 			return b;
 		}
+
+		/// <summary>The core picker as it reads, top to bottom, and which line it is on (for tests).</summary>
+		public IReadOnlyList<string> CoreChoiceLines => _core.Items.Cast<object>().Select(static o => o.ToString() ?? "").ToList();
+
+		public int CoreChoiceIndex => _core.SelectedIndex;
 
 		private DiscoveredCorePackage? ChosenCore
 			=> _core.SelectedIndex is >= 0 and var i && i < _cores.Count ? _cores[i] : null;
@@ -539,11 +653,11 @@ namespace Chimera.Client.GUI
 				}
 			}
 
-			if (_cfg?.HasMachines is true)
+			if (_cfg?.Machines is { Count: > 0 } machines)
 			{
 				var effective = WaterboxCore.EffectiveSettingsFor(_cfg, _settings);
 				var machine = _cfg.MachineFor(effective);
-				var at = machine is null ? -1 : _cfg.Machines.IndexOf(machine);
+				var at = machine is null ? -1 : machines.IndexOf(machine);
 				if (at >= 0) _machine.SelectedIndex = at;
 			}
 			// read before the pickers are refreshed: refreshing them selects the
@@ -624,9 +738,9 @@ namespace Chimera.Client.GUI
 		/// warning that is always on screen is a warning nobody reads.
 		/// </summary>
 		internal const string HardwareRendererCaveat =
-			"Hardware renderers are much faster, but carry a slightly higher chance of desync. "
-			+ "Check now and then that your movie still syncs: clear its greenzone in TAStudio and replay it from the start. "
-			+ "If you need a guarantee, choose a software renderer.";
+			"Hardware renderers use your PC's GPU: fast, but the picture is drawn outside the savestate, so video "
+			+ "can differ on another PC. The greenzone is kept between sessions, unless Chimera closed unexpectedly - "
+			+ "then it replays.";
 
 		private void ShowRendererCaveat()
 			=> _rendererCaveat.Text = IsHardware(ChosenRenderer) ? HardwareRendererCaveat : "";
@@ -670,10 +784,17 @@ namespace Chimera.Client.GUI
 		/// </summary>
 		private void PinMachine()
 		{
-			if (_cfg?.HasMachines is not true || _settings is null) return;
-			var index = Math.Max(0, Math.Min(_cfg.Machines.Count - 1, _machine.SelectedIndex));
-			var machine = _cfg.Machines[index];
-			_settings.Values[_cfg.MachineSetting] = machine.When is { Count: > 0 } ? machine.When[0] : machine.Id;
+			// the package's own loader refuses machines without a setting to pick
+			// between them, so these two are there together or not at all
+			if (_cfg?.Machines is not { Count: > 0 } machines
+				|| _cfg.MachineSetting is not { Length: > 0 } machineSetting
+				|| _settings is null)
+			{
+				return;
+			}
+			var index = Math.Max(0, Math.Min(machines.Count - 1, _machine.SelectedIndex));
+			var machine = machines[index];
+			_settings.Values[machineSetting] = machine.When is { Count: > 0 } ? machine.When[0] : machine.Id ?? "";
 			// the machine decides which files the project takes, so a form built for
 			// another machine is stale
 			_declarationCore = null;
@@ -681,9 +802,54 @@ namespace Chimera.Client.GUI
 
 		/// <summary>The machine chosen on page one, for tests.</summary>
 		public string? ChosenMachine
-			=> _cfg?.HasMachines is true && _machine.SelectedIndex >= 0
-				? _cfg.Machines[_machine.SelectedIndex].Id
+			=> _cfg?.Machines is { Count: > 0 } machines && _machine.SelectedIndex >= 0
+				? machines[_machine.SelectedIndex].Id
 				: null;
+
+		/// <summary>
+		/// Cancel while a compile is running stops it: the sessions are killed and
+		/// the window closes once they have. Closing the window does the same,
+		/// because a window that has gone is not waiting for anything either - and
+		/// neither can happen the direct way, since the compile is pumping
+		/// messages from inside a click handler and nothing may unwind under it.
+		/// </summary>
+		private void CancelPressed()
+		{
+			if (_precompiling)
+			{
+				_precompileCancelled = true;
+				_closeAfterPrecompile = true;
+				_precompileStatus.Text = "Stopping...";
+				return;
+			}
+			DialogResult = DialogResult.Cancel;
+			Close();
+		}
+
+		protected override void OnFormClosing(FormClosingEventArgs e)
+		{
+			if (_precompiling)
+			{
+				_precompileCancelled = true;
+				_closeAfterPrecompile = true;
+				_precompileStatus.Text = "Stopping...";
+				e.Cancel = true;
+				return;
+			}
+			base.OnFormClosing(e);
+		}
+
+		/// <summary>Back walks over the steps that did not apply on the way here.</summary>
+		private void GoBack()
+		{
+			for (var i = _page - 1; i >= 0; i--)
+			{
+				if (!PageApplies(i)) continue;
+				ShowPage(i);
+				return;
+			}
+			ShowPage(0);
+		}
 
 		private void ShowPage(int page)
 		{
@@ -695,13 +861,37 @@ namespace Chimera.Client.GUI
 		}
 
 		/// <summary>
-		/// A machine that needs no firmware is not asked about firmware: the
-		/// settings step is then the last one, and its button says Create.
-		/// Whether it is depends on the current files and settings, so this is
-		/// re-asked whenever either changes.
+		/// Whether a step applies at all. A machine that needs no firmware is not
+		/// asked about firmware; a core that compiles nothing has nothing to
+		/// compile. Both depend on the choices made so far, so this is re-asked
+		/// whenever they change.
 		/// </summary>
-		private bool IsLastPage(int page)
-			=> page == _pages.Length - 1 || (page == 2 && !AnyFirmwareRequired());
+		private bool PageApplies(int page) => page switch
+		{
+			3 => AnyFirmwareRequired(),
+			4 => PrecompileApplies(),
+			_ => true,
+		};
+
+		/// <summary>The next step that applies after this one, or -1 when this is the last.</summary>
+		private int NextApplicablePage(int page)
+		{
+			for (var i = page + 1; i < _pages.Length; i++)
+			{
+				if (PageApplies(i)) return i;
+			}
+			return -1;
+		}
+
+		private bool IsLastPage(int page) => NextApplicablePage(page) < 0;
+
+		/// <summary>
+		/// Whether this core compiles the game's code before running it
+		/// (docs/compile-cache.md). Needs a core that says so and a game to
+		/// compile: a project whose files are not settled yet has neither.
+		/// </summary>
+		private bool PrecompileApplies()
+			=> _cfg?.Precompile is true && PrecompileRomPath() is not null;
 
 		/// <summary>
 		/// Which firmware the decisions so far call for - the cheap half of the
@@ -724,9 +914,18 @@ namespace Chimera.Client.GUI
 			UpdateCreateEnabled();
 		}
 
-		/// <summary>Create is not an error message: it is simply unavailable until every required firmware is satisfied.</summary>
+		/// <summary>
+		/// Create is not an error message: it is simply unavailable until the last
+		/// step is answered - every required firmware provided, and every module
+		/// this core must compile for the game compiled.
+		/// </summary>
 		private void UpdateCreateEnabled()
-			=> _nextButton.Enabled = _page != _pages.Length - 1 || MissingRequiredFirmware() is null;
+		{
+			if (_precompiling) { _nextButton.Enabled = false; return; }
+			if (!IsLastPage(_page)) { _nextButton.Enabled = true; return; }
+			_nextButton.Enabled = (_page != 3 || MissingRequiredFirmware() is null)
+				&& (_page != 4 || PrecompileSatisfied());
+		}
 
 		/// <summary>whether Create is currently available, for tests</summary>
 		public bool CreateEnabled => _nextButton.Enabled;
@@ -746,25 +945,322 @@ namespace Chimera.Client.GUI
 				case 1:
 					var complaint = CardinalityComplaint();
 					if (complaint is not null) { _status.Text = complaint; return; }
+					// the files are settled now - which they are, and in what order - so this is
+					// where the game is hashed, once, and not at every pick along the way
+					HashGameForPrecompileNow();
 					if (!BuildSettingsPage()) return;
 					ShowPage(2);
 					break;
 				case 2:
-					if (!AnyFirmwareRequired())
+				case 3:
+				default:
+					if (_page == 3)
 					{
-						// nothing to ask for: the settings step was the last one
+						var missing = MissingRequiredFirmware();
+						if (missing is not null) { _status.Text = $"{missing} is required and not provided"; return; }
+					}
+					if (_page == 4)
+					{
+						if (!PrecompileSatisfied()) { _status.Text = "Compile this game's code first."; return; }
 						Create();
 						break;
 					}
-					BuildFirmwarePage();
-					ShowPage(3);
-					break;
-				default:
-					var missing = MissingRequiredFirmware();
-					if (missing is not null) { _status.Text = $"{missing} is required and not provided"; return; }
-					Create();
+					var next = NextApplicablePage(_page);
+					if (next < 0) { Create(); break; }
+					if (next == 3) BuildFirmwarePage();
+					if (next == 4) BuildPrecompilePage();
+					ShowPage(next);
 					break;
 			}
+		}
+
+		// ---- the code this core compiles for this game ---------------------------
+
+		/// <summary>
+		/// The game a precompile session would compile: the first file of the
+		/// first slot, which is the one a core boots. A slot list that is empty
+		/// means there is nothing to compile yet.
+		/// </summary>
+		/// <summary>a game named directly, for the tests and the screenshots</summary>
+		private string? _precompileRomOverride;
+
+		private string? PrecompileRomPath()
+		{
+			if (_precompileRomOverride is not null) return _precompileRomOverride;
+			foreach (var slot in _declaration?.Slots ?? [ ])
+			{
+				if (!_slotLists.TryGetValue(slot.Id, out var list)) continue;
+				if (list.Items.OfType<PickedFile>().FirstOrDefault() is { } file) return file.Path;
+			}
+			return null;
+		}
+
+		private string? _romSha1Path, _romSha1;
+
+		/// <summary>
+		/// Hashes the game when the file form is LEFT (Next), so that the compile
+		/// step opens on an answer instead of on a stall.
+		///
+		/// It used to run as each file was added, and that was the wrong moment
+		/// (user, 2026-09-17): a multi-gigabyte disc was read the instant it was
+		/// dropped, before the person had finished choosing - and which file is
+		/// "the game" is the FIRST of its slot, which adding, removing and
+		/// reordering all change. At Next the list is settled and it is read once.
+		///
+		/// Only for a core that compiles anything, and only for the file that
+		/// step would actually ask about. Nothing here is allowed to throw - a
+		/// game that fails to hash is one the compile step hashes itself, the way
+		/// it always did - and the answer lands in the same memo either way.
+		/// </summary>
+		private void HashGameForPrecompileNow()
+		{
+			if (_cfg?.Precompile is not true) return;
+			if (PrecompileRomPath() is not { } path) return;
+			if (_romSha1Path == path && _romSha1 is not null) return;
+			try
+			{
+				using var progress = ProgressDialog.Begin(this, "Adding game");
+				progress.Step($"hashing {Path.GetFileName(path)}");
+				PrecompileRomSha1();
+			}
+			catch (Exception)
+			{
+				// left for the compile step: this was an optimisation, not a duty
+			}
+		}
+
+		/// <summary>
+		/// The game's identity, which is what the precompiled code is filed
+		/// under (docs/compile-cache.md).
+		///
+		/// Taken through the ENGINE's hasher, not a private one: it answers
+		/// repeat calls from a cache keyed by path, size and mtime, and Create
+		/// hashes the very same file again when it adds it to the project. Two
+		/// independent hashings of a 5 GB disc image is one read too many, and
+		/// two notions of what a file's identity is, is one too many as well.
+		/// </summary>
+		private string? PrecompileRomSha1()
+		{
+			var path = PrecompileRomPath();
+			if (path is null || !File.Exists(path)) return null;
+			if (_romSha1Path == path && _romSha1 is not null) return _romSha1;
+			if (ChimeraEngine.Sha1OfFile(path) is not { } hashed) return null;
+			_romSha1 = hashed.Sha1;
+			_romSha1Path = path;
+			return _romSha1;
+		}
+
+		private string? PrecompileCacheDir()
+			=> _cfg is null ? null : WaterboxCore.CoreCacheDirectoryFor(WaterboxCore.CoreCacheRoot, PrecompileRomSha1());
+
+		/// <summary>Every module this game needs is compiled and unchanged.</summary>
+		private bool PrecompileSatisfied()
+			=> _precompileManifest is { Files.Count: not 0 } manifest && manifest.Satisfied(PrecompileCacheDir());
+
+		/// <summary>whether Create is available on the compile step, for tests</summary>
+		public bool PrecompileReady => PrecompileSatisfied();
+
+		/// <summary>what the compile step lists right now, for tests: name, hash, present</summary>
+		public IReadOnlyList<(string Name, string Sha1, bool Present)> PrecompileEntries
+			=> _precompileList.Items.Cast<ListViewItem>()
+				.Select(i => (i.SubItems[0].Text, i.SubItems[1].Text, i.ForeColor == Color.ForestGreen))
+				.ToList();
+
+		private void BuildPrecompilePage()
+		{
+			var manifest = CoreCacheManifest.Load(PrecompileCacheDir());
+			// Objects a DIFFERENT build of the package compiled are different
+			// code. The old layout kept them apart by filing them under the
+			// version; a game has one directory now, so the manifest is asked
+			// instead, and one that cannot vouch for itself is not believed.
+			_precompileManifest = manifest is not null && _cfg is not null
+				&& !manifest.CompiledBy(_cfg.CoreName, _cfg.Version)
+					? null
+					: manifest;
+			RefreshPrecompileList();
+		}
+
+		private void RefreshPrecompileList()
+		{
+			var dir = PrecompileCacheDir();
+			_precompileList.BeginUpdate();
+			_precompileList.Items.Clear();
+			foreach (var file in _precompileManifest?.Files ?? [ ])
+			{
+				var present = string.Equals(CoreCacheManifest.HashOf(dir, file.Name), file.Sha1, StringComparison.OrdinalIgnoreCase);
+				AddPrecompileRow(file.Name, file.Sha1, present);
+			}
+			_precompileList.EndUpdate();
+			UpdatePrecompileStatus();
+		}
+
+		/// <summary>
+		/// One module: green when its object is on disk and still what it was.
+		/// The name shown is the module's, not the whole path - the path is the
+		/// core's business and is in the tooltip for anyone who wants it.
+		/// </summary>
+		private void AddPrecompileRow(string name, string sha1, bool present)
+		{
+			ListViewItem item = new(name) { ForeColor = present ? Color.ForestGreen : Color.Firebrick, ToolTipText = name };
+			item.SubItems.Add(sha1);
+			item.SubItems.Add(present ? "Compiled" : "Missing");
+			_precompileList.Items.Add(item);
+			// follow the work: a compile puts these there one at a time over
+			// minutes, and a list that stays at the top shows the same first
+			// screenful throughout, looking stalled while it is anything but.
+			// Inside a BeginUpdate this costs nothing and leaves the finished
+			// list where the newest row is.
+			item.EnsureVisible();
+		}
+
+		/// <summary>
+		/// The bar fills with the modules compiled, out of what this game needed
+		/// last time. A game nobody has compiled yet has no total to fill
+		/// against, and the bar says "working" rather than pretending to know.
+		/// </summary>
+		private void UpdatePrecompileBar()
+		{
+			if (_precompileExpected is 0)
+			{
+				_precompileBar.Style = ProgressBarStyle.Marquee;
+				return;
+			}
+			_precompileBar.Style = ProgressBarStyle.Blocks;
+			_precompileBar.Maximum = (int)Math.Max(1, _precompileExpected);
+			_precompileBar.Value = Math.Min(_precompileList.Items.Count, _precompileBar.Maximum);
+		}
+
+		private void UpdatePrecompileStatus()
+		{
+			var total = _precompileList.Items.Count;
+			var green = _precompileList.Items.Cast<ListViewItem>().Count(i => i.ForeColor == Color.ForestGreen);
+			// While it runs, a row exists only once its module is compiled, so the
+			// total cannot come from the list - it comes from the sessions, and
+			// only once they have looked at the game. Until then there is nothing
+			// honest to count, and saying so beats a number that means nothing.
+			_precompileStatus.Text = _precompiling
+				? _precompileExpected is not 0
+					? $"Compiling {green} of {_precompileExpected} modules..."
+					: green is 0
+						? "Calculating..."
+						: $"Compiling... {green} modules compiled"
+				: total is 0
+					? "This game has not been compiled yet."
+					: green == total
+						? $"All {total} modules compiled."
+						: $"{total - green} of {total} modules are missing.";
+			_precompileStatus.ForeColor = !_precompiling && total is not 0 && green == total ? Color.ForestGreen : SystemColors.ControlText;
+			// Compile is offered exactly when there is compiling left to do
+			_precompileButton.Enabled = !_precompiling && !PrecompileSatisfied();
+			UpdateCreateEnabled();
+		}
+
+		/// <summary>
+		/// Compiles the game, in as many sessions as the machine can use. The list
+		/// fills as the objects land, so the wait shows what it is doing rather
+		/// than a bar with no content.
+		/// </summary>
+		private void RunPrecompile()
+		{
+			var romPath = PrecompileRomPath();
+			if (romPath is null || ChosenCore is null) return;
+
+			_precompiling = true;
+			_precompileCancelled = false;
+			// what this game needed last time, when it was compiled before
+			_precompileExpected = (uint)(_precompileManifest?.Files.Count ?? 0);
+			_precompileBar.Visible = true;
+			_precompileBar.Value = 0;
+			// nothing behind this step may be changed while it runs: the sessions
+			// are compiling for the game and the settings as they stand
+			_backButton.Enabled = false;
+			_precompileList.Items.Clear();
+			UpdatePrecompileStatus();
+			// the click handler owns the thread from here, so what it has just
+			// said must be painted before it does anything slow - and hashing a
+			// disc image is slow
+			_precompileStatus.Refresh();
+			_precompileButton.Refresh();
+			Application.DoEvents();
+
+			var romSha1 = PrecompileRomSha1();
+			var dir = PrecompileCacheDir();
+			if (romSha1 is null || dir is null)
+			{
+				_precompiling = false;
+				_precompileBar.Visible = false;
+				_backButton.Enabled = _page > 0;
+				UpdatePrecompileStatus();
+				return;
+			}
+
+			var seen = new HashSet<string>(StringComparer.Ordinal);
+			void Entry(PrecompileOrchestrator.Entry entry)
+			{
+				// arrives on a worker's reader thread; the list is the UI's
+				BeginInvoke(new Action(() =>
+				{
+					if (!seen.Add(entry.Name)) return;
+					AddPrecompileRow(entry.Name, entry.Sha1, present: true);
+					UpdatePrecompileBar();
+					UpdatePrecompileStatus();
+				}));
+			}
+			// The sessions cannot tell how many modules this game has until they
+			// have compiled them: most objects come from the executable and what
+			// it loads, which every session walks and each compiles a share of.
+			// So the only honest total is one a previous compile left behind.
+			void Progress(uint modulesDone, uint modulesTotal)
+			{
+			}
+
+			// The sessions are child processes reading the config off disk, so
+			// whatever firmware was chosen on the firmware page has to BE there
+			// before they start. Without this a core that needs firmware compiles
+			// nothing: the session boots, is refused for want of it, and exits.
+			_rememberFirmwareNow(ChosenCore.Name, ProvidedFirmwarePaths);
+
+			var manifest = PrecompileOrchestrator.Run(
+				ChosenCore.Path, _configPath, romPath, romSha1, dir,
+				_cfg?.CoreName ?? ChosenCore.Name, _cfg?.Version ?? "",
+				Entry, Progress, cancelled: PumpAndCheckCancel,
+				firmware: ProvidedFirmwarePaths);
+
+			_precompiling = false;
+			_precompileBar.Visible = false;
+			_backButton.Enabled = _page > 0;
+			if (manifest is not null) _precompileManifest = manifest;
+			RefreshPrecompileList();
+			if (_closeAfterPrecompile)
+			{
+				// the window was asked to go while the sessions were running; they
+				// have stopped, so now it can
+				DialogResult = DialogResult.Cancel;
+				Close();
+				return;
+			}
+			if (manifest is null)
+			{
+				// Say WHY. The sessions are headless frontends, so a refusal is a
+				// modal they could not show - most often firmware this core calls
+				// optional but this GAME needs. Without the reason the person is
+				// told only that nothing happened, and on Windows the parent has no
+				// console for the detail to go to either.
+				_status.Text = PrecompileOrchestrator.LastFailure is { Length: not 0 } why
+					? $"The compile stopped: {why}"
+					: "The compile was stopped; this game is not compiled.";
+			}
+		}
+
+		/// <summary>
+		/// Keeps the window alive while the sessions work - without this the list
+		/// never paints and the window is a grey rectangle - and reports whether
+		/// the person asked to stop while it was pumping.
+		/// </summary>
+		private bool PumpAndCheckCancel()
+		{
+			Application.DoEvents();
+			return _precompileCancelled || IsDisposed;
 		}
 
 		// ---- the core-informed form ----------------------------------------------
@@ -818,6 +1314,28 @@ namespace Chimera.Client.GUI
 		}
 
 		/// <summary>
+		/// Shows the compile step for a core and a game, without walking the pages
+		/// before it - the test and screenshot door for the step.
+		/// </summary>
+		/// <summary>
+		/// Starts the compile the way the button does - the test door for the
+		/// ORDER the sessions depend on: the firmware they will need has to be in
+		/// the config before they are spawned, because they are separate processes
+		/// that read it off disk.
+		/// </summary>
+		internal void RunPrecompileForTest() => RunPrecompile();
+
+		internal void UsePrecompileFrom(WaterboxConfig cfg, string cacheRoot, string romPath)
+		{
+			_cfg = cfg;
+			_settings ??= new WaterboxCoreSettings();
+			WaterboxCore.CoreCacheRoot = cacheRoot;
+			_precompileRomOverride = romPath;
+			BuildPrecompilePage();
+			ShowPage(4);
+		}
+
+		/// <summary>
 		/// Offers a given core's renderers without leaving page one - the test and
 		/// screenshot door for the dropdown beside the core.
 		/// </summary>
@@ -855,7 +1373,7 @@ namespace Chimera.Client.GUI
 
 		/// <summary>the exposed settings, in order, for tests</summary>
 		public string[] ExposedSettingNames
-			=> (_settings?.Declarations ?? [ ]).Select(static d => d.Name).ToArray();
+			=> (_settings?.Declarations ?? [ ]).Select(static d => d.Name ?? "").ToArray();
 
 		/// <summary>sets a value as the grid would, re-running the gate - for tests</summary>
 		internal void SetSettingValue(string name, object value)
@@ -880,6 +1398,7 @@ namespace Chimera.Client.GUI
 			_slotsHost.Controls.Clear();
 			_slotLists.Clear();
 			_slotGroups.Clear();
+			_slotOrderRefresh.Clear();
 			var y = 0;
 			// What the chosen MACHINE exposes, before any file is picked. A slot
 			// only a different sub-system takes is not an option that is greyed -
@@ -910,7 +1429,8 @@ namespace Chimera.Client.GUI
 					Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
 					IntegralHeight = false,
 					Location = Pt(8, 18),
-					Size = new(UIHelper.ScaleX(402), UIHelper.ScaleY(70)),
+					// a slot that takes several files leaves room for the two buttons that order them
+					Size = new(UIHelper.ScaleX(slot.Max is 1 ? 402 : 368), UIHelper.ScaleY(70)),
 				};
 				_tips.SetToolTip(list, help);
 
@@ -928,18 +1448,53 @@ namespace Chimera.Client.GUI
 					foreach (var path in DroppedPaths(e)) AddFileToSlot(slot.Id, path);
 				};
 
-				Button add = new() { AutoSize = true, Location = Pt(416, 18), Text = "Add..." };
+				// The buttons are anchored to the RIGHT like the list is, so a wider
+				// window widens the list and moves them along; anchored to the left
+				// they stayed put and the list grew over them (issue #103).
+				Button add = new() { Anchor = AnchorStyles.Top | AnchorStyles.Right, AutoSize = true, Location = Pt(416, 18), Text = "Add..." };
 				add.Click += (_, _) =>
 				{
 					foreach (var path in _pickFiles(slot)) AddFileToSlot(slot.Id, path);
 				};
-				Button remove = new() { AutoSize = true, Location = Pt(416, 48), Text = "Remove" };
+				Button remove = new() { Anchor = AnchorStyles.Top | AnchorStyles.Right, AutoSize = true, Location = Pt(416, 48), Text = "Remove" };
 				remove.Click += (_, _) =>
 				{
 					if (list.SelectedIndex >= 0) list.Items.RemoveAt(list.SelectedIndex);
 					RefreshSlotAvailability();
 				};
 				group.Controls.AddRange([ list, add, remove ]);
+
+				// THE ORDER IS PART OF THE MACHINE, not a convenience: the first file is what is in
+				// the drive at boot and the rest follow in swap order, and a PC-98 game can want
+				// its second disk booted. It used to be fixed by the order files happened to be
+				// added in, and the only way to change it was to remove everything and start again.
+				if (slot.Max is not 1)
+				{
+					Button MakeArrow(string glyph, string tip, int top, int delta)
+					{
+						Button b = new()
+						{
+							Anchor = AnchorStyles.Top | AnchorStyles.Right,
+							Location = Pt(378, top),
+							Size = new(UIHelper.ScaleX(32), UIHelper.ScaleY(28)),
+							Text = glyph,
+							Enabled = false,
+						};
+						_tips.SetToolTip(b, tip);
+						b.Click += (_, _) => MoveFileInSlot(slot.Id, list.SelectedIndex, delta);
+						return b;
+					}
+					var up = MakeArrow("\u25B2", "Move up: earlier in the swap order. The first file is the one in the drive at boot.", 18, -1);
+					var down = MakeArrow("\u25BC", "Move down: later in the swap order.", 50, +1);
+					void Refresh()
+					{
+						up.Enabled = list.SelectedIndex > 0;
+						down.Enabled = list.SelectedIndex >= 0 && list.SelectedIndex < list.Items.Count - 1;
+					}
+					list.SelectedIndexChanged += (_, _) => Refresh();
+					_slotOrderRefresh[slot.Id] = Refresh;
+					group.Controls.AddRange([ up, down ]);
+				}
 				_slotsHost.Controls.Add(group);
 				_slotLists[slot.Id] = list;
 				_slotGroups[slot.Id] = group;
@@ -1056,12 +1611,59 @@ namespace Chimera.Client.GUI
 					: [ ];
 
 		/// <summary>Adds a file to a slot's list; public in behaviour so tests can drive the form without a picker.</summary>
+		/// <summary>
+		/// Moves the file at <paramref name="index"/> of a slot one place up (-1) or down (+1) and
+		/// keeps it selected, so the same button can be pressed again. Out of range is nothing.
+		/// </summary>
+		public void MoveFileInSlot(string slotId, int index, int delta)
+		{
+			if (!_slotLists.TryGetValue(slotId, out var list)) return;
+			var to = index + delta;
+			if (index < 0 || index >= list.Items.Count || to < 0 || to >= list.Items.Count) return;
+			var moved = list.Items[index];
+			list.Items.RemoveAt(index);
+			list.Items.Insert(to, moved);
+			list.SelectedIndex = to;
+			if (_slotOrderRefresh.TryGetValue(slotId, out var refresh)) refresh();
+			// what is first decides things elsewhere (a slot exposed by an extension, the game
+			// the compile step asks about), exactly as adding and removing do
+			RefreshSlotAvailability();
+		}
+
+		/// <summary>The files of a slot, in order, for tests.</summary>
+		public IReadOnlyList<string> FilesInSlot(string slotId)
+			=> _slotLists.TryGetValue(slotId, out var list)
+				? list.Items.OfType<PickedFile>().Select(static f => f.Path).ToList()
+				: [ ];
+
 		public void AddFileToSlot(string slotId, string path)
 		{
 			if (!_slotLists.TryGetValue(slotId, out var list)) return;
 			if (_slotGroups.TryGetValue(slotId, out var g) && !g.Enabled) return;
 			var name = Path.GetFileName(path);
 			if (list.Items.OfType<PickedFile>().Any(f => f.Name == name)) return;
+
+			// a slot whose files are read BY NAME says which names (issue #105: a
+			// memory card called anything but vmu_A1.bin..vmu_D1.bin was taken here
+			// and refused by the core at boot, a screen later)
+			var namedSlot = _declaration?.Slots.FirstOrDefault(sl => sl.Id == slotId);
+			if (namedSlot?.NamePattern is { Length: not 0 } pattern)
+			{
+				bool matches;
+				try
+				{
+					matches = System.Text.RegularExpressions.Regex.IsMatch(name, pattern);
+				}
+				catch (ArgumentException)
+				{
+					matches = true; // a core that misspells its pattern refuses nothing
+				}
+				if (!matches)
+				{
+					_status.Text = $"{name}: {(namedSlot.NameHelp.Length is 0 ? namedSlot.Help : namedSlot.NameHelp)}";
+					return;
+				}
+			}
 
 			// a cue sheet is one pick, but its track files must be next to it -
 			// the same all-or-nothing rule the engine applies at creation,
@@ -1081,6 +1683,19 @@ namespace Chimera.Client.GUI
 			}
 
 			list.Items.Add(new PickedFile(name, path, tracks));
+
+			// A core that compiles its game's code files that code under the
+			// game's own hash, so the hash has to exist BEFORE the compile step
+			// opens - that step looks the game up to say what is already
+			// compiled, and looking it up is the first thing it does.
+			//
+			// Hashing here rather than there is what keeps that lookup instant.
+			// A disc image is gigabytes and the compile step used to hash one on
+			// the UI thread while building its page: a silent freeze, no
+			// progress, no cancel, at the exact moment the person arrived. Here
+			// the wait is where a wait is expected - they just chose a file -
+			// and it is said out loud. The engine memoizes by path, size and
+			// mtime, so Create's own hashing of the same file costs nothing.
 
 			// A slot that names its formats has still not been given a rule: the
 			// picker offers "All files" too, and a person who renamed something
@@ -1185,10 +1800,18 @@ namespace Chimera.Client.GUI
 				Newtonsoft.Json.JsonConvert.SerializeObject(effective));
 			// as the CHOSEN MACHINE has them: a package that is several machines
 			// narrows some settings per machine (a Master System port takes a pad
-			// or nothing, where a Mega Drive port takes six devices)
-			var all = _cfg.SettingsFor(_cfg.MachineFor(effective));
+			// or nothing, where a Mega Drive port takes six devices).
+			//
+			// Indexed against the PACKAGE's settings list, because that is the
+			// list the engine was handed and its indices count into. A narrowed
+			// list is shorter and renumbered; reading it at those indices lands
+			// on a different setting, the name check then rejects it, and every
+			// setting a machine narrows disappears - which is why a Neo Geo
+			// showed none of its DIP switches and a Game Boy no Fast Boot.
+			var all = _cfg.SettingsByDeclarationIndexFor(_cfg.MachineFor(effective));
 			var declarations = exposed
-				.Where(entry => entry.Index >= 0 && entry.Index < all.Count && all[entry.Index].Name == entry.Name)
+				.Where(entry => entry.Index >= 0 && entry.Index < all.Count
+					&& all[entry.Index] is { } decl && decl.Name == entry.Name)
 				.Select(entry => all[entry.Index])
 				// ...except the renderer and the machine, which are asked beside
 				// the core on page one and would only be asked twice here
@@ -1244,11 +1867,13 @@ namespace Chimera.Client.GUI
 				Newtonsoft.Json.JsonConvert.SerializeObject(effective));
 
 			// the Firmware folder answers first, plus anything remembered from
-			// earlier sessions - the user is only asked for what neither has
+			// earlier sessions - every dump ever chosen for this core, not only
+			// the one in use per id - and the user is only asked for what neither has
 			var remembered = needed
 				.Select(need => _rememberedFirmwarePath(ChosenCoreName ?? "", need.Id))
 				.Where(static path => path is not null)
-				.Select(static path => path!);
+				.Select(static path => path!)
+				.Concat(_rememberedFirmwarePaths(ChosenCoreName ?? ""));
 			_firmwareIndex = FirmwareLocator.BuildIndex(_firmwareSearchDirs, remembered);
 			BuildFirmwareNeeds(needed);
 			RenderFirmwareRows();
@@ -1266,13 +1891,29 @@ namespace Chimera.Client.GUI
 						? decls[entry.Index]
 						: decls.FirstOrDefault(d => d.Id == entry.Id),
 				};
-				// the requirement is one exact file; the folder either holds it
-				// (any name) or the user is asked
-				if (need.Decl is not null
-					&& FirmwareLocator.FindFor(need.Decl, _firmwareIndex) is { } found)
+				// A requirement that pins a hash is one exact file: the folder
+				// either holds it (under any name) or the user is asked.
+				//
+				// One that pins none - an Xbox disk image, a console's own
+				// identity dump, files no two people have the same copy of - can
+				// only be recognised by the name the core declares, or by where
+				// this machine last had it. Without that every xemu project asked
+				// for all four by hand, with the files sitting in the Firmware
+				// folder under exactly the names the page was showing (issue #38).
+				if (need.Decl is not null)
 				{
-					need.ChosenPath = found.Path;
-					need.ChosenSha1 = found.Sha1;
+					var found = FirmwareLocator.FindEither(need.Decl, _firmwareIndex);
+					if (found is null && string.IsNullOrEmpty(need.Decl.Sha1)
+						&& _rememberedFirmwarePath(ChosenCoreName ?? "", need.Id) is { } last)
+					{
+						found = _firmwareIndex.FirstOrDefault(f =>
+							f.Path.Equals(System.IO.Path.GetFullPath(last), StringComparison.OrdinalIgnoreCase));
+					}
+					if (found is not null)
+					{
+						need.ChosenPath = found.Path;
+						need.ChosenSha1 = found.Sha1;
+					}
 				}
 				return need;
 			}).ToList();
@@ -1447,6 +2088,12 @@ namespace Chimera.Client.GUI
 			=> _firmwareNeeds.Where(static n => n.ChosenPath is not null)
 				.ToDictionary(static n => n.Id, static n => n.ChosenPath!);
 
+		/// <summary>The same, by declaration: what to remember under each dump's own key, so the survey and later projects find it.</summary>
+		public IReadOnlyList<(Chimera.Emulation.Common.CoreFirmwareDecl Decl, string Path)> ProvidedFirmwareDumps
+			=> _firmwareNeeds.Where(static n => n.ChosenPath is not null && n.Decl is not null)
+				.Select(static n => (n.Decl!, n.ChosenPath!))
+				.ToList();
+
 		/// <summary>the requirement states, for tests</summary>
 		public bool FirmwareSatisfied(string id)
 			=> _firmwareNeeds.FirstOrDefault(n => n.Id == id)?.Satisfied is true;
@@ -1462,6 +2109,10 @@ namespace Chimera.Client.GUI
 			// NOT disposed here on success: the caller takes ownership of the
 			// finished project and boots the machine from it. On any failure
 			// below we dispose it ourselves and stay on the page.
+			// Create hashes every file the project takes - a disc image is
+			// gigabytes - so the wait says which file it is on
+			using var progress = ProgressDialog.Begin(this, "Creating project");
+			progress.Step("hashing the project's files");
 			var project = EngineProject.New();
 			project.SetCore(core.Name, core.Version ?? "", core.Sha1 ?? "");
 			// The platform, stamped at creation: reopening forces the pinned core
@@ -1503,8 +2154,8 @@ namespace Chimera.Client.GUI
 				Dictionary<string, object> recorded = new();
 				foreach (var decl in _settings?.Declarations ?? [ ])
 				{
-					recorded[decl.Name] = _settings!.Values is not null
-						&& _settings.Values.TryGetValue(decl.Name, out var value)
+					recorded[decl.Key] = _settings!.Values is not null
+						&& _settings.Values.TryGetValue(decl.Key, out var value)
 							? value
 							: decl.DefaultValue;
 				}
@@ -1514,8 +2165,8 @@ namespace Chimera.Client.GUI
 				// because the slot gates and the engine's own validation read it
 				if (RendererDecl() is { } rendererDecl)
 				{
-					recorded[rendererDecl.Name] = _settings?.Values is not null
-						&& _settings.Values.TryGetValue(rendererDecl.Name, out var chosen)
+					recorded[rendererDecl.Key] = _settings?.Values is not null
+						&& _settings.Values.TryGetValue(rendererDecl.Key, out var chosen)
 							? chosen
 							: rendererDecl.DefaultValue;
 				}
@@ -1537,6 +2188,20 @@ namespace Chimera.Client.GUI
 					pins.Add(new Newtonsoft.Json.Linq.JObject { ["id"] = need.Id, ["sha1"] = need.ChosenSha1 });
 				}
 				if (pins.Count is not 0) project.SetFirmwareJson(pins.ToString(Newtonsoft.Json.Formatting.None));
+			}
+
+			// What the core compiled for this game, by name and hash. The files
+			// themselves are not in the project - they regenerate from the same
+			// game and package - but the list is, so that opening this project
+			// later can say whether it is running the same compiled code.
+			if (_precompileManifest is { Files.Count: not 0 })
+			{
+				Newtonsoft.Json.Linq.JArray cache = new();
+				foreach (var file in _precompileManifest.Files)
+				{
+					cache.Add(new Newtonsoft.Json.Linq.JObject { ["name"] = file.Name, ["sha1"] = file.Sha1 });
+				}
+				project.SetCoreCacheJson(cache.ToString(Newtonsoft.Json.Formatting.None));
 			}
 
 			string? declarationJson = null;

@@ -138,6 +138,25 @@ namespace Chimera.Client.GUI
 			public bool EditInvisibleColumns { get; set; }
 			public int MainVerticalSplitDistance { get; set; }
 			public int BranchMarkerSplitDistance { get; set; }
+
+			/// <summary>
+			/// The sidebar's width, which is what a person actually chose - the
+			/// splitter DISTANCE above is the roll's width, and the roll is the
+			/// panel that grows with the window. Saved from a maximised window,
+			/// that distance was the width of a maximised roll, and restored into
+			/// a normal-sized window it left the sidebar its 25-pixel minimum,
+			/// which no amount of maximising afterwards undid because the sidebar
+			/// is the fixed panel (issue #15). Zero means never saved; the
+			/// distance is then used, as before.
+			/// </summary>
+			public int SidebarWidth { get; set; }
+
+			/// <summary>
+			/// Where the branches end and the markers begin, as a share of the
+			/// sidebar's height - the same fix for the same reason, since the
+			/// sidebar's height follows the window's. Zero means never saved.
+			/// </summary>
+			public double BranchMarkerSplitRatio { get; set; }
 			public bool BindMarkersToInput { get; set; }
 			public bool CopyIncludesFrameNo { get; set; }
 			public bool AutoadjustInput { get; set; } // Currently unsupported due to being broken
@@ -180,9 +199,9 @@ namespace Chimera.Client.GUI
 
 			public MovieClientSettings MovieSettings;
 
-			public IStateManagerSettings CurrentStateManagerSettings;
 
-			public IStateManagerSettings DefaultStateManagerSettings;
+
+
 		}
 
 		private MovieClientSettings _movieSettings = new();
@@ -226,9 +245,7 @@ namespace Chimera.Client.GUI
 
 		private void Tastudio_Load(object sender, EventArgs e)
 		{
-			MainVertialSplit.SetDistanceOrDefault(
-				Settings.MainVerticalSplitDistance,
-				_defaultMainSplitDistance);
+			RestoreMainSplit();
 			_activeInputRoll = MakeInputRoll(); // first because stuff in Engage assumes we have at least one
 
 			if (!Engage())
@@ -242,9 +259,7 @@ namespace Chimera.Client.GUI
 			_autosaveTimer.Tick += AutosaveTimerEventProcessor;
 			ScheduleAutoSave(Settings.AutosaveInterval);
 
-			BranchesMarkersSplit.SetDistanceOrDefault(
-				Settings.BranchMarkerSplitDistance,
-				_defaultBranchMarkerSplitDistance);
+			RestoreBranchMarkerSplit();
 
 			HandleHotkeyUpdate();
 
@@ -303,6 +318,7 @@ namespace Chimera.Client.GUI
 		{
 			var main = MainWindow;
 			if (main is null) return;
+			if (!MainWindowHasRealPosition(main)) return;
 			var wasDocked = Math.Abs(Left - _lastMainRight) <= UIHelper.ScaleX(12);
 			_lastMainRight = main.Right;
 			if (!wasDocked || !ShouldMovePair(main)) return;
@@ -323,6 +339,11 @@ namespace Chimera.Client.GUI
 		{
 			var main = MainWindow;
 			if (main is null) return;
+			// A minimised main window reports the (-32000,-32000) sentinel (and
+			// per MainForm can read it even while WindowState still says Normal).
+			// Recording that as our reference would make restoring the main
+			// window fling TAStudio ~32000px off-screen - it "never comes back".
+			if (!MainWindowHasRealPosition(main)) return;
 			var delta = new Size(main.Location.X - _lastMain.X, main.Location.Y - _lastMain.Y);
 			_lastMain = main.Location;
 			if (!ShouldMovePair(main)) return;
@@ -337,6 +358,17 @@ namespace Chimera.Client.GUI
 				_movingPair = false;
 			}
 		}
+
+		/// <summary>
+		/// A minimised main window reports the (-32000,-32000) sentinel - and per
+		/// MainForm can read it even while WindowState still says Normal. Its
+		/// position and size mean nothing there, so we neither follow it nor take
+		/// it as our reference point (which is what left TAStudio off-screen after
+		/// the main window was minimised and restored).
+		/// </summary>
+		private static bool MainWindowHasRealPosition(Form main)
+			=> main.WindowState is FormWindowState.Normal
+				&& main.Location is not { X: -32000, Y: -32000 };
 
 		/// <summary>
 		/// The main window's move is followed unless it was one WE made, the user
@@ -998,11 +1030,11 @@ namespace Chimera.Client.GUI
 			}
 		}
 
-		private FileWriteResult SaveTas(bool saveBackup = false)
+		private FileWriteResult SaveTas(bool saveBackup = false, bool withoutGreenzone = false)
 		{
 			if (string.IsNullOrEmpty(CurrentTasMovie.Filename) || CurrentTasMovie.Filename == DefaultTasProjName())
 			{
-				return SaveAsTas();
+				return SaveAsTas(withoutGreenzone);
 			}
 
 			_autosaveTimer.Stop();
@@ -1015,10 +1047,17 @@ namespace Chimera.Client.GUI
 			IMovie movieToSave = CurrentTasMovie;
 
 			FileWriteResult result;
-			if (saveBackup)
-				result = movieToSave.SaveBackup();
-			else
-				result = movieToSave.Save();
+			// the greenzone is the wait: hundreds of megabytes of states through
+			// zstd, and the window shows them going
+			using (ProgressDialog.Begin(this, saveBackup ? "Saving backup" : "Saving project"))
+			{
+				if (saveBackup)
+					result = movieToSave.SaveBackup();
+				else if (withoutGreenzone)
+					result = CurrentTasMovie.SaveWithoutGreenzone();
+				else
+					result = movieToSave.Save();
+			}
 
 			if (!result.IsError)
 			{
@@ -1036,7 +1075,7 @@ namespace Chimera.Client.GUI
 			return result;
 		}
 
-		private FileWriteResult SaveAsTas()
+		private FileWriteResult SaveAsTas(bool withoutGreenzone = false)
 		{
 			_autosaveTimer.Stop();
 
@@ -1059,7 +1098,7 @@ namespace Chimera.Client.GUI
 				MessageStatusLabel.Owner.Update();
 				Cursor = Cursors.WaitCursor;
 				CurrentTasMovie.Filename = fileInfo.FullName;
-				saveResult = CurrentTasMovie.Save();
+				saveResult = withoutGreenzone ? CurrentTasMovie.SaveWithoutGreenzone() : CurrentTasMovie.Save();
 				Settings.RecentTas.Add(CurrentTasMovie.Filename);
 				Cursor = Cursors.Default;
 
@@ -1124,19 +1163,41 @@ namespace Chimera.Client.GUI
 		}
 
 		/// <summary>
-		/// Get a savestate prior to the previous frame so code following the call can frame advance and have a framebuffer.
-		/// If frame is 0, return the initial state.
+		/// The frame the history would put us on to reach <paramref name="frame"/>:
+		/// the one BEFORE it, so whatever follows can advance once and have a
+		/// framebuffer. Asking does not move the machine.
 		/// </summary>
-		private KeyValuePair<int,Stream> GetPriorStateForFramebuffer(int frame)
+		private int PriorStateForFramebuffer(int frame)
+			=> CurrentTasMovie.States.Nearest(frame > 0 ? frame - 1 : 0);
+
+		/// <summary>
+		/// Puts the machine on a frame the history holds. Always forwards from an
+		/// anchor, whichever way the frame lies: see docs/state-manager.md.
+		/// </summary>
+		public void LoadStateAt(int frame)
 		{
-			return CurrentTasMovie.TasStateManager.GetStateClosestToFrame(frame > 0 ? frame - 1 : 0);
+			if (!CurrentTasMovie.States.RestoreTo(frame)) return;
+			AfterStateLoaded(frame, null);
 		}
 
-		public void LoadState(KeyValuePair<int, Stream> state, int? branchIndex = null)
+		/// <summary>
+		/// Puts the machine on a branch's OWN state. A branch does not go through
+		/// the history: it keeps a whole state of its own, so that reaching one
+		/// never depends on a history that coarsens and evicts around it
+		/// (docs/state-manager.md).
+		/// </summary>
+		public void LoadBranchState(TasBranch branch, int branchIndex)
 		{
-			StatableEmulator.LoadStateBinary(new BinaryReader(state.Value));
+			using (ProgressDialog.Begin(this, "Loading the branch", showAfterMs: 400))
+			{
+				StatableEmulator.LoadStateFromFile(CurrentTasMovie.BranchStatePath(branch.StateFile));
+			}
+			AfterStateLoaded(branch.Frame, branchIndex);
+		}
 
-			if (state.Key == 0 && CurrentTasMovie.StartsFromSavestate)
+		private void AfterStateLoaded(int frame, int? branchIndex)
+		{
+			if (frame == 0 && CurrentTasMovie.StartsFromSavestate)
 			{
 				Emulator.ResetCounters();
 			}
@@ -1194,7 +1255,7 @@ namespace Chimera.Client.GUI
 		{
 			// TODO: columns selected?
 			var selectedRowCount = GetSelection().Count();
-			var temp = $"Selected: {selectedRowCount} {(selectedRowCount == 1 ? "frame" : "frames")}, States: {CurrentTasMovie.TasStateManager.Count}";
+			var temp = $"Selected: {selectedRowCount} {(selectedRowCount == 1 ? "frame" : "frames")}, States: {CurrentTasMovie.States.Count}";
 			var clipboardCount = _tasClipboard.Count;
 			if (clipboardCount is not 0) temp += $", Clipboard: {clipboardCount} {(clipboardCount is 1 ? "frame" : "frames")}";
 			SplicerStatusLabel.Text = temp;
@@ -1341,15 +1402,56 @@ namespace Chimera.Client.GUI
 			return false;
 		}
 
+		// ---- the two splitters, remembered as what was chosen rather than where it landed ----
+		//
+		// SplitterMoved fires for a drag and for a window that was resized under
+		// the splitter alike, so what it records must not depend on the window's
+		// size at the time: the sidebar's width (the sidebar being the fixed
+		// panel, that is what a drag sets), and the branches/markers boundary as
+		// a share of the sidebar's height. Nothing is recorded until the window
+		// has finished loading, so restoring a value does not re-record it.
+
+		private static int Clamp(int value, int min, int max) => Math.Max(min, Math.Min(max, value));
+
+		private void RestoreMainSplit()
+		{
+			var width = MainVertialSplit.Width;
+			var max = width - MainVertialSplit.Panel2MinSize - MainVertialSplit.SplitterWidth;
+			if (Settings.SidebarWidth > 0 && max > MainVertialSplit.Panel1MinSize)
+			{
+				MainVertialSplit.SplitterDistance = Clamp(width - Settings.SidebarWidth - MainVertialSplit.SplitterWidth, MainVertialSplit.Panel1MinSize, max);
+				return;
+			}
+			MainVertialSplit.SetDistanceOrDefault(Settings.MainVerticalSplitDistance, _defaultMainSplitDistance);
+		}
+
+		private void RestoreBranchMarkerSplit()
+		{
+			var height = BranchesMarkersSplit.Height;
+			var max = height - BranchesMarkersSplit.Panel2MinSize - BranchesMarkersSplit.SplitterWidth;
+			if (Settings.BranchMarkerSplitRatio > 0 && max > BranchesMarkersSplit.Panel1MinSize)
+			{
+				BranchesMarkersSplit.SplitterDistance = Clamp((int)Math.Round(Settings.BranchMarkerSplitRatio * height), BranchesMarkersSplit.Panel1MinSize, max);
+				return;
+			}
+			BranchesMarkersSplit.SetDistanceOrDefault(Settings.BranchMarkerSplitDistance, _defaultBranchMarkerSplitDistance);
+		}
+
 		private void MainVerticalSplit_SplitterMoved(object sender, SplitterEventArgs e)
 		{
-			Settings.MainVerticalSplitDistance = MainVertialSplit.SplitterDistance;
+			if (_initialized)
+			{
+				Settings.MainVerticalSplitDistance = MainVertialSplit.SplitterDistance;
+				Settings.SidebarWidth = Math.Max(MainVertialSplit.Panel2MinSize, MainVertialSplit.Width - MainVertialSplit.SplitterDistance - MainVertialSplit.SplitterWidth);
+			}
 			if (_inputRolls.Count != 0) RepositionRolls(); // this event gets called while loading
 		}
 
 		private void BranchesMarkersSplit_SplitterMoved(object sender, SplitterEventArgs e)
 		{
+			if (!_initialized || BranchesMarkersSplit.Height <= 0) return;
 			Settings.BranchMarkerSplitDistance = BranchesMarkersSplit.SplitterDistance;
+			Settings.BranchMarkerSplitRatio = (double)BranchesMarkersSplit.SplitterDistance / BranchesMarkersSplit.Height;
 		}
 
 		private void TasView_CellDropped(object sender, InputRoll.CellEventArgs e)
@@ -1398,7 +1500,7 @@ namespace Chimera.Client.GUI
 					}
 					else
 					{
-						yield return (name, MovieSession.MovieController.Definition.MnemonicsCache[name].ToString(), 1);
+						yield return (name, MovieSession.MovieController.Definition.MnemonicFor(name).ToString(), 1);
 					}
 				}
 			}
@@ -1444,21 +1546,54 @@ namespace Chimera.Client.GUI
 				return;
 			}
 
-			// a branch is its input and its state; the state is cache, and a cache
-			// that was lost or set aside leaves the branch with nothing to jump to
-			if (branch.CoreData is null)
+			// A branch is its input and its state. The input is in the project; the
+			// state is cache beside it, and a cache that was lost or set aside - a
+			// project carried to another machine, a cleared cache, one set aside for
+			// another core build - leaves only the input. That is still the branch:
+			// load it and replay to its frame, as a refused state does (issue #80).
+			if (branch.StateFile is null)
 			{
-				MainForm.AddOnScreenMessage("This branch has no saved state beside the project; it cannot be loaded.");
+				_suspendEditLogic = true;
+				CurrentTasMovie.LoadBranch(branch);
+				_suspendEditLogic = false;
+				ReplayToBranchFrame(branch,
+					"This branch has no saved state beside the project; replaying to its frame instead.",
+					$"No saved state for this branch: replaying to frame {branch.Frame}.");
 				return;
 			}
 
 			_suspendEditLogic = true;
 			CurrentTasMovie.LoadBranch(branch);
 			_suspendEditLogic = false;
-			LoadState(new(branch.Frame, new MemoryStream(branch.CoreData, false)), CurrentTasMovie.Branches.IndexOf(branch));
+			try
+			{
+				LoadBranchState(branch, CurrentTasMovie.Branches.IndexOf(branch));
+			}
+			catch (Exception ex) when (ex is InvalidOperationException or IOException)
+			{
+				// Two refusals reach here. The sandbox refuses a state another machine
+				// made - a different build of the core, most often, which is what an
+				// autosaved xemu project reopened beside a second xemu version met
+				// (issue #63). The engine refuses one written in another savestate
+				// format before the machine ever sees it, and says which two formats
+				// (issue #115). Either way the branch's input is already loaded and the
+				// state was only a way to reach its frame faster; the history reaches
+				// it by replay instead, and the refused state is let go so it is not
+				// offered again. The reason is shown as given: it is the only place a
+				// person is told WHY, and the format one names both builds.
+				branch.StateFile = null;
+				ReplayToBranchFrame(branch,
+					$"This branch's saved state could not be loaded, so it replays to its frame instead. {ex.Message}",
+					$"Branch state refused: replaying to frame {branch.Frame}.");
+				return;
+			}
 
-			CurrentTasMovie.TasStateManager.Capture(Emulator.Frame, Emulator.AsStatable());
-			QuickBmpFile.Copy(new BitmapBufferVideoProvider(branch.CoreFrameBuffer), VideoProvider);
+			CurrentTasMovie.States.Capture(Emulator.Frame);
+			// the picture is cache too, and a cache can hold a branch's state without it
+			if (branch.CoreFrameBuffer is not null)
+			{
+				QuickBmpFile.Copy(new BitmapBufferVideoProvider(branch.CoreFrameBuffer), VideoProvider);
+			}
 
 			if (Settings.OldControlSchemeForBranches && TasPlaybackBox.RecordingMode)
 			{
@@ -1466,6 +1601,22 @@ namespace Chimera.Client.GUI
 			}
 
 			StopSeeking();
+			RefreshDialog();
+		}
+
+		/// <summary>
+		/// A branch whose input is loaded but whose state cannot be used: reach its
+		/// frame the way the greenzone reaches any frame, from the nearest state at
+		/// or before it. The branch did load, so a script watching for that is told.
+		/// </summary>
+		private void ReplayToBranchFrame(TasBranch branch, string onScreen, string status)
+		{
+			MainForm.AddOnScreenMessage(onScreen);
+			MessageStatusLabel.Text = status;
+			var from = PriorStateForFramebuffer(branch.Frame);
+			if (from >= 0) LoadStateAt(from);
+			GoToFrame(branch.Frame);
+			BranchLoadedCallback?.Invoke(CurrentTasMovie.Branches.IndexOf(branch));
 			RefreshDialog();
 		}
 	}

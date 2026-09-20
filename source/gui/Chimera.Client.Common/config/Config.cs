@@ -1,4 +1,4 @@
-using System.Collections.Generic;
+﻿using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
 using System.Linq;
@@ -89,6 +89,59 @@ namespace Chimera.Client.Common
 		/// scanned first, so this only ever adds.
 		/// </summary>
 		public List<string> CorePackagePaths { get; set; } = new();
+
+		/// <summary>
+		/// Cores added by hand in File &gt; Core Manager, by the address of the GitHub
+		/// page that publishes them. They are listed below the official ones and
+		/// fetched the same way; removing one takes it out of here, and so out of the
+		/// list, because nothing else remembers it.
+		/// </summary>
+		public List<RosterCore> ExternalCores { get; set; } = new();
+
+		/// <summary>
+		/// Where everything Chimera keeps per user lives, when that is not the platform's usual
+		/// place (issue #52). Empty means the usual place. See <see cref="DataDirectory"/>.
+		/// </summary>
+		public string DataDirectory { get; set; } = "";
+
+		/// <summary>
+		/// A change of <see cref="DataDirectory"/> that was asked for and waits for the next start,
+		/// which carries it out before anything in the data directory is opened. Null when none is
+		/// waiting; empty means "back to the usual place".
+		/// </summary>
+		// this project is not yet in a nullable context as a whole (the newer files
+		// opt in one by one), so the annotation has to say where it applies
+#nullable enable annotations
+		public string? DataDirectoryPending { get; set; }
+#nullable restore annotations
+
+		/// <summary>Whether that change carries the existing data over, or leaves it where it is.</summary>
+		public bool DataDirectoryPendingMove { get; set; }
+
+		/// <summary>
+		/// Whether Tools &gt; Cache Manager holds the cache under
+		/// <see cref="CacheSizeLimitMb"/> on its own, removing the oldest
+		/// unlocked entries when it goes over. On by default; see
+		/// <see cref="CacheCleanPolicy"/> for why, and docs/cache-manager.md.
+		/// </summary>
+		public bool CacheAutoClean { get; set; } = true;
+
+		/// <summary>
+		/// What the whole cache may weigh, in megabytes, before the auto-clean
+		/// starts taking the oldest. Megabytes for the same reason
+		/// <see cref="MovieConfig.GreenzoneBudgetMb"/> is: it is the unit this file
+		/// keeps sizes in.
+		/// </summary>
+		public int CacheSizeLimitMb { get; set; } = CacheCleanPolicy.DefaultLimitMb;
+
+		/// <summary>
+		/// How much of the disk to leave free whatever the limit says, in
+		/// megabytes. The limit bounds Chimera; this bounds the damage Chimera can
+		/// do to the machine, which is a different promise - see
+		/// <see cref="CacheCleanPolicy.FreeSpaceFloorBytes"/>.
+		/// </summary>
+		public int CacheFreeSpaceFloorMb { get; set; } = CacheCleanPolicy.DefaultFreeSpaceFloorMb;
+
 		public bool PauseWhenMenuActivated { get; set; } = true;
 		public bool SaveWindowPosition { get; set; } = true;
 		public bool MainFormStayOnTop { get; set; }
@@ -337,6 +390,13 @@ namespace Chimera.Client.Common
 		/// what someone actually picked, and a system with one core never appears here.
 		/// </summary>
 		public Dictionary<string, string> DefaultCores = new();
+
+		/// <summary>
+		/// The build a core runs with when several builds of it are installed, keyed by core name, valued by
+		/// package SHA1 - what the user opened with File &gt; Open Core or installed in the core manager.
+		/// A project ignores it whenever the build it pins is installed (<c>CoreChoices.PickBuild</c>).
+		/// </summary>
+		public Dictionary<string, string> DefaultCoreBuilds = new();
 
 		/// <summary>
 		/// Where the user put each file a core package asked for, keyed

@@ -317,10 +317,10 @@ phase of unverified change.
   producing BOTH OSes' artifacts: managed IL built once via dotnet (run_target
   'frontend', Linux dir only), natives built per-target - native gcc for .so, and
   mingw-w64 cross (static gcc runtime, so no libgcc/winpthread dlls) for .dll via
-  extern/tools/meson/mingw-w64.ini + mingw-toolchain.cmake. Root meson.build: direct
+  extern/meson/mingw-w64.ini + mingw-toolchain.cmake. Root meson.build: direct
   shared_library targets for chimerahash/lua54/e_sqlite3/cimgui/luasocket (luasocket's
-  two same-named "core" modules live in extern/tools/meson/luasocket-*/ subdirs), nested
-  upstream builds via extern/tools/meson/nested-build.sh for zstd (its own meson), SDL2 +
+  two same-named "core" modules live in extern/meson/luasocket-*/ subdirs), nested
+  upstream builds via extern/meson/nested-build.sh for zstd (its own meson), SDL2 +
   openal (cmake + toolchain file), chd_capi (cargo, --target x86_64-pc-windows-gnu
   for cross). WSL provisioned: mingw-w64 gcc 13, rustup 1.97.1 + windows-gnu target,
   and - after packages.microsoft.com's Ubuntu 24.04 feed turned out to serve a
@@ -353,7 +353,7 @@ phase of unverified change.
   will absorb (meson orchestrating the dotnet build and every native recipe).
   Thirteenth addendum (2026-08-10, user-directed - NATIVES FROM SOURCE): ExternalProjects
   moved to extern/ at the repo root, and ALL prebuilt native libraries are gone from the
-  tree. extern/tools/build-natives.ps1, run automatically by the solution build
+  tree. extern/build-natives.ps1, run automatically by the solution build
   (BuildNativeDeps target, incremental by timestamp), builds every native dependency
   from source into build/dll: libchimerahash + SDL2 (in-repo recipes; clang-cl - chimerahash's
   gcc target-attributes need it, and a .def now provides the exports ELF visibility
@@ -507,7 +507,7 @@ Decisions, all user-confirmed:
    every mednafen core - is the scale precedent.)
 4. **Everything waterbox lives in ONE external repository: miniBox**
    (github.com/ToolAssisted-run/chimera-common-minibox), consumed as a submodule at
-   extern/tools/chimera-common-minibox like every other from-source dependency. It carries all
+   extern/chimera-common-minibox like every other from-source dependency. It carries all
    sides: the runtime (sandbox host - Chimera's meson builds it into the
    frontend's OS-dependent artifacts), the guest toolchain (the core-author
    kit: musl fork, emulibc, libco, libcxx sysroot, linkscript, common.mak),
@@ -594,7 +594,7 @@ re-record.
 
 Flavor (c) LANDED (2026-08-11): synth.wbx is the SAME synthcore.c
 compiled for the miniBox waterbox sandbox (see the miniBox repository at
-extern/tools/chimera-common-minibox - a from-scratch C/C++ port of BizHawk's waterbox host,
+extern/chimera-common-minibox - a from-scratch C/C++ port of BizHawk's waterbox host,
 GCC-built guest toolchain, machine spec, all meson) and wrapped in the
 waterbox ABI (tests/synth/package-box/). Its whole machine state lives in
 guest memory, so the waterbox host savestates it AUTOMATICALLY - no
@@ -864,6 +864,15 @@ also what a blip-style resampler needs (it does not produce the same count every
 frame). When a core exports the count, `audio.samplesPerFrame` becomes the buffer
 CAPACITY rather than the per-frame number.
 
+**A package says what rate it mixes at** (2026-09-04). The frontend's sound path
+is built around 44100 Hz and the lineage's cores all produced it, so nothing ever
+asked. A PS2's SPU2, a GameCube's DSP and an Xbox's APU mix at 48 kHz, and played
+as 44.1 they came out a semitone and a half low with their audio outrunning the
+video of every encode (issue #37). `audio.rate` declares the rate (44100 when
+absent) and the adapter resamples to 44100 once per frame, on the way to the
+sound output and the encoder alike. Presentation only: the guest's bytes, which
+the gates hash, are what they were.
+
 The wrinkle noted in the ABI section is now visible rather than theoretical:
 sync settings are keyed by adapter *type*, so both NES packages share one config
 key and one settings blob. Whichever core is loaded reads the keys it knows and
@@ -1070,6 +1079,23 @@ user decided its shape.
 - **Missing means a sentence, not a stack trace.** `MissingFirmwareException` is
   its own type for exactly this: it is the one load failure the user can fix, and
   the message names the window that fixes it.
+- **Config > Firmware surveys every installed core** (2026-09-05, issue #30). Until
+  it, firmware was only ever asked about from inside: the Emulator menu's window
+  needs a loaded package, the wizard asks per project, and a downloaded project
+  that wanted a bios could only say "put it in the Firmware folder". The survey
+  reads each package's `waterbox.config` in the Cores folder when the window
+  opens, lists one row per declaration entry grouped by core - PCSX2's
+  seventy-three bios releases are seventy-three rows, collapsed to the ones on
+  hand - and answers each from the Firmware folder and from every path a person
+  ever chose, by hash. Nothing is kept: the rows go with the window and a
+  deleted package is gone on the next open (the frontend keeps no list of
+  firmware, and cannot). What a person chose for it stays in config.ini, keyed
+  by the core's name, for the day the package is put back. A chosen file is
+  remembered where it lives, under `<core>/<id>#<sha1>` so several releases of
+  one id can all be known, and never copied - firmware can be a PlayStation 3
+  update or an Xbox disk image, and a second copy is a second thing to drift.
+  The wizard and Open Project index every remembered dump of the core, so a
+  file located in the survey satisfies them wherever it sits.
 - **Delivery is a mount.** The file is handed to the guest as another mounted
   file, under the declared id, next to the rom and the settings - so the guest
   reads it with the same call it reads the rom with, and nothing in the ABI is
@@ -1286,6 +1312,25 @@ starts describing the moment rather than the ingredients, two builds of one
 commit stop matching and every hash in the chain becomes noise.
 
 
+## A long wait says what it is waiting for (user-asked, 2026-09-05)
+
+Opening, creating and saving a project could take a long time with nothing on
+screen - a PlayStation 3 boot fetching its compiled code, a four-gigabyte disc
+being hashed, a greenzone of hundreds of megabytes going through zstd - and a
+frozen window is a window a person kills. The work stays on the UI thread, as
+it must (the emulator and the engine are not shared across threads), so the
+answer is not a worker but a report: the engine gains one progress sink
+(`ce_progress_set`), and its slow calls report into it as they go - hashing a
+file says the file's name and bytes of its length, the state container says
+bytes compressed or read, a boot says its stage, the cache bridge counts the
+objects it fetches. The frontend's own steps report into the same stream
+(`EngineProgress`), and a small `ProgressDialog` listens while it is up, draws
+a bar when the stage has a length and a clock when it does not, pumps the
+message loop from those reports, and disables its owner so a click during the
+wait cannot start a second operation inside the first. The engine test hashes a
+nine-megabyte file with a sink installed and checks the last report reaches the
+end, and that nothing is heard when no sink is set.
+
 ## Turbo: a frame nobody looks at does not have to be drawn (user-asked, 2026-08-29)
 
 Fast-forwarding to the interesting part of a run spends most of its time drawing
@@ -1432,3 +1477,2557 @@ One sharp edge paid for on the way: the sandbox's file system is flat, so
 `hostRoot` is always empty, and upstream's `host:` resolver leaves the path
 empty when it is - which made the machine unable to read the very ELF it had
 just been told to boot. In a flat file system a name IS its path.
+
+## A guard page is not a write barrier on Windows (2026-09-10)
+
+Seeking through the history gave back a machine the plain run never had. Only
+on Windows, only with ares, and only through the greenzone: saving and loading a
+full state every frame was exact, so the fault was in the page-level dirty
+tracking rather than in the state format. Sixty-eight bytes of Game Boy work RAM
+were wrong after seeking two hundred frames back over a four hundred frame run,
+and further back than about four hundred frames the guest jumped to address
+zero.
+
+**What the sandbox was doing.** miniBox tracks writes by protecting memory: a
+page that matches the baseline is read-only, the first write faults, the handler
+copies the pre-image and lets the write through. Windows cannot do that for the
+page the stack pointer is in - it delivers an exception by pushing a context
+record onto the faulting thread's own stack, so the kernel's write fails too and
+the process dies with no handler having run. ares hands every emulated component
+a coroutine stack out of malloc, so its stacks looked like ordinary memory and it
+died on its first frame. The fix at the time was to protect every clean page
+with the guard bit instead, because the kernel clears that bit BEFORE it raises,
+which makes the fault deliverable wherever the stack is.
+
+**Why that was wrong.** A guard bit can also be cleared with NO exception
+delivered at all. Instrumenting the arena found a few hundred pages an epoch
+that miniBox had told Windows to protect (`VirtualProtect` returned success, and
+querying straight afterwards confirmed the bit was set) and that later read back
+as plain PAGE_READWRITE with no handler ever having run for them. Every write to
+such a page after that is invisible, and the page still says clean - so the
+frame's delta does not carry it and the baseline it will be reverted to is the
+wrong one. A read-only page cannot fail that way: nothing but the sandbox itself
+can make it writable.
+
+**So the contract changed instead: a guest says where its stacks are.** Ordinary
+memory is read-only-when-clean on Windows exactly as it is on Linux, and MAP_STACK
+is how a guest asks for a stack. ares' libco asks for its coroutine stacks with
+mmap now (patch 0015 in that core) instead of taking them from malloc. A stack
+page on Windows is then never protected at all, and nothing reports its writes.
+
+**What a stack did is READ, not watched.** The first version of this called every
+stack page written whether or not it was, which is correct and costs everything:
+ares gives a Game Boy nineteen coroutines a stack of their own, 2.6MB of them,
+and all of it went into every delta. Seven hundred frames of history came to
+268MB where Linux made 110MB, and capturing a frame cost 74% of the run against
+Linux's 20%. Almost none of those pages had changed - almost none of a coroutine
+stack is ever touched.
+
+Nothing there can report a write to a stack, but anything can read one. Each
+stack page keeps a shadow of what it held when the last frame was described, and
+a delta asks memcmp which of them moved; "differs from the sealed image", which
+is what a savestate needs, is the same question against the baseline snapshot.
+Both are exact, and both are stricter than a fault bit, which stays set when a
+page is written and then put back. The same seven hundred frames now cost 107MB -
+SMALLER than Linux's 110MB, for exactly that reason - and 32% of the run against
+Linux's 19%. What is left is one 2.6MB comparison a frame, so the remaining
+difference is set by how much stack a core asks for, not by how big its machine
+is.
+
+**Two smaller things fell out of the same measurement.** An epoch marked a stack
+page eagerly and then dropped it from the set it re-examines, so a stack was
+captured by one frame and never looked at again; and `VirtualQuery` was being
+read as if `RegionSize` were the length from the address asked about, which it is
+not - it counts from the region's own base, so the walk stepped over the pages
+after it.
+
+**What this is not.** Nobody has identified what clears those guard bits. The
+exception-dispatch theory - the kernel scribbling its context record onto pages
+below the stack pointer - was tested by marking every page near a faulting `rsp`
+and does not explain them; not one of the lost pages had ever been near one. It
+does not matter for the fix, because the fix is to stop depending on the bit, but
+it is not a solved mystery and should not be written up as one.
+
+## A seek costs what changed, not what the machine could be (user-asked, 2026-09-10)
+
+The ask was a deep look at the state history with speed as the only first-class
+goal: forward capture, going back to an older frame, and the rerecord that
+follows an edit. Memory and disk were welcome but second. Everything below was
+measured before it was touched, on ares - Super Mario 64 (an 18 ms frame, some
+300 pages written each) and a Game Boy (a 3 ms frame, some 70) - with the two
+benches in `tests/perf` for the parts a core would only blur.
+
+**Going back was proportional to the arena.** Restoring a frame is one anchor
+loaded and the deltas since it applied, and applying a delta ended by
+re-protecting every page there is: half a million lookups and syscalls on the
+ares arena, 2.3 ms for a delta of sixteen pages, paid once per link. A restore
+of 34 links took 59 ms on the N64 and 54 on the Game Boy, whose deltas are a
+quarter the size - the same number, because the cost was not in the delta. The
+anchor load walked the same half million pages to find the few that differed.
+Both are proportional to the change now: a delta refreshes only the pages in
+its two lists whose protection actually moved, and the load compares the
+machine's packed status and dirty maps against the state's a word at a time,
+skipping eight untouched pages per two loads. The same restores are 3 ms and
+2 ms; on the bench a 2 GB seek of 32 links went from 78 ms to 1.7.
+
+**Forward capture was paying a fault for what it already knew.** A page the
+machine writes every frame - the framebuffer, the audio ring, the CPU's own
+registers - faulted every frame, and was re-protected every frame so that it
+could fault again. On the N64 that was two thirds of what a captured frame
+cost. A page written a few frames in a row now goes HOT: it stays writable, and
+what it did is found by comparing it with a copy taken when the epoch opened.
+Four kilobytes copied and compared is a fraction of a microsecond; a fault is
+several. A hot page that stops changing cools after a few frames and is held
+like any other. The comparison is exact where a fault is not, so a page written
+with the bytes it already held stays out of the delta - the Game Boy's frames
+came out a third smaller, 700 of them 85 MB where they were 110. The bench's
+300 pages written every frame went from 1.75 ms to 0.06. On the real cores the
+history's share of the run fell from 9% to 5% (N64) and 14% to 11% (Game Boy);
+what is left is the pages a frame writes for the first time in a while, and
+those are what the fault is for.
+
+The invariant is the whole design: **a hot page's shadow is the page as the
+epoch opened.** Opening an epoch copies every hot page, because nothing in the
+sandbox can know whether the guest ran since the last delta was saved, and the
+two operations that rewrite pages from outside the guest - a state loaded, a
+delta applied - refresh the copy or cool the page as they go. It was tempting to
+refresh the shadow only when a delta was saved and skip the copy at open; that
+is wrong the first time the engine takes an anchor instead of a delta, because
+the frame between ran with no epoch and the shadow is a frame stale, and a page
+written back to its older bytes would then be left out of a delta whose start
+did not hold them. The copy costs a tenth of a millisecond and the reasoning
+costs nothing to keep.
+
+**The client was spending as much on a seek's frame as the core did.** A
+TAStudio seek runs the main loop once per frame, and every frame refreshed the
+piano roll, presented the picture and pumped the message queue - 5.9 ms a frame
+on the Game Boy, of which 3.0 was the machine. The headless mode already served
+the host on a wall-clock cadence instead of per frame, for exactly this reason;
+a seek now does the same: sixty times a second the window is live, shows where
+the seek has got to and takes a click to stop it, and the frames between are
+emulated and nothing else. The destination frame is always drawn and shown.
+`CHIMERA_LOOP_TRACE=1` prints where each frame's time goes, phase by phase,
+because this was found by measuring and the next such thing will be too.
+
+Two sharp edges. The frames a seek passes through get the tools' fast update
+whether or not it is a turbo seek, so a Lua script that counts frames during a
+seek needs "Run Lua during turbo" now as it already did during one. And on the
+Xvfb box this was measured on, a TURBO seek is slower than a plain one - the
+present and the message pump cost several milliseconds each there with no frame
+drawn, which reads like software GL and a progress bar repainting - and that is
+not understood; it is bounded to the sixty services a second now, and the GPU
+box has not been measured.
+
+**A bug was found on the way and is fixed:** applying a delta copied a page's
+baseline aside AFTER overwriting it, so a page this process had never written -
+one from a history file, applied to a machine that had not reached that frame
+itself - kept the delta's bytes as its sealed image, and every later return to a
+frame where the page was clean put those bytes back. In-process it could not
+happen, because every page in a delta had faulted on the recording run and had
+its copy already; a reopened project is exactly the case it could.
+
+## What was spilled early is settled, and the seek loop measured where it runs (2026-09-10)
+
+The three loose ends of the round above, taken in turn.
+
+**Density on disk is a temporary condition now.** A stretch spilled before the
+far band reached it kept every frame's delta on disk for good, because
+`coarsen()` skipped anything spilled - 1567MB of file for six thousand Game Boy
+frames under a 64MB budget, the state-manager doc's own example. Once the far
+boundary passes a spilled stretch it is now settled: its links are read back
+one at a time, composed down to the far grid under the same caps `tidy()` uses,
+and what is left is appended to the file; the old body is dead room and the
+compaction takes it back. Four links a call, so it is a little work every frame.
+The first version read the whole stretch into a working copy and refused any
+stretch bigger than the budget - which is every stretch that was spilled under a
+small budget, the only ones that need it. Streaming is the point, not an
+optimisation: what is held is one accumulating link, one just read, and the
+result, which is far-band sized. On a Game Boy under an 8MB budget with tight
+bands, each 61-frame stretch went from 9.5MB on disk to 1.9MB, and the file's
+live bytes from 112MB to 46MB.
+
+**The turbo-seek anomaly was Xvfb's.** Measured on the Windows box with the real
+GPU, driving `Chimera.exe --headless` through interop with the same project and
+Lua kicker: a plain Game Boy seek is 3.5 ms a frame and a turbo one 3.1, against
+2.7 for the machine alone. The several milliseconds a present and a message pump
+cost with no frame drawn were the software GL under Xvfb, and are not a Windows
+problem. Two more phases in the loop trace - movie and sound - showed where the
+rest of the client's time goes there: the movie's frame handling is the
+greenzone capture itself (0.22 ms, the history's share of a Game Boy frame), and
+the message pump at sixty services a second is the piano roll repainting, which
+is what the person is watching.
+
+**A DISPLAY that does not answer is asked first.** Both gate scripts start an
+Xvfb only when DISPLAY is unset, and the dev box has DISPLAY set to an ssh
+session's forwarded display with nothing behind it, so every frontend leg failed
+with "Could not open display" - fourteen legs and a hundred and two window
+tests, all saying the same thing. The scripts probe the display with xdpyinfo
+now and bring up their own when it does not answer. The rule stands that a
+caller's working display is used rather than a second one; what changed is that
+"set" is not taken for "working".
+
+**Not taken: the anchor's two bytes a page.** An anchor carries a status byte and
+a dirty byte for every page of the arena - 1.1MB on ares, some 21MB on rpcs3 -
+and packing them would be a savestate format change. The stream layout is fixed
+in miniBox's machine spec, anchors are one in six hundred frames, and the load
+already skips the untouched pages a word at a time, so the saving is a few
+per cent of memory on the biggest machines against a format every saved state
+and history file would have to keep reading. Left as it is, and written down so
+that it is not rediscovered as an easy win.
+
+## A test that cannot fail is not a test (user-asked, 2026-09-10)
+
+Asked to look for bugs and latent runtime failures across the state machinery,
+rather than only in the round just written. The method is worth keeping, because
+the bugs it found were not ones reading the code had suggested.
+
+**Two randomized differential tests, each against a model.** miniBox's drives
+the page tracker with random writes, maps, unmaps, protections and zeroings and
+asks whether an anchor plus its deltas reproduces the machine byte for byte,
+seeking backwards and continuing from where it lands. The engine's does the same
+to the history with random frames, restores, edits, pins, budgets, spills and
+save/load round trips. Deterministic per seed, so a failure names its seed and
+step and can be re-run.
+
+**Then every fix was checked by putting the bug back.** Eight mutations, one per
+fix: the test that was supposed to catch it had to fail, and the tree without it
+had to pass. Three of them did NOT fail, and that was the most useful part of
+the exercise - it showed two of the things being "fixed" were not reachable:
+- The protection run left unclosed when a delta apply fails only ever makes
+  pages LESS permissive, and the next epoch re-protects them anyway. Kept for
+  the single exit, but it is not a bug fix and is not written up as one.
+- The first version of the truncated-load test wrote through an epoch, and
+  `epoch_begin` re-protects everything mapped writable, so it healed the damage
+  before the test could see it. The exposure is a write BETWEEN the failed load
+  and the next epoch, which is exactly what a refused restore leaves the session
+  free to do. Written that way, it fails without the fix.
+
+The fuzz's own first failure was a bug in the fuzz: it modelled an input edit by
+changing the machine BEFORE opening the epoch, so the change sat in the epoch's
+baseline and never entered the delta. A real edit diverges the next frame's
+state, inside the epoch. Worth saying because the shape recurs - a model that
+does not do what the thing it models does will report the difference as the
+subject's fault.
+
+**What the tests are not.** They use a machine of sixty four cells and a merge
+of their own, so they say nothing about miniBox's composition or about a real
+core. That is what the synthetic witness, the ares gate and the rerecord suites
+are for, and all of them were run.
+
+## Going back has to be possible even where the greenzone gave up (user-reported, 2026-09-10)
+
+Reported from use: a rewind to a part of the movie the greenzone no longer
+covered did nothing at all, and something crashed at some point.
+
+The cause was one line of policy. The disk budget dropped the oldest stretch in
+the spill file whichever one it was, so the stretch holding frame zero went like
+any other; and with nothing stored at or before the target, the piano roll's
+GoToFrame loaded nothing and then unpaused to seek forward from a frame already
+past the one asked for. It cannot arrive. From the outside that is a rewind that
+does nothing, with no message.
+
+Three things follow, and the order matters.
+
+**The beginning of the run is not a cache entry.** Everything else the history
+holds is an optimisation - lose it and you replay - but frame zero is what makes
+replaying possible at all. It is never evicted now, in memory or on disk. The
+encode path had already written the invariant down ("Frame zero always has a
+state") and would have thrown; the piano roll trusted it silently.
+
+**What survives should be spread, not recent.** Keeping the newest and dropping
+the oldest is the obvious policy and it is wrong for a TAS: it empties the far
+past first, so the further back you want to go the less there is to go on, until
+the middle of a long movie costs a replay from zero. The stretch given up is now
+the one whose absence widens the gap between its neighbours least. Applied
+repeatedly that thins the whole run evenly and leaves anchors across it - the
+breadcrumbs the report asked for - so any frame costs one anchor load and a
+bounded replay. It is the same thought the bands already apply to landings,
+applied to whole stretches.
+
+**A seek that cannot arrive is not started.** The guard above should make it
+unreachable, but "unreachable because of an invariant elsewhere" is how this got
+shipped in the first place, so the piano roll now says what is wrong and stays
+where it is.
+
+What is NOT done, and is the honest limit: if a project's history is lost or
+belongs to another machine, the frontend still has no way to rebuild the machine
+from power-on and replay - it starts from wherever the emulator is. Frame zero
+being kept means that case does not arise while a session is running, but a
+project reopened with no usable history has only the frames it captures from
+there. Rebooting the core and replaying the movie is the missing piece.
+
+## A getenv is not free when a renderer makes fifty thousand calls a frame (user-reported, 2026-09-10)
+
+Reported from use: Flash under Ruffle is slow in Chimera and not in vanilla
+Ruffle. Measured rather than guessed, and it was two things of about the same
+size.
+
+**The GPU bridge asked the environment a question on every crossing.**
+`ce_gl_dispatch` called `getenv("CHIMERA_GL_CHECK")` per GL call, on the
+reasoning - written down in the code - that a getenv is nothing beside a GL
+call. Ruffle's wgpu backend makes SIX THOUSAND GL calls in an average frame and
+fifty thousand in a heavy one, so the walk through the environment was being
+paid fifty thousand times a frame to answer a question whose answer cannot
+change while the process runs. Read once, as everything else in this codebase
+that reads an environment variable already does, the machine's own frame went
+from 58.8 ms to 32.9.
+
+The lesson is not "getenv is slow". It is that "nothing beside X" is an estimate
+of a ratio, and a ratio is only an argument when the count is known. The count
+here is now printed by `CHIMERA_GL_TRACE`, per frame, precisely so the next such
+claim can be checked rather than believed.
+
+**And the greenzone was capturing twenty megabytes a frame** because the near
+band kept every frame whatever it cost. That half is in docs/state-manager.md.
+
+Together: 112 ms a frame to 48, which is nine frames a second to twenty-one.
+What remains is the six thousand crossings themselves - each one a call out of
+the sandbox - and that is a batching problem, not a constant-factor one.
+
+## A machine's own settings were indexed against the wrong list (user-reported, 2026-09-11)
+
+Reported from use: the Neo Geo shows no settings at all, and it used to.
+
+The settings were there. They are declared in the package, scoped to the machine
+with `when`, and `machines.json` and `waterbox.config` both carry all seven of
+the Neo Geo's. What went wrong was arithmetic.
+
+The engine answers "which settings are exposed" with a NAME and an INDEX, and
+the index counts into the declaration it was handed - the package's own settings
+list. The wizard then read that index out of `SettingsFor(machine)`, which is a
+different list: the machine's, with the settings belonging to other machines
+dropped and everything after them renumbered. A name check caught the mismatch
+and threw the entry away, so nothing was ever displayed wrongly - it was simply
+not displayed. Every setting a machine narrows disappeared: the Neo Geo's DIP
+switches, the Game Boy's Fast Boot, the Super Famicom's PPU revisions, all of
+them, on every multi-machine core.
+
+`SettingsByDeclarationIndexFor` answers in the package's own index space - one
+slot per package setting, null where the machine does not have it - and the
+wizard reads that. The test pins the shape rather than the symptom, because the
+symptom (nothing shown) is indistinguishable from "this machine has no
+settings", which is exactly why this survived.
+
+**Worth saying about the Neo Geo in particular**, since that is where it was
+found: those seven settings ARE its DIP switches - they go straight into
+REG_DIPSW - but an **AES never reads that register**. Traced over 900 frames of
+two commercial games, it is read zero times, because the AES is a home console
+and has no DIP switches on it. The machine that reads them is the MVS, the
+arcade board, and the ares core does not offer it yet for a reason recorded in
+that core's own PLAN.md: ares has no uPD4990A, so the MVS BIOS waits on a
+real-time clock pulse that never comes. The switches are exposed now because
+they are declared and a frontend must not silently eat a declaration; what they
+do is the core's business and the core says so.
+
+## The GL bridge can say WHICH calls, not just how many (2026-09-11)
+
+`CHIMERA_GL_TRACE` has printed a per-frame call count since the getenv round,
+and that count is what made "six thousand calls a frame" a sentence anybody
+could say. It is also what made it a sentence nobody could act on. Ruffle's
+frame on New Star Soccer is fifty thousand calls; the next question - which of
+them, and costing what - had no instrument.
+
+Two now:
+
+- **`CHIMERA_GL_TIME=1`** adds "N ms in the driver" to the per-frame line. The
+  clock read either side is real, about 20ns a call, so a fifty-thousand-call
+  frame pays a millisecond to be measured; that is worth knowing when reading
+  the number, and it is why this is off by default.
+- **`CHIMERA_GL_PROFILE=1`** counts calls and nanoseconds per opcode and dumps
+  the table every 300 frames and again at exit. The names are deliberately not
+  carried in the process: opcodes are the master list's order (miniBox
+  `source/gl/gl-entry-points.txt`, first entry is 100) and resolving them is a
+  job for whoever reads the dump, not for the hot path.
+
+The exit dump is not belt and braces. `ce_gl_release` marks the frame boundary
+and a host that is not drawing never calls it, so a run with rendering off
+collected the whole profile and printed none of it.
+
+What they found on a GTX 1060 is in the Ruffle core's own PLAN.md, and the
+shape of it is worth repeating here because it is general: **forty thousand GL
+calls cost 1.5 ms between them, and six calls cost 11.** The expensive ones
+were `glGetSynciv` and `glGenBuffers` - waiting for the GPU, and allocating
+fresh resources every frame. A call count is a measure of chattiness and
+chattiness is not cost.
+
+And a correction to the round before: the same feature measured 6 ms a frame
+under llvmpipe and 1.5 ms on the real GPU. A software rasteriser's readback is
+a copy out of memory the CPU has just written; a real driver's is a transfer it
+has already had to wait for. Numbers taken on Mesa in WSL do not transfer to a
+GPU, and this codebase has a whole memory note saying so - which did not stop
+it happening.
+
+## A deleted buffer's name is kept (2026-09-11)
+
+The profile above said Ruffle's frame spends 1.74 ms in `glGenBuffers`. A
+hundred and thirty-nine buffers created, filled with `glBufferData`, and deleted
+every frame - the counts pair exactly - at twelve microseconds a call for an
+entry point whose whole job is to reserve a name.
+
+Reserving a name does not cost twelve microseconds. What costs that is the
+driver draining deferred deletes: the buffers being freed are ones the GPU is
+still reading, so the delete is held, and the next reservation queues behind it.
+The churn is paid for twice.
+
+So the bridge keeps the name instead of giving it back, and answers the next
+request from that list. Three things make it safe rather than clever:
+
+- **A recycled buffer is re-specified before use.** Every one of those hundred
+  and thirty-nine is followed by a `glBufferData`, which replaces its size and
+  contents outright and orphans whatever the GPU still held. Immutable storage
+  would not allow that, but a guest across this bridge cannot have
+  `ARB_buffer_storage` - it hands out a host pointer - so the mutable path is
+  the only path here.
+- **Only names the bridge handed out are pooled.** A guest deleting something it
+  never generated has a bug, and passing that through to the driver is how the
+  bug stays visible.
+- **The list is bounded.** Past the cap a delete is a real delete, so a guest
+  that frees far more than it allocates cannot turn this into a leak.
+
+Measured on a GTX 1060, frames differenced to remove startup: 18.12 ms a frame
+to **16.97**, and the driver's share 13.50 to 11.36. `glGenBuffers` leaves the
+profile entirely. `CHIMERA_GL_NO_POOL=1` turns it off, which is how the A/B was
+taken and how the next person can retake it.
+
+**The oracle for a change like this is the picture, not the clock.** Three
+frames apiece of Ruffle and of Dolphin, captured on the real GPU with the pool
+on and off: byte-identical, all six. A GL object pool that changes a pixel is
+not an optimisation, and nothing else in this codebase can tell you that it did.
+
+### Deferring texture deletes: tried, removed, then actually measured
+
+Textures churn the same way - a hundred created and deleted a frame, and
+`glGenTextures` is 1.13 ms while the `glTexStorage2D` behind it is sixty
+NANOseconds. They cannot be pooled: `glTexStorage2D` is immutable, so a recycled
+texture must be handed back for exactly the shape it already has, and the shape
+is not known until the call after the one that has to choose a name. Doing it
+properly means translating texture names throughout the bridge.
+
+The cheap version - hold the deletes a few frames so the GPU has finished before
+the driver is told - was written and removed. It is 0.5 ms a frame WORSE:
+17.74 and 17.59 against 17.22 and 17.19 for buffer pooling alone.
+
+**Those are not the numbers this section first carried, and the first ones were
+worthless.** `chimera-run` compiles the engine's sources straight in
+(`meson.build`: `engine_src + gl_bridge_src`); it does not load
+`libchimera.dll`. Every A/B taken by copying the DLL beside it and leaving the
+executable alone measured the same binary twice, and reported the difference
+between two runs of it as the difference between two builds. Copy BOTH, and
+md5sum both, every time - the note about staging a fresh directory per
+experiment was already in this codebase's memory and it was still not enough,
+because it did not say which files.
+
+## The fence waiting is the GPU, and the GPU is busy (2026-09-11)
+
+After the buffer pool, the largest single item in Ruffle's frame was 6.7 ms in
+`glGetSynciv`. An average cannot say what that is: every call costing a hundred
+microseconds is overhead, and one call in fifty costing five milliseconds is a
+BLOCK. So the profile grew a longest-call and an over-50us count, and then
+`CHIMERA_GL_WHY=N`, which prints the last sixteen opcodes whenever a call
+blocks - because a profile says which call waited and never what the wait was
+for.
+
+It is unambiguous. In steady state, 2851 of 3428 blocking events were
+`glGetSynciv` and every one of them came immediately after
+`DrawElementsInstancedBaseVertexBaseInstance`: about eighteen a frame, 267
+microseconds each, the guest issuing a draw and then waiting for the GPU. The
+rest is the readback, once a frame, as a chain that is exactly what it looks
+like - `ReadPixels`, `FenceSync`, `Flush`, `GetSynciv`, `ClientWaitSync`,
+`GetBufferSubData`, each one blocking, about 2 ms together.
+
+**The waits are real.** `CHIMERA_GL_GPUTIME=1` brackets each frame with
+`glQueryCounter(GL_TIMESTAMP)` and reads the pair a frame later: the GPU's own
+span is the same order as the whole frame. And the frame tracks GPU work -
+Ruffle's `quality` from high to low is 17.07 ms a frame to 14.43, a 15% cut for
+nothing but less multisampling. The CPU is waiting on a GPU that has the work.
+
+So the bridge cannot take this one. It is wgpu's OpenGL backend synchronising
+because it has no persistent buffer mapping, and it cannot have one here: a
+persistent map hands back a host pointer, and a sandboxed guest cannot read host
+memory. That is the same root cause as the buffer churn the pool now absorbs,
+and the rest of it lives in the guest. Named, measured, and not pretended away.
+
+## A seek does not draw, and that is a promise about the PICTURE too (user-reported, 2026-09-11)
+
+Reported from use: a PlayStation 2 project's picture degrades as you re-record,
+without desyncing, and only playing the movie from the beginning puts it right.
+
+Four measurements, on a GTX 1060, took it apart. Rewinding once, five times and
+twenty times all produced **exactly the same** difference from a straight run -
+83,663 bytes - so it is not cumulative. Saving and reloading the state before
+every one of 3000 frames produced no difference at all, so it is not the
+savestate. A straight run with no rewind anywhere, composing only its final
+frame, produced **the same 83,663 bytes**, so it is not the rewind. And the
+software renderer did the same thing, so it is not the GPU.
+
+What it is: **a seek replays with drawing off, and one renderer's display stage
+carries state from frame to frame.** Chimera turns rendering off for the frames
+a seek passes through - nobody is looking at them - and PCSX2's turbo patch
+implements that by returning from `GSRenderer::VSync` before `Merge`. Merge is
+not only composition: it decrements a scanmask countdown, advances the
+deinterlace phase, and leaves the device holding the frame a blend deinterlacer
+will want next. Skip it for fifteen hundred frames and the one frame that IS
+composed comes from state that never saw them.
+
+The first fix was a warm-up: draw the last five frames before a seek's
+destination, because drawing the last frame only is 7.29% of the picture wrong,
+the last two 3.87%, and the last five exact. **It was the wrong fix, and the way
+it was wrong is worth keeping.** Marvel vs Capcom 2 redraws its whole screen
+sixty times a second, so a few frames of drawing really does rebuild everything
+that matters. A title screen does not. Flycast on Re-Volt, seeking to a title
+screen painted once around frame 1350 and then left alone: drawing the last 1,
+2, 4, 8, 30, 60 or 120 frames all give the same picture, and it is the SEGA
+licence screen, a whole screen earlier. Only 300 - far enough back to include
+the frame that painted it - is right. What the renderer draws lives on the far
+side of the bridge and STAYS there; a screen painted by exactly one frame is
+lost if that frame is skipped, and no number of later frames repaints it,
+because the game has nothing more to say. **There is no number to declare.**
+
+So the core is simply never told to stop drawing (`video.drawEveryFrame`, read
+by the engine at session open), and `render == 0` comes to mean only that the
+host does not copy the picture out. That is affordable because the drawing was
+never the expensive part: over 1500 frames on a GTX 1060, PCSX2 costs 8.28s in
+turbo, 8.30s drawing without reading back, and 9.75s doing both. The readback -
+a 1.2 MB `glReadPixels` across the bridge - is the whole saving, and turbo keeps
+it.
+
+The general rule this is an instance of: **"nobody is looking at this frame" is
+a statement about the OUTPUT, not a licence to skip the renderer's own
+bookkeeping.** Ruffle gets it right by construction - its rendering-off path
+skips the readback and still runs `Player::render`, which is where its caches and
+its `Event.RENDER` broadcast live - and Dolphin gets it right because its XFB
+always decodes from the machine's own memory. Both measured at 0.00% either way.
+PCSX2 and Flycast skipped the whole stage, and this is what that cost - and
+they are the only two bridged cores that did.
+
+It also says something about what a hardware renderer's picture is allowed to
+be. The greenzone's contract has always been about the MACHINE, and this did not
+break it: EE RAM was byte-identical through every one of these runs. But a
+person watching TAStudio judges by the picture, and a picture that depends on
+which frames happened to be drawn is a picture that cannot be trusted to mean
+anything. Costing 0.75 ms a frame, there was no reason to leave it.
+
+## A window's title is asked for, not assigned (user-reported, 2026-09-11)
+
+Reported from use: the Cache Manager's "Greenzone budgets..." button threw
+`InvalidOperationException` the moment it was clicked, from `FormBase`'s own
+`Text` setter, before the dialog had drawn anything.
+
+`FormBase` refuses `Text = ...` on purpose. A title is not a string a window
+owns, it is an answer the window has to be able to give again: the "static
+window titles" setting (Config > Customization, for anyone recording their
+screen) reaches in and asks every open window for its title a second time, and a
+window that assigned its title once during construction has nothing left to ask.
+So the title is a property - `WindowTitle` for the honest one, `WindowTitleStatic`
+for the one safe to show a stranger - and `UpdateWindowTitle` is the only thing
+that writes to `Text`. The setter throws rather than quietly ignoring the write,
+because a window silently keeping the wrong title is the failure the whole
+mechanism exists to prevent.
+
+**This class of mistake is easy to make and invisible until somebody opens the
+window.** It compiles: `Text` is an ordinary inherited property. It reads right:
+the same constructor assigns `Text` to a dozen child controls a few lines below,
+where it is perfectly correct, so the one bare `Text =` looks like all the
+others. And nothing exercises it - a dialog reached from one button in one
+window is not on any path a test or a session walks by accident. This one had
+been in the tree since the budgets dialog was written.
+
+The sweep found 21 `FormBase` subclasses and exactly one offender, so this was
+not a pattern that had spread. The guard against the next one is
+`FormTitleContractTests.EveryWindowGetsItsTitleFromWindowTitle`: it reflects over
+the frontend assembly for every concrete `FormBase` subclass (base classes that
+only exist to be derived from, such as `ToolFormBase`, are excluded by being the
+base of another) and fails naming any that declares neither override. A window
+that declares neither has nowhere to have put its title except `Text`, so the
+check catches the bug without having to construct windows that need an emulator
+and a live session. Its limit is worth knowing: a window that overrides
+correctly and ALSO assigns `Text` somewhere later still gets through, so the
+per-form tests that open a dialog and read its title back stay worth writing.
+
+## A movie's log has a shape, and only the machine can describe it
+(user-reported, 2026-09-11)
+
+Reported from use (issue #54): open a project, seek so some frames are green,
+select a range and press Delete. A "Failed to draw input roll" box appears, the
+project closes, and the frontend then falls over painting the roll it no longer
+has a movie for. Not core-specific: seen on DOSBox-X, reproduced on PCSX2.
+
+What is thrown, from inside the paint, is
+`ArgumentOutOfRangeException: Length cannot be less than zero` out of
+`MovieController.SetFromMnemonic` - it looked for the comma that ends an axis
+field, found none, and asked for a substring of negative length. The entry it
+was reading had no axis fields at all. That entry was the one Delete had just
+written: Clear is the only editing path that generates an entry from
+`DefaultValueController` rather than from the frame's own state, and
+`DefaultValueController` was built once, lazily, and kept for the movie's life.
+
+The order that poisons it is the order a project opens in. The file says which
+core to boot and with what, so the file is READ FIRST; until that boot the
+frontend's emulator is the null one, whose controller has no controls and -
+because `InputManager.SyncControls` builds a mnemonics cache for every emulator
+it syncs, the null one included - is perfectly willing to generate entries. The
+read touches `DefaultValueController` (finding where the run's input stops), and
+that first touch fixed the writer's idea of an entry as "115 controls, none of
+them axes" for the rest of the session, while every reader used the machine's
+own controller, which knows this movie's four mouse axes.
+
+The corroborating measurement was on screen the whole time: the reporter's
+"Last input" marker sat on frame 844, the last frame of the movie, when the run's
+input stops at 744. That marker is found by comparing entries against an empty
+one, and an "empty" generated from the null emulator's controller (131 characters,
+no commas) matches no real entry (151 characters, four axis fields), so the search
+runs off the end.
+
+**The rule: a controller used to generate or parse a movie's entries is not a
+thing to cache across the boot that defines it.** Both caches now remember the
+definition and the log key they were built from and rebuild when either changes
+(`MovieBase.DefaultValueController`, `TasMovie.DisplayValue`), and `TasMovie.Attach`
+- which runs after the session has the machine's controller - works out where
+the input stops a second time, because the pass done during the read could not
+have been right. What makes this class of bug expensive is that the two halves
+fail asymmetrically: writing a wrongly-shaped entry is silent, and the cost is
+paid later by a reader in the middle of a paint, where there is nothing sensible
+to do with an exception.
+
+## A black screenshot is not evidence until the same frame is drawn beside it (2026-09-11)
+
+A report of "the picture is pitch black" cost two false positives in one
+afternoon, both of them the same mistake. A frontend screenshot taken at frame
+702 of a Marvel vs Capcom 2 project came back an unbroken 0.00% lit; so did one
+at frame 600. Neither was a bug. Frame 600 of that game is black under any
+input at all, and frame 702 is black under THAT PROJECT'S input and lit under a
+blank movie - the project holds a start press the blank movie does not, and the
+game is a screen further on because of it.
+
+So the ground truth for a picture is the same frame of the same movie, drawn by
+`chimera-run` beside it, and the input is half of "the same movie". This is
+cheap to get - `--screenshot <frame>=<path>` on a run that is otherwise undrawn
+costs one composed frame - and the alternative is chasing the frontend for an
+hour over a game that was showing a loading screen.
+
+The other half of the discipline is to A/B the suspect rather than reason about
+it. The suspect there was `video.drawEveryFrame`, added hours earlier, and the
+A/B did not need a rebuild of anything: the installed core package is a zip, so
+it was repacked with the key set to `false` and run beside the real one through
+the same frontend. Same picture, so not the flag. A package-level switch is
+often the cheapest bisect available, and it tests the shipped artefact rather
+than a build of it.
+
+## The crash text was already on disk, and it named the core (2026-09-12)
+
+Reported from use: a New Star Soccer project "crashes if you clear the greenzone
+and come back to frame 1", on the OLD Ruffle core, on a real GTX 1060. No crash
+text came with it, and the first job was not a theory but that text. It was
+already on the reporter's own disk - `minibox-diag.log` in their bundle, two
+faults two minutes apart, both:
+
+	[veh] unhandled fault: addr=ffffffffffffffd0 access=read rip=0000036f0012eb07
+
+Both halves of that line are guest addresses, so `objdump -d
+--start-address=<rip>` on the packaged `core.wbx` names the instruction with no
+debugger and nothing asked of anybody: `mov %fs:(%rax),%rax` at
+`_x86_64_get_dispatch+7`, with `%rax` holding -0x30 from the instruction before
+it. The faulting address IS `%fs_base + (-0x30)` for a base of zero, so the
+report carried its own diagnosis - the guest's thread pointer was gone.
+
+It also settled WHICH core, which the reporter had not. That symbol exists only
+in the NEW Ruffle package. The old one has no `PT_TLS` segment and not one
+`%fs:` reference in its entire text, and cannot fail this way; the new one
+gained both by compiling Mesa in for its software renderer, whose glapi keeps
+its dispatch table in a thread local.
+
+The cause was then measured rather than reasoned about, with five lines on the
+Windows box: `wrfsbase`, then arithmetic with no fault, no syscall and no yield.
+The base survived `SwitchToThread`, was gone after `Sleep(1)`, and was gone
+after 47 ms and 16 million iterations of plain computation - one scheduler
+quantum. Windows does not keep a user-mode FS base across a context switch.
+miniBox's repair, and this repository's own account of the PCSX2 version of the
+same crash, had both assumed the loss happened AT a fault; that assumption is
+why the repair ran on the way out of one and could not work. It is now taken on
+the way IN, and runs that died inside twenty frames complete.
+
+What the headless runners were worth here: `chimera-run` on the OLD core, on the
+same GPU, survived `--seek 1`, `--seek 0 --stop-at-seek` and `--rewind-loop 1,2`,
+and the frontend survived 600 frames of back-jumps and then 800 frames with the
+greenzone thrown away three times and replayed from power-on after each. The
+same runner on the NEW core died in twenty frames with no greenzone involved at
+all. The crash reported as the greenzone's was never the greenzone's, and no
+time was spent reading the state history.
+
+Worth carrying forward separately: the project stores `renderer` as `wgpu-hw`,
+a value the new package no longer declares. The guest's `cfg.choice` falls back
+to its default, so that project runs the SOFTWARE renderer on the new core -
+the very thing that was dying - while the frontend's `-hw` suffix test still
+sees a hardware name and asks for a GPU bridge. A setting value a package has
+stopped declaring is a silently different machine, and nothing says so.
+
+One trap that nearly became a second bug report. Driving "Clear Greenzone" from
+Lua the obvious way produced a `NullReferenceException` inside
+`emu.frameadvance()` that looked exactly like a frontend bug on the clear path.
+It was the binding. Every TAStudio Lua method that moves the emulator brackets
+it with `IsUpdateSupressed`, and without that the frontend resumes the very
+script that is still running: the coroutine is no longer suspended and
+`CurrentFile` is null. A new binding that skips the bracket manufactures a crash
+in the code it was written to exonerate.
+
+## The Windows bundle broke on a file nobody had touched (2026-09-12)
+
+Release started failing on a docs-only commit. The step was "Build the Windows
+bundle", and the error was not ours:
+
+	during RTL pass: pro_and_epilogue
+	gl_bridge.cpp: In function '(static initializers for gl_bridge.cpp)':
+	internal compiler error: in choose_baseaddr, at config/i386/i386.cc:7119
+
+A compiler crash, in a file that had not changed, inside a function nobody
+wrote. The first guess - that the runner had resolved a different mingw variant
+than this box, posix against win32 - was wrong twice over. The log's own
+`update-alternatives` lines pick win32, and `apt policy` said this machine
+already had the runner's exact package, 13.2.0-6ubuntu1+26.1. Same compiler,
+same flags, and that is worth stating plainly: it turned a CI-only mystery into
+a local one. The ICE reproduced here in seconds, and every candidate fix could
+then be measured rather than pushed and waited on.
+
+What the compiler could not emit is the function C++ synthesises to construct a
+file's namespace-scope objects. At -O1, where it compiles, that function is
+thirty-nine instructions which realign the stack and call `atexit` three times,
+once per container; at -O2 and above `choose_baseaddr` cannot find a base
+register for that frame. The three containers were the object audit's lives and
+the buffer pool's two vectors.
+
+The cheap fix - build this one file at -O1 - was rejected. `ce_gl_dispatch` is
+the bridge's hot path, every opcode the guest sends crosses it, and
+de-optimising a whole translation unit to route around a bug in its
+initialisers pays for the workaround in the wrong place. The fix deletes the
+function the compiler cannot emit instead: the three containers became
+function-local statics behind accessors, constructed on first use, so the file
+has no static initialiser at all. `nm` confirms it - no `_GLOBAL__sub_I` - and
+the file compiles clean at both -O2 and -O3.
+
+The constraint left behind is the part to remember. `gl_bridge.cpp` must not
+gain a container, a string, or anything else needing dynamic construction at
+namespace scope, or the Windows Release breaks again the same way - in a
+compiler-synthesised function that no diff will ever point at. The comment on
+`auditLives()` says so where somebody about to add one would read it.
+
+## A release can be skipped without anything failing (2026-09-12)
+
+Found while watching the fix above go green. CI passed on the commit, and no
+Release came out of it. Nothing had failed: CI's run was CANCELLED, and Release
+follows `workflow_run` with `conclusion == 'success'`, so it skipped. A skipped
+run is not a red mark anywhere - the commit simply had no release, and only
+someone looking for one would notice.
+
+The cause is that CI's concurrency group was keyed on workflow and ref alone,
+with `cancel-in-progress: true`. A push to main and the nightly schedule are
+the same workflow on the same ref, so they shared a group and the second to
+start killed the first. They are only ever in the same window because GitHub
+runs these crons very late: CI asks for 04:00 and started at 08:16, Release
+asks for 05:00, and the core repos ask for 04:00 and start around 08:30 to
+08:50. The push that morning landed at 08:10, straight into the nightly's real
+window rather than its declared one. The same thing cancelled the Ruffle core
+gate twenty-one minutes in, after it had built its Mesa and its core, taking
+the publish with it.
+
+The fix is to put `github.event_name` in the key, so a schedule and a push no
+longer share a group while a push still supersedes an older push - which is the
+only thing `cancel-in-progress` is wanted for here. What makes this worth a
+section is not the one-line fix but the failure mode: a pipeline that reports
+success on every job it ran, and quietly produced nothing. The three Release
+failures before it were loud and got attention within the day; this one had
+been possible the whole time and would have gone unnoticed indefinitely.
+
+The same group shape is still in the core repos (ares, dolphin, dosbox-x,
+eka2l1, flycast, gpgx, opera, pcsx2, ppsspp, rpcs3, snes9x, stella, xemu,
+quickernes); Ruffle's is fixed here alongside Chimera's.
+
+## An unimplemented syscall is not a refusal (2026-09-12)
+
+The Ruffle core gate had been failing on a runner for two days, and it lied
+about why in three different ways. Every sandbox leg failed, which looked like
+the missing guest Mesa build. With Mesa built it still failed, which looked like
+the gate being too slow for its 150 minute budget - software rendering really
+does cost more than the bridge, and the gate really had gone from 26 minutes to
+58. Then the same commit gated GREEN, which looked like a cache race between
+concurrent runs. None of it was true, and none of it could be reproduced on a
+workstation even running CI's exact command.
+
+The gate ran every leg with stderr sent to /dev/null, so what it actually said
+was never once printed. A smoke step that runs ONE trace test with stderr left
+alone - added to the core gate, ten minutes in, before the gate is allowed to
+spend a runner - printed it immediately:
+
+	miniBox: unimplemented syscall 203 (1, 80, 36f02c3d0e0)
+
+203 is sched_setaffinity. miniBox answers sched_getaffinity (204) deliberately
+and honestly with one CPU, so that a guest's thread pools stay deterministic,
+and it had never implemented setting the mask back. Mesa does both during thread
+setup, so from the day a core linked Mesa into its guest the core could die on
+any frame - SIGILL, exit 132, intermittent because it depends on whether Mesa's
+threading path runs at all.
+
+The principle worth keeping is the one in the title. A syscall the host does not
+implement is not an error the guest can handle and carry on from: the guest is
+killed where it stands. Every syscall a linked library might reach for is
+therefore a liveness question, not a completeness one, and "we do not support
+that" has to be said with a return value. sched_setaffinity is now taken and
+ignored, which is the honest answer - guest threads are green threads on one
+host thread, so there is nothing to pin, and the mask read back is the same one
+CPU either way.
+
+Two things made this cost days rather than minutes, and both are now fixed. The
+gate swallowed the evidence, and a timeout CANCELS a job rather than failing it,
+so the "upload the work dir on failure" step never ran and nothing survived to
+read. A canary that fails fast produces an artifact; a gate that runs to the
+timeout produces nothing at all.
+
+## A folder has no hash, so it has to become a file (user-decided, 2026-09-12)
+
+A project stores names and SHA1s and never paths. That is the oldest promise in
+this frontend and the reason a movie travels: anyone holding files whose hashes
+match can replay it, wherever those files sit on their disk. miniBox goes
+further and binds every mounted file to the savestate by SHA-256.
+
+A game that arrived as a dumped FOLDER cannot be named that way, because a
+directory has no hash. A PlayStation 3 disc is a tree; so is a floppy's worth of
+DOS. The natural answer - let a core open a folder - breaks the promise rather
+than extending it: there is nothing to name, nothing to bind a state to, and
+nothing a second person can be asked to reproduce. So the folder has to become
+one file first, and the interesting requirement is not that it becomes A file
+but that it becomes the SAME file on anybody's machine. The precedent the user
+cited (TASEmulators/iso_maker, which drives xorriso) does exactly this.
+
+Reproducibility here is the whole design, and it is a matter of naming every
+channel through which the host can leak into the bytes and closing each one
+deliberately:
+
+- Timestamps. Fixed dates everywhere - a constant DOS date in the zip, a
+  constant date in the FAT12 directory - never the file's mtime and never now.
+- Mode bits. A constant external-attributes word in the zip, so a dump copied
+  off a FAT drive and one copied off ext4 pack identically. The ISO carries no
+  Rock Ridge, which is the other way to close the same channel: the format is
+  then unable to record a mode at all, including the DIRECTORY modes that are
+  easy to forget because nobody ever looks at them. That is a deliberate
+  difference from the xorriso precedent, which does write Rock Ridge and has to
+  be told what modes to put in it.
+- Order. Entries are sorted byte-wise, never by locale, so a machine with a
+  different collation does not produce a different image.
+- Identifiers the format invites you to invent. FAT12's volume serial is the
+  clearest case: DOS wrote the format time there, which is a timestamp wearing
+  a different hat. It is zero.
+- Symlinks. Collected with symlink_status and skipped, so what is written
+  describes the tree rather than wherever the tree points.
+
+Three shapes, chosen because they are the three things a core actually wants.
+Stored zip, so a core can seek inside it and read what it would have read
+loose, at the same size on disk. ISO 9660 with Joliet, because the disc cores
+want a disc and Joliet keeps long names - built as two directory trees over one
+node tree, and refusing any single file of 4 GiB or more by name rather than
+truncating it, since the format cannot describe one. FAT12, a 1.44 MB floppy
+with deterministic 8.3 names, refusing what does not fit rather than quietly
+leaving it out.
+
+The packing is the engine's (ce_media_make, and the hashing happens on the way
+out through a streaming SHA1) and the window only chooses, shows and cancels.
+That is the thin-C# rule applied to something it would have been very tempting
+to write in C#: every one of the channels above is a correctness question, and
+correctness lives in the engine where the tests are.
+
+Refusing is a feature in all three. An empty folder, a file too big for the
+format, a floppy that will not hold the tree - each is an error with a sentence,
+and a cancel leaves nothing behind rather than half an image that hashes to
+something.
+
+## The image was valid and the console refused it anyway (user-reported, 2026-09-12)
+
+The first real use of the tool was Ultra Street Fighter IV, and the image it
+produced would not boot: "RPCS3: boot failed: Invalid file or folder". The image
+was a correct ISO 9660 volume with a correct Joliet tree, and the EBOOT was
+where it should be. See the commit for the mechanism - sectors 0 to 15 are
+reserved and meaningless to ISO 9660, and a PlayStation 3 disc keeps its
+encryption region table there, which rpcs3 treats as mandatory.
+
+Two things are worth keeping from it. The first is that "reserved" in a
+container format is where the platform puts what it needs, so writing a valid
+volume is not the same as writing a disc that platform will accept, and the
+table is only written for an image that looks like a PS3 disc (PS3_DISC.SFB at
+the root) because it would mean nothing anywhere else.
+
+The second is about evidence, and it is the same lesson as the syscall above.
+This was nearly called fixed three times on no evidence at all: the first A/B
+ran both images without firmware, so both stopped before rpcs3's loader was
+reached; the second had a synthetic EBOOT that is not an executable, so the
+fixed image failed later for its own unrelated reason and printed the same
+sentence. Only --log-trace SYS,ISO showed what differed. A generic error message
+that appears for several distinct causes will happily confirm whatever you
+already believe, and an A/B whose two legs stop before the code under test is
+not a test.
+
+## The exit code was the evidence all along (user-reported, 2026-09-12)
+
+With the image booting, the same game failed the next step: "The compile stopped:
+3 of 8 sessions failed without saying why". The frontend precompiles a PS3 game's
+modules in several headless sessions at once, and three of eight died.
+
+The first thing this needs recording for is a wrong turn taken confidently. The
+orchestrator budgeted memory per session and spent all of what the machine
+reported free, so "too many sessions for the memory" was an easy story, and a
+measurement seemed to support it - 8.32 GB peak for one session. That figure was
+maximum resident set size on Linux, which counts the sandbox's arena as the guest
+touches it, and it is not what the machine has to find. On Windows, where this
+was reported, one session peaks at 1.75 GB of commit and a 3.0 GB working set,
+and eight of them together held 8.7 GB while the machine never dropped below 79
+GB free of 127.5. The memory story was not just unproven, it was false.
+
+What settled it was the thing the orchestrator had been throwing away. A session
+that dies prints nothing on its way out, so its exit code is the only account of
+it there is - and "without saying why" was never a limit of what could be known.
+The code was 0xC0000005: an access violation. Not a kill, a crash. Windows Error
+Reporting had the same thing with more detail (three BEX64 entries, same fault
+offset at three different module bases, so one deterministic crash site, in
+"unknown" module because a sandboxed guest is mapped memory and not a loaded
+image). Every exit code now names itself, the POSIX signals and the Windows
+status values both, and an unrecognised one at least reports its number. That is
+the principle worth keeping: a report that says "no reason given" while holding
+a reason is a bug in the report, and the fix is not more guessing.
+
+The crash was reproduced exactly - twice on Windows, twice on Linux, one session
+at a time with 93 GB free - once the condition was understood: it needs a WARM
+cache. A cold session compiles its share and exits 0; a session that FETCHES a
+game's objects walks into it. That is why three of eight died for the user and
+one of eight for this workstation: it depends on which sessions find their work
+already done, not on which modules they own.
+
+The fault itself is in the rpcs3 core and is written up there (docs/PLAN.md, risk
+2). In short: a JIT memory manager whose allocator returns `block + (pos %
+c_max_size)` will, once its pointer passes the end of the region, hand out
+addresses that alias code already loaded - and the next relocation writes into
+somebody else's instructions. The core had lowered that bound to save arena
+space; this game's main module is 87.9 MB of generated code, and a stray 4-byte
+relocation turned a nop into `add %bl,(%rdi)`, a store to the first byte of the
+emulated machine's execution table. The bound is back and the wrap is refused
+with a sentence.
+
+Two things in the frontend came out of it and stay. The per-session figure is now
+4 GB of what is spare after 4 GB kept for the system, from the Windows
+measurement rather than from an inflated one. And where every dead session died
+for want of memory - and only then, which after all this means almost never - the
+run halves the sessions and goes again, because too much at once is a reason to
+want less rather than a reason to stop.
+
+The last lesson is about instruments. This was found by making the machine say
+where its regions are (the core prints its `vm`, `exec` and JIT bases when a
+precompile starts) and by making the sandbox print the faulting instruction's
+bytes and registers, not just its address (miniBox 5436126). The byte at the
+faulting rip was a nop, which is impossible for a write fault, and that single
+impossibility is what said the code had been modified underneath. A day of
+debugging bought that line; it now prints on both platforms.
+
+## The greenzone may use a second core; the machine never will (user-decided, 2026-09-12)
+
+Asked for directly: emulation is single-core on purpose and must stay that way,
+but state management - deltas, anchors, coarsening, spilling, prefetching - is
+demanding work on the critical path that a helper thread could take. Is it
+worth it?
+
+The full arithmetic and the design are in docs/state-manager.md, "What a second
+thread could take, and what it could never". What belongs here is the boundary
+and the three findings that decide it.
+
+**The boundary.** The machine runs on one core because a movie that replays is
+a machine whose every step is the same step. The greenzone is not the machine -
+it is a cache of where the machine has been, and it has been allowed to differ
+between machines since the day it was tuned: `tuneStride` decides what to keep
+from what the clock says. So a helper thread here cannot change a movie, and
+the rule that keeps it that way is one line - the helper reads guest memory
+through miniBox's always-RW mirror and never writes it. Every mutation of the
+machine stays on the emulation thread.
+
+**The first finding is negative, and it is the one that matters.** A capture is
+about a sixth copy and five sixths page-table work: one `mprotect` per run of
+pages written last frame, and the guest's own stores trapping. The second is
+not work done ON the emulation thread, it IS the emulation thread. Measured
+with a new bench (`tests/perf/storebench.c`), a 1 MB delta at 256 pages a frame
+is 0.04 ms of walk and 0.32 ms of copy, inside a captured frame costing 1.86.
+Against the real-run figures already in this log - the history is 5% of an N64
+run, 11% of a Game Boy one - the offloadable share of a whole session is one to
+three per cent. **Threading the steady-state capture for throughput is not
+worth a thread, and anybody who proposes it for that reason has the wrong
+reason.**
+
+**The second finding is that the prize is the stalls, not the mean.** An anchor
+is a whole machine copied at once: 40 to 180 ms on a 257 MB machine and 150 to
+700 ms on a gigabyte one, and it happens every 600 frames - once every ten
+seconds - forever. A spill is an `fwrite` plus `fflush` of a whole stretch, 7 ms
+to ext4 and 57 ms to NTFS, and `evict()` is a loop that can do several in one
+frame once the budget is full. Coarsening is 0.16 to 0.72 ms a frame and is
+capped at 8 MB of input precisely because it is on the critical path. What a
+person notices is a freeze, and all three of these are bytes moving between
+buffers and files while the machine waits for no reason.
+
+**The third finding came out of measuring rather than of the question.**
+Anchors do not only stall, they thin the greenzone: `tuneStride` averages every
+capture together, so one 121 ms anchor drags the mean far enough over
+`kCostShare` to treble the near band's stride, which then recovers one step per
+thirty captures. A significant share of frames on a heavy core are captured
+sparsely because of a cost that has nothing to do with those frames. That is
+fixable on its own - tune the stride on deltas, measure anchors apart - and is
+worth doing whether or not any of the rest is.
+
+The decision is to build it in that order: the I/O first (no guest memory, no
+miniBox change), then coarsening, and only then the copy-on-write anchor, which
+is where miniBox's deliberate single-threadedness - "a plain array + no lock is
+sufficient", says tripguard.c - has to be faced honestly. The anchor is the
+large prize and the real decision; the first two phases are worth having on
+their own terms.
+
+And it is threadS, not a thread (user-decided, 2026-09-12). The work divides by
+what it touches and by whether anything waits for it, which is the distinction
+that actually matters: **owed work** - the writer, the capture drainer, the
+tidier - has already been promised, is counted against the budget, and a
+barrier waits for it; **speculative work** - the prefetch that keeps a composed
+prefix behind the playhead, the compression of cold deltas - is promised to
+nobody and is killed where it stands by any edit, seek or memory pressure. A
+speculative thread that can make owed work wait has stopped being speculative,
+so it works from a snapshot, publishes with one atomic swap, and is cancelled
+rather than joined. The drainer is the one role that wants a POOL rather than a
+thread, because copying a quarter of a gigabyte is bound by the memory bus and
+one thread does not saturate it. Everything is bounded by what the machine can
+spare and every role is droppable: with the helpers off, the work happens in
+line exactly as it does today, which is what makes the threaded path
+verifiable at all - the synchronous path is the reference implementation.
+
+The concurrency rule is the part that had to be designed rather than coded
+into existence (user-asked, 2026-09-12). Somebody stepping back, jumping,
+scrubbing, editing an input and switching a branch several times a second is
+what TAS work IS, so the model must be one in which interference cannot make an
+unstable state rather than one in which it happens not to. Three facts carry
+it. There is no user thread - the run loop calls DoEvents itself, so every
+click and hotkey is dispatched on the loop thread, between frames, in order.
+Only the loop owns anything: the machine, the segments, the byte count, the
+spill metadata. And helpers do not own, they CONVERT - handed an immutable
+buffer, they hand back a buffer or a file range, and the loop applies the
+result at one point per frame.
+
+What follows from those is that there is no lock on the history to wait behind,
+no cycle to deadlock in, and no window where a reader can want bytes that a
+writer has not finished: a spill is not a spill until its completion is
+applied, so the memory copy stays until the file is good. Link bodies become
+reference-counted and immutable, which deletes the use-after-free that an edit
+during a helper's work would otherwise be. Every piece of work carries a
+generation, and anything that makes a timeline untrue bumps it, so interference
+turns work in flight into garbage automatically. And a barrier is "help
+finish", not "wait" - the loop joins the work rather than blocking on it, so
+the worst case a user action can meet is the speed of the code that exists
+today.
+
+None of it lands on a green unit suite. The user set the bar and it is written
+down beside the design: long stress runs with the budget full, seeking
+backwards at every distance, re-recording back and forth with changed inputs,
+cores whose machine includes disk-backed files, every core rather than the two
+that are easy to drive, and the performance claim measured before and after as
+a per-frame MAXIMUM rather than a mean. A history bug is silent, late and lands
+somewhere else; a threaded one would be all three and unreproducible as well.
+
+One thing is deliberately not on the list. The page faults and the
+re-protection are eighty per cent of a captured frame and no thread can ever
+take them. The lever that reaches those is granularity - a 2 MB huge page
+faults once where 512 pages fault 512 times - at the cost of deltas 512 times
+coarser, which is the trade this whole design was built to escape. It is a
+different project, and mixing the two would be a good way to lose both.
+
+## The greenzone got its threads, and the machine kept its core (2026-09-12)
+
+The design above is now three quarters built, and what it measured is worth
+recording beside what it predicted, because one prediction was wrong in an
+instructive way and four defects turned up that only the bar the user set could
+have found.
+
+**What exists.** The project save and the spill writes happen on a writer
+thread; an anchor is taken as a plan, its pages held read-only by miniBox and
+copied on a drainer thread while the machine runs on. Coarsening is still on
+the loop and is now deliberately staying there (below). Everything is droppable
+- `CHIMERA_HELPERS=0`, or a thread that will not start, and the whole of it
+happens in line exactly as before, which is the reference the threaded path is
+tested against rather than a fallback nobody exercises.
+
+**What it bought.** On the emulation thread, an anchor of a 256 MB machine fell
+from 84.7 ms to 9.6, and of a gigabyte machine from 521 ms to 33 - eight to
+fifteen times less - with the resulting state byte for byte the state the old
+path would have written. A captured frame's 99th percentile improved 1.7x to
+12x depending on the shape of the machine, and its worst frame up to 7.2x. A
+project save of a 122 MB history went from 51 ms of freeze to returning at
+once. The prediction that the steady-state MEAN would barely move was right: it
+moved 1.1x to 1.5x, and anybody doing this for throughput would still have the
+wrong reason.
+
+**The measurement that made phase 3 possible** was not about copying at all. A
+copy-on-write anchor has to hold every page it is about to copy, and if that
+cost what the copy costs the idea is dead; it does not, because mprotect works
+on RANGES. Holding 256 MB read-only measured 0.76 ms in one call and 1.08 ms in
+megabyte runs, against 40 to 180 ms to copy it. One micro-bench, five minutes,
+and it decided the whole design.
+
+**The prediction that was wrong.** The design said a spill should not count as
+spilled until its write landed, so that a reader could never want bytes that
+were not there. Built that way, the budget would be met later than it is asked
+to be - and eviction is driven by that byte count, so the history would hold
+different frames threaded than in line. It is the other way round: the metadata
+settles at once, exactly as before, and what pays for it is that every READER
+of the file waits for the writer, and only for the range it needs. That is what
+makes a step-for-step comparison between the two modes possible, and that
+comparison is now a test.
+
+**Phase 2 is not deferred, it is declined.** Moving coarsening off the loop
+costs that same property - a merge that lands a frame late leaves a landing the
+synchronous path had already merged away - and it buys 0.16 to 0.72 ms a frame
+of a cost that is not what anybody feels. Trading the one property that makes a
+threaded design checkable for a fraction of a millisecond is a bad trade, and
+saying so is more useful than leaving it on a list.
+
+**The measurement that nearly ended it, and the one line that saved it.** On a
+synthetic block the copy-on-write anchor did what it promised. On a real
+PlayStation 2 - a 232 MB state, anchors every twenty frames - it did nothing at
+all: 117 to 141 ms on the emulation thread against 113 to 129 for the old path.
+Splitting the trace line in two said why in two minutes. The plan cost eleven
+milliseconds, exactly as the bench said; `std::vector::resize` was spending a
+hundred and thirty zeroing the quarter-gigabyte buffer it was about to be
+written over. A body is now allocated by an allocator whose `construct` does
+nothing, so whoever fills the bytes pays for touching them - for an anchor, the
+drainer - and the same machine's anchor costs 12 to 17 ms. The lesson is not
+about allocators: a bench can measure a mechanism perfectly and the system not
+at all, because the thing it does once outside its loop is the thing that costs.
+
+That figure was itself half the story (2026-09-13). It was the frame the anchor
+was taken on; the frame AFTER it waited 103 to 145 ms for the drainer, because
+every capture began by finishing the plan, whether it needed the anchor's bytes
+or not. A trace line for the wait found it, and the wait now happens only where
+the bytes are read. The same lesson a third time: the number measured was the
+one the trace printed, and the cost had moved to a line nobody had written yet.
+
+And it is the same lesson twice in one day, from opposite ends. The rpcs3 crash
+above was found by printing the bytes at the faulting instruction instead of
+just its address; this was found by printing the buffer's time beside the
+plan's. Both had been one missing number away the whole time, and in both cases
+the missing number cost a day before it cost two minutes. What transfers is not
+the fix, it is that an instrument which reports the thing you are working on
+and nothing beside it will confirm whatever you already believe.
+
+**What reaches the disk is compressed, and the decisions did not notice.** Real
+machine states compress seven to a hundred and eighteen times at zstd level 1 -
+a PlayStation 2 anchor from 232.9 MB to 9.95 MB - so the writer compresses each
+spilled body as it writes it. The design constraint was the same one as
+everywhere else in this work: the history decides with LOGICAL sizes, reserved
+at once, and only the readers learn where the compressed bytes physically
+landed. The same PS2 history then weighed 79.9 MB on disk instead of 2.5 GB,
+and a cold restore of a spilled anchor fell from 103 ms to 59. As first built it
+bought no depth, because the disk budget still counted logical bytes; counting
+physical ones would make disk eviction follow the writer's timing, and that
+trade was put to the user rather than made. The answer was to count compressed
+bytes (user-decided, 2026-09-13), and with the same 1024 MB budget a PS2 run
+that had been throwing away all but two anchors kept everything it ever spilled
+in 79.7 MB, and served a seek back from disk that the raw run had to replay.
+What it cost is written down beside it: threaded and in line still decide the
+same frames step for step, but may drop from disk at different moments, so the
+differential test now compares the disk once, after a flush. The measurement that found this
+had to be taken twice, because the first one landed on the tiny boot anchor and
+read a page cache rather than a disk, and both mistakes flattered the old path.
+
+**Four defects, and what each says.** A reader and the writer shared one FILE
+handle, and a FILE is one position: the loop seeking to the oldest stretch and
+the writer seeking to the end interleaved, and restores came back with somebody
+else's frames seven runs in twenty. Two handles fixed it, and the lesson is
+that "different ranges" is not the same as "different files". The save barrier
+called into a session that was already freed, which a four-thousand-frame soak
+found by surviving every seek and dying on the way out - a barrier belongs to
+the thing that knows it is still alive. And twice a barrier was taken before
+deciding whether it was needed, or a decision was made on numbers describing a
+file that had not been written yet: both turned a win into a loss, and neither
+was visible as anything but a slower run.
+
+Every one of those four came from repetition and from real cores, not from a
+green suite: the FILE-position bug passed thirteen runs in twenty. That is the
+whole argument for the bar.
+
+## The open ideas, measured rather than argued (2026-09-13)
+
+Three ideas were left over when the greenzone got its threads, and each one was
+settled by a run on a real machine rather than by how good it sounded.
+
+**A saved history is compressed, because the spill file already proved it.** A
+project's history is the greenzone written out, made of the same mostly-empty
+machines, and it had stayed raw. `ChimeraHistory4` is the magic followed by
+exactly the old layout as one zstd stream - nothing else about the format moved,
+so nothing is held twice to save or load it and the old version is still read.
+A PlayStation 2 history went from 1,845 MB to 60 MB, and the save got faster, not
+slower, because level 1 compresses faster than the disk writes.
+
+**Reverse deltas stay out, and the reason is where the work would happen.** They
+were removed once for costing a page copy in the fault handler on every frame,
+and the question was whether hot pages - which already keep the page as the
+frame found it - had made that copy free. They had not: on the PlayStation 2 two
+thirds of what a frame writes lands on pages that are not hot, 2.2 MB a frame
+past boot and 168 MB in the worst one. That copy cannot move to a helper. The
+bytes it needs exist only until the guest's write goes through, so it is paid on
+the machine's own thread or not at all - and a design whose whole premise is that
+the machine's thread only runs the machine does not buy a faster gesture with
+it. The number that would reopen this is a core where most written pages are hot.
+
+**The anchor spacing is chosen by what a seek would cost, not by a table of
+cores.** A stretch closes once its links weigh as much as its anchor, so a seek
+costs about two anchor loads on any machine. The first version was wrong about
+light machines in a way only a real run could show: a NES, a Genesis and a SNES
+all took an anchor every thirty-one frames, because their anchors are smaller
+than thirty frames of pages, and there a seek was already a millisecond. So the
+weight only counts past 64 MB of links - about twenty milliseconds of walking -
+and those cores went back to one anchor per run. The PlayStation 2 went from
+99 / 103 / 135 ms seeks to 63 / 44 / 53, for about 650 MB more held in memory.
+A positive spacing from a caller is still obeyed exactly. What transfers is the
+floor: a rule derived from cost ratios needs an absolute threshold too, or it
+optimises a cost nobody was paying.
+
+## Opening TAStudio from a script freed the script (2026-09-13)
+
+`client.opentasstudio()` on a bare rom crashed in `--headless`, on main, for
+everybody. With no project open TAStudio starts one, starting a movie reboots the
+core, and a reboot restarts the Lua console - which closed the Lua state the
+calling script was still running on. The call returned into freed memory, and
+the fault was a write through `L->top` holding the bytes of the string
+"DrawFini": a Lua method name, sitting where the state used to be. The other
+calls that can reboot (`openrom`, `openproject`, `reboot_core`) already told the
+console first, so it re-injected its dependencies instead of closing the state;
+`opentasstudio` never did, because opening a window was not supposed to boot
+anything.
+
+Fixing it exposed a second failure on the same gesture, on Genesis only. gpgx
+declares its Mega Drive and its Mega CD both as the GEN system, the package
+listed GEN twice, the registry put the core under GEN twice, and the reboot -
+which forces the core by name - found "more than one matching element". A
+system is listed once now, in the package and again in the registry. Both were
+found only by running the gesture on real roms of two different cores: the first
+fix made the NES pass and the Genesis still fail.
+
+## A shadow a frame behind is not always a frame behind (issue #64, 2026-09-13)
+
+Reported from outside: ares crashed on Windows running NES games, with faults at
+addresses like `0x3`, `0xf5` and the start of the `ares::Famicom::cpu` object -
+jumps into data. None of it reproduced from a plain run, a savestate round trip
+every frame, thirty minutes of play, pressed Reset buttons, the frontend itself,
+the reporter's own nightly, or rebooting the core in one process. What did was
+the user's suggestion: rewind many times, at irregular patterns. A seeded Lua
+stress script - record, seek back one frame or a hundred or to the start, seek
+forward, throw the greenzone away, resume - found it on Windows only, identically
+on the reporter's build and the current one: in nine seeks as ares throwing
+`Thread::Enter()::ThreadNotFound`, and after some 1470 seeks in the reporter's
+exact shape, an execute fault at `rip=0x2` and a read through `r15=0x3` inside
+`ares::Famicom::CPU::step` with `rcx` holding `&ares::Famicom::cpu`. Both are a
+coroutine's stack from one moment beside a heap from another.
+
+The cause was in miniBox. A Windows stack cannot report its own writes (the
+kernel pushes the exception record onto that very stack), so a stack page is
+tracked by COMPARING it with a shadow. The shadow was rewritten only when a delta
+was saved, and the reasoning that this was safe - "a stale shadow is a frame
+behind; carrying a page too many is waste, never wrong" - fails whenever the
+stale bytes happen to EQUAL the new ones, which determinism makes common. Two
+paths were measured, each with a test that fails on the Windows build without
+the fix: a load or a delta apply (seek back, replay, and the stack is rewritten
+into exactly the old timeline's bytes), and a frame captured as an anchor rather
+than a delta (the shadow still describes the frame before it). The first fix
+covered only the first path; seed 31 then survived 3000 steps and seed 57 still
+died at ~1470 seeks. The rule that closed both is the one hot pages already had:
+when an epoch opens, every stack page's shadow is what it holds, so the
+comparison at the end of the frame is its end against its start whatever
+happened in between (miniBox, `stack_shadows_describe_now`). Seeds 31, 57, 73
+and 91 then each survived 3000 irregular actions on Windows - 1992, 2121, 1989
+and 2033 seeks.
+
+Three things worth keeping. An argument of the form "the stale value can only
+make us do extra work" has to survive the case where the stale value EQUALS the
+new one, and a deterministic machine is exactly where that case is common. A
+harness that does one kind of thing at a time - a single seek, a round trip
+every frame, a long plain run - passes a bug that needs a SEQUENCE: clear, go to
+zero, go to zero again, replay, come back, step back eight frames. And a fix that
+makes the known reproduction pass is not finished until a different seed has run
+past where the old one died; the first version of this one looked complete for
+an hour.
+
+The fault report changed with it, because the crash that proved the fix partial
+printed `code:` and nothing more: reading instruction bytes at `rip=0x2` from
+inside the handler was a second fault. It now prints every general-purpose
+register first and reads code only where it is readable.
+
+The stress found four more on the way, none of them this, each fixed after it.
+After seventeen to thirty-four core reboots in one process on Windows the sandbox
+could not create its memory block again ("failed to create memory block"): a
+freed block released its mirror - a view of the block's section - with
+VirtualFree, which cannot release a view and failed silently, so every reboot
+leaked a whole arena; it is now unmapped as a view, and the reboot-heavy stress
+survives 156 reboots. TAStudio could not open a movie whose log key names
+controls the machine does not currently have (`MnemonicMap`,
+`KeyNotFoundException` - a project recorded with a second controller and
+reopened without it): `ControllerDefinition.MnemonicFor` answers from the cache
+and falls back to the system's lookup for a name the machine lacks, and every
+reader of the cache goes through it. A project's game record took the package's
+FIRST system (`RomLoader`, `factory.SystemIds[0]`), so an ares NES project said
+N64 wherever that was read; it now takes the system the created emulator reports.
+And headless mode waited forever on the prompt to locate a project's missing
+file; it now names the missing files and exits 64, like every other dialog a
+headless run cannot answer.
+
+## A save in the background still stopped the run (nss102, 2026-09-13)
+
+A Ruffle project of 8039 frames froze "for about ten seconds, every so often,
+worse as the movie grew". Saving a project already happens off the machine's
+thread: the history is snapshotted and written as one job on the history writer
+(`saveToLater`). Measured headless on Windows with the writer's waits traced,
+the save wrote 4.35 GB in 46 s - and the frame about five seconds after it
+started took 42.4 s. That frame spilled: a Ruffle stretch is about 300 MB, the
+writer's queue is capped at 64 MB, and a spill over the cap waits for the
+writer to catch up - which, with a save in the queue, is the whole save. The
+autosave fires every thirty minutes, and the history it writes grows with the
+run until the budgets are full, which is the "worse as the movie grew".
+
+While a save is pending the history now neither spills nor compacts (both would
+wait for the writer); the memory budget is kept by thinning, which is what a
+history with nowhere to spill has always done, and a refused spill is not
+reported as a full disk. The same run on Windows with the fix: the save still
+wrote its 4.35 GB, no frame took a second or more, the slowest after the save
+took 0.29 s - an ordinary spill frame - and the 7000 frames finished in 238 s
+rather than 287. A test asks the same question without a disk: 200 captures
+made while a save is pending, none of which may queue a write; it fails without
+the fix.
+
+The general lesson is the one the helper threads were built on and this broke
+quietly: moving a job off the critical path is only half of it. Anything that
+WAITS for that helper - a queue cap, a drain before a read - puts the job back
+on the path, and the biggest job the helper ever gets decides how long.
+
+The same measurement found the other half of the report, which is not fixed:
+a capture drops every stored frame after it (`captureOnce` calls
+`invalidateAfter(frame - 1)`), so going back and playing forward over unchanged
+input throws away the greenzone ahead, and returning to the end replays all of
+it - 300 frames in 10 s, 1000 in 31 s, 3000 in 99 s. Every TAStudio edit already
+invalidates explicitly; the engine's own record path relies on the capture
+doing it. Whether a replay may keep what is ahead is the user's decision.
+
+## A replay changes nothing (user-decided, 2026-09-13)
+
+The rule the user set: a non-modifying replay does not affect the greenzone.
+
+It did. Every capture dropped every stored frame after it (`captureOnce` called
+`invalidateAfter(frame - 1)`), on the reasoning that a capture describes the
+frame we stand on and anything after it is a timeline that no longer happens.
+That is true of recording over an entry and false of playing one back. On
+nss102 a seek back followed by play threw the greenzone ahead away, and the way
+back to the end was emulated frame by frame: 300 frames in 10 s, 1000 in 31 s,
+3000 in 99 s - the "stall" a user sees on every click forward after looking
+back, and longer the further back they looked.
+
+Now a capture of a frame the history already reaches past stores nothing and
+drops nothing, and lets the epoch go so the next delta is measured from where
+the machine stands. What changes the timeline says so itself, before the frame
+is played:
+
+- every TAStudio edit, recording included, already did (`TasMovie.InvalidateAfter`);
+- a branch loads through the same call, at the point where the logs diverge;
+- loading a savestate into a project now also counts a log that is merely
+  longer or shorter as diverging where the shorter one ends;
+- the engine's own movie (`ce_session_movie_advance`) invalidates after the
+  current frame whenever the input is not the log's - recording, or past the
+  log's end - and `ce_session_movie_load` invalidates after the first entry
+  the old and new logs disagree on.
+
+What a replay does not do is fill in what the bands thinned: the history is
+append-only, so frames the far band gave up stay given up until the playhead
+passes the end again. Making a branch mid-history no longer stores its frame
+either - and no longer drops everything after it, which is what that capture
+used to do. A branch carries its own state, so nothing reaches for it.
+
+Measured on nss102 on Windows with the change, the same script as before: back
+1, 2, 5, 10, 30, 100, 300, 1000 and 3000 frames and return to the end each time.
+Every return took a second or less and at most 17 frames of emulation - the
+stride back to the stored frame before the end - where the returns from 300,
+1000 and 3000 frames back had taken 10, 31 and 99 s.
+
+## Two versions of a core are one core to its firmware (issue #60, 2026-09-13)
+
+Installing a second xemu beside the first listed its firmware twice in Config >
+Firmware, with nothing to tell the two sets apart. The survey made one group per
+package found on disk. Firmware is remembered by core name, never by package, so
+the two groups were always the same files - the second was only noise. The
+survey now makes one group per core: every declaration any installed version
+makes, once each by id and dump, so a firmware only the newer version asks for
+is still asked for. That is the reporter's own preference - more firmware
+rather than fewer - and it needs no version shown, because nothing about a
+chosen file depends on which version asked.
+
+## A cache is checked against the build that runs (issue #63, 2026-09-13)
+
+An autosaved xemu project, reopened, could not load its branches: every attempt
+threw "memory block load failed", and miniBox's diagnostics said "this state was
+made by another machine". The cache beside a project (greenzone, branch states)
+is only used when the machine identity it records matches the project's - and
+that identity took the core's hash from the project's PIN. A project opened on
+another build of its core - accepted at the "not the project's core build"
+prompt, or simply the version that registered first when two are installed,
+which is what the same reporter had (issue #60) - still pinned the old hash
+until saved, so the old build's cache passed the check and its branch states
+reached a sandbox that rightly refused them.
+
+The identity now names the build that runs when it is known, so a cache made by
+another build is set aside with the note every other mismatch gets, and the
+greenzone starts empty. And a branch whose state is refused anyway no longer
+throws out of TAStudio: its input is already loaded, so the refused state is let
+go and the branch's frame is reached by replay, with a message saying why.
+
+Still open: with two builds of one core installed, the registry keeps whichever
+registered first, so a project cannot choose the build it pins without the other
+being removed. The prompt says the builds differ; it cannot yet offer the right
+one.
+
+## Several builds of one core, and the one a project pins (user-decided, 2026-09-13)
+
+Issue #63's still-open half, as the user put it: several versions of a core may be
+installed and selectable, as long as they are not the exact same package. The
+registry used to keep one factory per core name and silently drop the next, so
+a project pinned to an older xemu opened on whichever xemu this session had
+loaded first - and its saved states were refused.
+
+A core package is now registered beside another of the same name whenever the
+two are different bytes, and a project boots the exact build it pins whenever
+that build is installed, loading it next to the others if need be. Which build
+runs otherwise is one rule, `CoreChoices.PickBuild`, used by every place that
+turns a core name into a machine - project boot, the cache's machine identity,
+a bare rom, a movie's forced core, the firmware in use: the pinned build if it
+is there, else the one the user chose, else the most recently installed. The
+user decided the middle term: opening a package with File > Open Core, or
+installing a version in the core manager, is choosing it
+(`Config.DefaultCoreBuilds`); a project loading the build it pins is not, and
+records nothing. The "not the project's core build" prompt now only appears
+when the pinned build is genuinely not installed.
+
+Two smaller truths came with it. "Which package made this emulator" was
+answered per adapter ASSEMBLY, and every miniBox package shares one, so it
+named whichever package registered last; the registry now remembers the
+factory behind each emulator, and the movie header and firmware record read
+that. And an adapter package - a .NET assembly rather than a miniBox guest -
+still cannot be loaded twice, because a second assembly of the same identity
+would silently be the first one's types; those stay one build per name.
+
+Proved end to end headless: with a byte-different copy of the synth core loaded
+first (and so chosen), a project pinned to the original booted once, played its
+movie to an OK dump, and never asked; the same project pinned to a build that is
+not installed stopped at the prompt (exit 64). The chosen build in the config
+was the copy, untouched by the project's own load.
+
+## A crash takes nothing that was entered (user-decided, 2026-09-13)
+
+The user asked for crashes not to be fatal, and above all for the work in
+progress - the inputs - never to be lost, even when a crash cannot be survived.
+
+The crash that prompted it could not have been caught. nss102 died inside the
+NVIDIA OpenGL driver with 0xc0000409, a fast-fail: Windows ends the process on
+the spot and runs no handler, managed or native. A design that saves the work
+"on the way down" saves nothing in exactly the crashes that matter most, and a
+killed process or a power cut is no kinder. So the inputs never wait for a
+crash: they are on disk before anything can go wrong.
+
+The input log is the engine's (`ce_movie_log`), so the engine journals it. A
+journal opened on a log first writes the whole log, then appends one line per
+change - add, set, insert, remove, truncate, clear, key, or a whole image for a
+parse or an assign - and hands each line to the operating system with a flush
+the moment it is made, syncing to the disk at most once a second. Bytes the OS
+holds outlive the process whatever kills it; a power cut costs at most that
+second. The journal alone rebuilds the log; a line the crash cut short is not
+replayed; rewriting the journal goes through a fresh file and a rename, so a
+crash mid-rewrite still leaves a whole one.
+
+The frontend keeps the rest (`ProjectRecovery`, per project, beside its cache):
+a session file naming the process, a snapshot of the whole project - markers,
+branches, settings, written through the backup path, so no greenzone and no
+change to what counts as saved - rewritten every few seconds while there is
+unsaved work, and the journal restarted with each snapshot to keep it short.
+A branch load replaces the movie's log object, and the journal follows it.
+Closing the project removes it all.
+
+Opening a project whose recovery files outlived the process that wrote them
+(the process is gone, or is another process with that id) rebuilds the work
+before anything else happens: the newer of the snapshot and the saved project
+file is the base, the journal's inputs replace its log, and the result is
+written into the backups folder as `<name>.recovered <time>.chimeraProject` -
+never over the project. Then it asks: yes swaps that content in, unsaved, and a
+save writes it to the project; no opens the project as last saved and the copy
+stays. A headless run never asks; it says where the copy is.
+
+What can be caught is survived. An error on the UI thread, or in a frame step
+(the core, the movie, a tool), keeps the work (a snapshot on the spot), pauses
+emulation and says so - with the work's state in the message - and the session
+goes on; a burst of them is told a few times and then only on the status line,
+so recovering cannot become an endless run of dialogs. An error on another
+thread ends the process whatever a handler does, so that handler only keeps the
+work. Headless runs still fail loudly, so a gate cannot pass by swallowing one.
+
+Not done, on purpose: no native last-chance handler writes anything. Code that
+runs inside a process whose memory may be corrupt is the least trustworthy code
+there is, and there is nothing left for it to save - the inputs are already on
+disk. One trap met on the way: a static field of type `MainForm` on `Program`
+made every start fail, because a field's type is loaded with its class, which
+is before Chimera's assembly resolver is installed; the handlers hold framework
+delegates instead.
+
+## A GPU core's word that its states survive is not taken (2026-09-13)
+
+Reopening nss102 (Ruffle, `opengl-hw`) crashed Chimera inside the NVIDIA OpenGL
+driver - `nvoglv64.dll`, 0xc0000409, a fast-fail - after a long load and a black
+screen. It reproduced headless on the same GTX 1060 from a copy of the project
+and its saved greenzone, at the same fault offset, on the first frames after
+restoring frame 21 from the history the previous session saved. The build from
+before today's replay change ran the same steps to frame 300.
+
+The difference was not a bug introduced but one uncovered. Ruffle declares
+`video.gpuStatesSurviveTheContext`, so its greenzone was saved and loaded across
+sessions - but until a replay stopped discarding the frames ahead, the first
+capture of every session threw away everything loaded after frame 0, so a Ruffle
+state from another process was never actually run. Keeping the greenzone
+(user-decided, the same day) made the frontend restore one, and the renderer's
+objects did not come back with it: the state's own GL audit saw nothing
+orphaned, and the driver still aborted the process.
+
+So the claim is no longer taken on trust: a machine a GPU drew keeps its states
+for its own session, whatever the core declares, exactly as GPU cores without
+the claim always have. Rewind, branches and the greenzone within a session are
+unchanged; across a restart they are recomputed by replay. The declaration is
+still written into the project, because it is what the core said. Making it
+true is Ruffle's to do, and a core that proves it - a restored state drawn to
+the right picture in a fresh process - can have it honored again.
+
+## Markers and branches are journaled too, and unsaved work is locked (user-decided, 2026-09-13)
+
+Two follow-ups the user set for recovery. First, the markers and branches are
+journaled as they change, like the inputs, instead of reaching the disk only in
+the snapshot every few seconds. Second, the journal is a cache manager object,
+locked by default.
+
+The journal stays one file and stays the engine's. The engine carries the
+frontend's own records without interpreting them: an image of every marker and
+branch goes into the same fresh file as the input log whenever the journal is
+rewritten, so no crash can separate them, and each later change is appended
+with the same flush and the same once-a-second sync as an input. Three records
+say everything: `M` the markers a person placed (the run's own are derived),
+`B` one branch whole, keyed by its Uuid, and `O` the branch order - the list IS
+those ids, so a removal needs no record of its own. A branch's input log is in
+its record, but only when that branch changes. Changes are found by comparing
+cheap signatures on every pass of the main loop rather than by events, because
+a marker's message and a branch's text are plain properties anybody can set.
+Recovery replays the inputs, then takes the markers, branches and order the
+records end on; a journal with no such records leaves the base project's.
+
+Making it a cache entry uncovered a real hole. The recovery folder lived inside
+the project's cache, and a project's cache entry is the whole folder - so the
+auto-clean, which takes unlocked greenzones oldest first, or anyone removing a
+greenzone by hand, would have deleted unrecovered work with it. Recovery now has
+its own root, `<data>/Recovery/<id>`, and its own kind (`CacheKind.Recovery`,
+"Unsaved work"). The lock book already started every kind but greenzones locked;
+unsaved work joins them for the opposite reason from the small caches - it is
+the one entry whose loss is work rather than time. It is in use while any
+session that owns it is running, and a folder where an earlier build left it is
+moved on first use.
+
+One slip worth a line: a hand-typed separator went into the source as a raw
+control character, six times over. It compiled and ran; it is now an escape.
+
+## A crash no handler sees still says what it was (user-decided, 2026-09-13)
+
+The crash that started the recovery work was a graphics driver's fast fail:
+`__fastfail` ends the process without running one exception handler, one
+finally or one managed event. The work survives that (the journal), but nothing
+said why it had been needed - the Windows event log named a module and an
+offset, and the minidump `LocalDumps` happens to be set to keep was found by
+chance, outside anything Chimera knows about.
+
+What was ruled out: a handler in the process (never runs, and would be code in a
+process that has just declared itself corrupt), and a watcher process attached
+as a debugger (it would see every first-chance fault, and miniBox takes page
+faults by design - a debugger in the loop makes the sandbox crawl).
+
+What runs is Windows Error Reporting, in its own process, and WER has a place
+for exactly this: a runtime exception helper module, registered by the process
+(`WerRegisterRuntimeExceptionModule`) and allowed by a per-user registry value,
+so no administrator. It is loaded into WerFault.exe with a handle to the dead
+process. Proven on the test box before anything was built on it: a C crasher
+that fast-fails (`int 0x29`) and one that dereferences null both left a note
+and a minidump, and the stack walk resolved through WerFault's own dbghelp.
+
+So `chimera_crash.dll` (source/crash, built by meson for Windows only) writes a
+note and a minidump into `<data>/Crashes`. It reads a fixed block in Chimera's
+memory - the folder, the frame, lines about the session - through the process
+handle, clamps everything it reads, and claims nothing, so Windows' own record
+of the crash is unchanged. The note is plain text and flushed as it goes, so a
+dump that fails or stalls cannot take the note with it. The block is never
+freed: it is read after the process is gone. Registration failing costs the
+note, never the start.
+
+A note is matched to a recovery folder by process id AND time (ids are reused),
+and the reopen prompt says what ended the session. The minidumps are for a
+debugger, not for a person; the one line in the prompt is for the person.
+
+The first question a driver crash raises is what the renderer had just asked of
+it, and a stack inside nvoglv64.dll without symbols does not say. So the GPU
+bridge keeps a flight recorder (docs/gpu-bridge.md, "The flight recorder") and
+the note carries its last calls: always on, because the crash that needs it is
+never the run somebody switched a trace on for, and read from outside, because
+nothing inside runs after a fast fail.
+
+## A GPU core's word is withdrawn again, after it bricked a project (user-decided, 2026-09-14)
+
+35be468 honored `video.gpuStatesSurviveTheContext` again the morning after it was
+withdrawn, on measurements that were all true: a Ruffle state reloaded in a
+fresh process, one restored twenty-one frames deep, and one restored 7768 frames
+deep out of a 1.07 GB history, each drawing the right picture. By the evening
+the person could not open their project at all.
+
+The project's history had been written by a session that went on to die of
+guest heap corruption (musl's footer check in `__bin_chunk`). Opening the
+project, TAStudio went to its remembered frame, 8915, restored the nearest state,
+8890, from that history, and the first draw after it killed the process inside
+the NVIDIA driver: generated driver code indexing a table with a garbage count
+that came from the restored guest. Every open, the same frame. It reproduced on
+the same GTX 1060 from an isolated copy of the build and a copy of the cache:
+with `history.bin` the process dies in the same driver function with the same
+register fingerprint; without it the project opens and draws. A clean session's
+history, reopened in a new process, restored and landed without incident. So
+what 35be468 measured is still true, and it could not have seen this: it never
+restored a state from a session that was already going wrong.
+
+That asymmetry decides it. A greenzone that starts empty costs a replay; a
+history that crashes on open costs the project until someone knows which file to
+rename. And the hardware path does not reproduce itself run to run - two
+identical runs to frame 60 differ in about a megabyte of guest heap - so a state
+carried into another process is not the machine that process would have made.
+
+So a machine a GPU drew keeps its states for its own session again, exactly as
+the section above had it. A history already on disk from the day the claim was
+honored is not loaded when the project opens - it opens cold and says why - and
+the next save removes it. Honoring the claim again needs the missing half first:
+a hardware path that reproduces itself, and a way to tell a history from a
+session that ended in a crash.
+
+
+## A greenzone is trusted when the session that wrote it finished (user-decided, 2026-09-16)
+
+The 2026-09-14 withdrawal above is narrowed, not reversed. It refused every
+GPU-drawn greenzone because one bricked a project - but the asymmetry it
+identified was never the renderer. The history that bricked nss102 was written
+by a session that went on to die of guest heap corruption; the same entry
+records that a clean session's history, reopened in a new process, restored and
+landed without incident.
+
+Measured on the real project, 2026-09-16, GTX 1060, the released Ruffle
+54c45bae replaying the project's own 8916-frame input log: a 626 MB greenzone
+written by one process and reloaded by another loaded in 2.4 s, rebuilt the GL
+context, and drew frame 8915 PIXEL FOR PIXEL identical to the straight run - with
+a control at frame 8815 differing by 76,129 bytes, so the comparison could tell
+frames apart. No guest died in any run, and no minibox-diag.log was written. Five
+synthetic fresh-process reloads with 66 rewinds between them behaved the same.
+
+So the gate is the shutdown, not the renderer. `ProjectRecovery` already knows:
+`End(clean: true)` deletes the recovery folder, so "no folder" is a session that
+finished. `LastSessionEndedCleanly` says so explicitly rather than leaving
+callers to read a missing `Leftover` as clean - which it is not, because
+`FindUnfinishedIn` also returns none when another Chimera has the project open
+and when a folder holds no work at all.
+
+What still does not travel is a BRANCH's machine: it rides inside the project
+file, which people hand to each other and open on other PCs, and a state a GPU
+drew is only good where that GPU is. That stays refused for a GPU-drawn machine,
+and is now refused after an unclean shutdown as well.
+
+The cost of being wrong is unchanged and still asymmetric - a greenzone that
+starts empty costs a replay; a history that crashes on open costs the project -
+which is why the gate refuses on doubt rather than on evidence of harm.
+
+## A greenzone lives in memory, and the disk is for saving (user-decided, 2026-09-15)
+
+A greenzone used to spill: once it outgrew its memory budget, the oldest
+stretches were written into the project's cache directory, up to a disk budget
+of ten gigabytes (2026-09-10), and a helper thread did the writing so the run
+never waited on it (2026-09-12). It extended a greenzone past what the machine
+could hold. It also meant that a person working in TAStudio was writing
+gigabytes to their drive, continuously, for as long as they worked - and a
+single session on nss102 left spill files of four and five gigabytes in its
+cache. That is a cost paid by the SSD, in wear, for a convenience nobody sees.
+
+So Chimera keeps a greenzone in memory only. It no longer gives the history a
+directory to spill into, so a history over its budget thins its far band and
+then drops the oldest of it - which costs replaying, never work. The disk is
+written when a project is saved, and that is the moment somebody asked for it.
+The disk budget is gone from the settings and from the per-project budgets, and
+TAStudio's note about a greenzone that could not reach the disk went with it,
+since it can no longer happen.
+
+The engine keeps the capability. Spilling is tested there, `chimera-run --spill`
+and the benchmarks still use it, and it costs Chimera nothing it does not turn on.
+What changed is the frontend's choice, not what the engine can do.
+
+Two cleanups belong to the decision. Spill files an earlier build left behind are
+deleted when their project is next opened: the engine only ever swept them when
+it was given a spill directory, so nothing else would remove them. And a
+`config.ini` or per-project budget file that still names a disk budget loads
+without complaint; the key is ignored and the next save drops it.
+
+Not changed, and deliberately left for a separate decision: crash recovery still
+writes while a project has unsaved work (a snapshot of the project every few
+seconds, and every input change to a journal), because that is the promise that
+entered work survives a crash; and TAStudio's autosave is a project save on a
+timer, and writes the history like any other save.
+
+## A core that stops is a question, not a crash (user-decided, 2026-09-15)
+
+A core's machine dies in ways that are no fault of Chimera: it aborts (a Rust
+panic, a failed allocation, an assertion - issue #43 met one as "unimplemented
+syscall 200"), it halts on finding its own heap corrupt, it follows a wild
+pointer, it exits, it deadlocks, it asks for something the sandbox does not
+provide. Each of those used to take the whole frontend with it.
+
+miniBox now hands control back instead (its "A guest that dies"): the call into
+the guest returns, the machine is marked dead with a one-line reason - the core's
+own last words when it wrote any - and it runs nothing until a state is loaded,
+which revives it. Only a fault in host code, which cannot be trusted, stays fatal.
+
+The engine reports it as an error on the frame (`ce_session_guest_death`, and -1
+from a frame advance, a movie advance or a seek) and records nothing for a frame
+that never happened. The frontend raises `CoreStoppedException`, pauses, keeps the
+work, and asks what to do next. Every answer keeps the inputs, branches and
+markers:
+
+1. Go back to the latest safe point - the newest greenzone frame at or before the
+   one the machine died on, named by number. A state load, so the machine lives
+   again.
+2. Restart the machine and run again from frame 0 - the greenzone cleared back to
+   its first frame and the machine put back on it. Not a reboot: a reboot reloads
+   the project from disk, and would lose what was not saved.
+3. Save the project's inputs without the greenzone, and close. A history from a
+   run whose machine died is not one to trust; the file an earlier save wrote goes
+   too (`TasMovie.SaveWithoutGreenzone`).
+4. Close without saving, after asking. The recovery journal is ended without its
+   clean-up, so the next open finds the work and offers it back.
+
+A headless run has nobody to ask: it prints the reason, keeps the recovery
+journal, and ends the ordinary way with exit code 65
+(`HeadlessMode.EXIT_CODE_CORE_STOPPED`).
+
+The stop reaches the frontend as a STATE (`ICoreStops.CoreStopped`, set by the
+frame advance that did not run), and MainForm raises `CoreStoppedException` from
+its own frame. Thrown from the emulator's frame advance, just back from the
+engine, the same exception crashed Mono in its unwinder in most runs - and did
+so with the previous host and a stop the engine only pretended, so it was never
+the sandbox - while thrown one frame further up it never did.
+
+The synth core dies on cue for the tests (all eight buttons: an abort; all but
+Up: a wild pointer), and the witness checks both, twice: chimera-run stops with
+the reason, and headless Chimera exits 65 with it, without a native crash, with
+the journal left behind.
+
+## A restore is a new context to a GPU core (user-decided, 2026-09-15)
+
+Issue #43 (xemu, FlatOut 2: "crashes at some point, while seeking or autosaving")
+was not a missing syscall and not the greenzone. The reporter's project, on the
+reporter's build and on the current one, died on the same step of a seeded
+TAStudio stress every time, three minutes in: an insert behind the playhead, a
+restore to frame 272, a replay. xemu's renderer asserted
+(`glCheckFramebufferStatus == GL_FRAMEBUFFER_COMPLETE`, surface.c) and aborted.
+
+The restored state said texture 56 was a 512x512 depth buffer. It had been
+something else since: the frames after 272 reallocated it. A whole-machine state
+brings back a renderer's IDEA of its GL objects - the surface cache, which name
+holds what - but not the objects, which live in the driver and stay as the
+future left them. Same session, same names, so nothing was ever dead
+(`CHIMERA_GL_STATEAUDIT`: 0 deleted, 0 reissued) and nothing told the renderer;
+the context id, the one signal a bridged core rebuilds on, only moved per
+session. docs/gpu-bridge.md said "rewind and branches within a session are
+untouched - the objects are still there". The objects were; what they held was
+not. Upstream xemu has the protocol for its own savestates - download the
+surfaces into VRAM before saving, flush the caches after loading - and a
+sandbox snapshot runs neither.
+
+So every state load moves the id (`ce_gl_state_loaded`), and a GPU core treats
+a restore exactly as it treats a reopen: it builds its objects again from
+emulated memory. No core changed; every one of them (dolphin, flycast, pcsx2,
+rpcs3, ruffle, xemu) already rebuilds on a moved id, and the user chose one rule
+for all of them over a per-core flush. `CHIMERA_GL_KEEP_OBJECTS_ON_LOAD` puts
+the old behaviour back for A/B.
+
+Measured on the GTX 1060: the stress that died at step 13 on both builds ran its
+whole 20 minutes with the id moving - 212 steps, no stop.
+
+Making every core rebuild on every rewind exposed a bridge bug the rare reopen
+had hidden. The buffer pool keeps a deleted buffer's name for reuse rather than
+deleting it, assuming the guest will respecify it with `glBufferData`. Dolphin's
+stream buffers are `glBufferStorage` - immutable, persistently mapped - and its
+rebuild deletes them. A recycled name came back still mapped or with its storage
+fixed, the new buffer's storage and map failed, and Dolphin's vertex loader
+wrote to address 0. The rule: recycling a name must behave like a real delete,
+or it is a different operation. A buffer that is mapped or immutable is never
+pooled, and a target the pool cannot identify turns it off. It took a trace
+(`CHIMERA_GL_POOL_TRACE`) to find the last gap - the texel buffer on
+`GL_TEXTURE_BUFFER` - after two fixes reasoned from the code had each missed it.
+
+## A crash only the CI runner has is tracked, not waited on (user-decided, 2026-09-15)
+
+The two witness legs that make the synth core stop on purpose (`S:frontend:abort`,
+`S:frontend:wild`) pass here every time and crash Mono on the GitHub runner every
+time. The runner's log shows the core stopping correctly; the crash is Mono's own,
+while CoreStoppedException is thrown. Symbolized with Ubuntu's `mono-runtime-dbg`
+(fetched with `apt-get download` and unpacked, no install needed), the frames are
+`mono_amd64_throw_exception` -> `mono_handle_exception_internal` ->
+`unwinder_unwind_frame`, at `mini-exceptions.c:662`: `*lmf = (*lmf)->previous_lmf`,
+with the LMF - Mono's chain of managed-to-native transitions - pointing at
+0xdab80. The chain is already corrupt when the exception walks it.
+
+What it is not: the compiler (natives and guest built with the runner's gcc 13.3
+here - the guest came out byte-identical), the CPU count (pinned to four cores),
+Mono's version or the OS (identical), or a one-off (a rerun failed the same way).
+160 local runs, none crashed. The same unwinder crash was met while the feature
+was being written, with a faked stop and the previous miniBox host, which is
+why the throw moved to MainForm's own frame; on the runner that is not enough.
+
+Releases were not held for it. On the runner, and only there (GITHUB_ACTIONS),
+those two legs report KNOWN when Mono crashes, which does not fail the run;
+anything else wrong with them still fails, and everywhere else a native crash
+still fails. On Windows the frontend runs on .NET Framework and is not affected.
+A Linux user whose core dies can still see the crash this feature was meant to
+replace. Finding the cause is owed.
+
+## A branch is its input, and a stack's leftovers are not the machine (2026-09-15)
+
+Issue #80: branches in a reopened project either would not load or replayed to
+their frame. Both messages came from TAStudio.LoadBranch, and they were two
+different problems.
+
+"This branch has no saved state beside the project; it cannot be loaded." A
+branch's input lives in the project; its state and picture are cache beside it,
+and a cache that was lost or set aside leaves the input alone. That is still the
+branch. It now loads the input and replays to the branch's frame, the way a
+refused state already did (ReplayToBranchFrame, which also tells a Lua
+onbranchload watcher). Checked headless on a PPSSPP project with a branch at 60
+and no state: the branch loads, the run reaches 60, the callback fires.
+
+"This branch's saved state was made by a different machine; replaying to its
+frame instead." That is the right answer when the core build changed. It was
+also the answer on Windows when nothing had changed at all. miniBox names a
+machine by a hash of its sealed baseline, and a state from another hash is
+refused. On Windows a stack page written before the seal keeps a snapshot -
+nothing reports a stack's writes there, so they are found by comparing - and
+the hash took that snapshot's bytes. What sits on a stack at seal is whatever
+the boot left below the stack pointer. For PPSSPP that was timer readings,
+different in every process, so every state was refused in the next session.
+
+Proved with `chimera-run` and PPSSPP on Beta Bloc, one package throughout: a
+state saved in one process loaded in a second on Linux and was refused in a
+second on Windows. Dumping both sealed baselines (miniBox `MB_SEAL_DUMP`) found
+341,677 pages, 2 different, both stack snapshots. The hash now takes such a page
+by its tag, as it always has on Linux, so Linux hashes and caches are unchanged.
+After it a Windows state loads in a new process and continues exactly: RAM and
+VRAM after the load match a straight run to the same frame. miniBox's
+`test_stack_leftovers_are_not_identity` fails against the old hash on the
+cross-built Windows run and passes against the new one.
+
+## A recycled buffer name has one owner, and a second delete frees nothing (2026-09-15)
+
+After the #43 change a Ruffle project's picture broke on its first rewind. With
+the rebuild working, a same-session rewind still came back with its background
+missing, and `CHIMERA_GL_CHECK` showed a run of glBufferSubData refused with
+GL_INVALID_VALUE after every rebuild. With `CHIMERA_GL_NO_POOL` the same rewind
+was pixel-exact. The pool was handing one buffer to two owners.
+
+The bridge keeps a guest's deleted buffer names and serves them to later gens
+(bufferPool()). It pooled any delete of a name it had made, and a name already
+in the pool still counted as made - so deleting it again pushed it a second
+time, and two gens were served the same buffer. The second owner's glBufferData
+shrank the first owner's storage, and every upload after that was refused.
+Deleting a deleted name is legal GL, and the driver ignores it. After a restore
+it is ordinary: the restored renderer lets go of handles whose buffers the
+frames after the restored one had already deleted.
+
+A name in the pool is now marked, and a delete of a marked name does nothing,
+as the driver would. The bookkeeping moved into gl_buffer_pool.h, apart from the
+GL calls, and `test_gl_buffer_pool` checks it without a driver: a double delete
+serves the name once, and mapped, immutable, foreign and overflow deletes still
+reach the driver. On the GTX 1060 a Ruffle project rewound three times to frame
+300 and replayed to 600 draws the same 220,400 pixels as a straight run, with no
+GL error, pool on.
+
+The Ruffle core had its own half of this: old handles dropped lazily after the
+rebuild deleted numbers the new backend had been handed. That is fixed in the
+core (its gl-map.cpp keeps the new backend off the old numbers), because only
+the guest knows which generation a name belongs to.
+
+## The greenzone stays close to the playhead, and how close is a setting (user-decided, 2026-09-15)
+
+Reported while editing a Ruffle project: the greenzone near the last input got
+sparser and sparser as the run went on. The near band's stride tuner thins the
+frames behind the playhead when storing every one costs more than 15% of the
+run, and nothing held it back below one frame in 32. A Ruffle frame is dear to
+store, so it climbed there within a couple of thousand frames and stayed - and
+because the frames further back had been captured before it climbed, the history
+was densest where nobody was working and sparsest where somebody was.
+
+The trade is real, and measured on the user's project on a GTX 1060 over 2500
+frames: every frame 71 s, one in 4 41 s, one in 8 32 s, one in 32 22 s, no
+history 12-18 s. A first attempt that kept a sparser band only when the measured
+capture share fell was wrong about the cost - a stored frame also slows the
+emulation itself, which that share never sees - and ran 2.6 times slower; it was
+thrown away before it shipped.
+
+The user chose a cap of one in four, as a setting beside the memory budget: for
+every project, and per project in the project's cache like the budget, because
+how dense a greenzone can afford to be is a fact about the machine the work is
+done on, not about the movie. The tuner still thins when a frame is dear, but a
+rewind right behind the playhead replays at most three frames. The measurements
+and the misleading share are in docs/state-manager.md, "How close the near band
+stays".
+
+## A greenzone keeps everything until its budget is full, then thins to a doubling shape (user-decided, 2026-09-15)
+
+Reported on New Star Soccer: a greenzone given 16 GB used 3 GB, and rewinds of a
+few thousand frames replayed for a long time. The history was thinning by
+distance whatever the budget - one frame in 1200 beyond about 2000 frames back -
+and, once a budget did fill, deleting from the oldest end without regard to
+spacing.
+
+The user's rule replaced both: discard nothing until the budget is full; then
+keep a near band at most 4 frames apart and bands behind it whose spacing
+doubles - 8, 16, 32, 64 ... - as many as the run is long. Two refinements came in
+review. Measured back from the frontier (the newest stored frame), because
+thinning cannot be undone and a band centred on the playhead would thin the work
+somebody scrolled away from. And 32 snapshots a band is a goal, not a quota -
+"heavier cores won't even have the budget for 32 entries in total" - so the band
+holding the most gives a frame up first, the budget is spread round robin across
+the bands, and a band's last snapshot is never removed.
+
+Two things the first cut got wrong, both caught by the unit test before any
+real core ran it. The merge caps (8 MB, and never bigger than the anchor) existed
+for distance coarsening, and applied to budget thinning they left a single long
+stretch stuck over its budget, because a frame in the middle of a stretch can
+only go by composition; thinning now ignores them and bounds its own work per
+call. And a history that spills to disk must keep the stretch being written
+whole, or settling on disk finds merged links it cannot compose.
+
+A third, found the same way: frame 0 and the frontier had been counted as their
+bands' members, so the frontier was always the near band's "last" snapshot and
+the frame before it always went; under a starved budget nothing aged into a
+farther band and the history collapsed to those two frames. They are kept on
+their own account now, and the tail stays exponential however small the budget.
+
+Frame 0, pins and the frontier are never given up; if nothing may go the budget
+is missed rather than a band emptied. The design is docs/state-manager.md, "The
+policy: everything until the budget is full, then a doubling shape";
+greenzone_shape.h and test_greenzone_shape hold the bands.
+
+## A save records the core that ran (user-reported, 2026-09-16)
+
+Opening a project on a different core build already does the right things: it
+warns, and it starts the greenzone empty because the cached states were made by
+another machine. What it did not do was write the new build down. The project
+was saved with the pin it was created with - name, version and package hash of a
+core nobody was running - so the next open warned again, and the one after that.
+
+A save now records the core that ran, when it can be named exactly: the pin is a
+package, so only a loaded package may replace it, and the name, the version and
+the package SHA1 travel together (a name from one build beside a hash from
+another would describe a machine that never existed). A movie with no core
+headers and an emulator that came from no package - a test's fake - still leaves
+the pin alone, which is what keeps a project openable at all.
+
+The Chimera version was already rewritten by every save, with the version that
+created the project kept as `OriginalEmuVersion`; the core now follows the same
+rule.
+
+## A game's compiled code is filed under the game (user-decided, 2026-09-17)
+
+Compiled code used to live in one directory per core and per package version:
+`CompiledCode/<core>/<build>/`, with a per-game manifest inside it. That layout
+bought one real thing - a rebuilt core could not read the objects an older build
+compiled, because they were filed somewhere else - and paid for it with
+directories that never went away. On the machine this was decided on there were
+five of them, 231 MB, one per local core build, and nothing said which was still
+wanted. One of the five had no manifest at all: 39 MB no tool could name and no
+person could find.
+
+A game's code is now filed under the game's own SHA1 and nothing else:
+`Cache/PrecompiledCode/<game sha1>/`. Neither the core's name nor the package
+version is in the path, so a game has ONE directory however often the core is
+rebuilt. What the old layout guaranteed by separation is now guaranteed by
+evidence: the manifest records which core and which package build produced the
+objects, and a manifest that cannot vouch for the build now running is not
+believed - the game compiles again. A rebuild costs minutes; a directory that
+accumulates forever costs them every time, and silently.
+
+Games share no objects. Each keeps its own copy of everything it needs,
+firmware libraries included, even where two games would compile the same
+library. Measured before deciding: the shared firmware set was 12 MB against a
+game's own 47 MB. So the duplication is about a quarter again of a game's size,
+and what it buys is that a row in a window is one directory - removable whole,
+with nothing else depending on what is inside it, and no question of whether
+some other game still needs a file before it can go.
+
+That is what makes the removal safe to offer per game. `Tools > Pre-Compiled
+Modules...` (it was under Config for its first day; the user moved it beside the
+other managers, below Reproducible Media Maker, 2026-09-17) lists what is there - the game, the core that compiled it, when,
+how many modules, what it weighs - and takes one away at a time. It replaced
+"Clear Compiled Code", which could only empty everything for a whole core, and
+it is the only place the store is emptied; filling it is still the wizard's,
+where a project is not created until its game is compiled. Compiled code left
+the Cache Manager with it: two views of one store, at two granularities, meant
+the coarser one described a layout that no longer exists.
+
+A directory nothing can name is still listed. A compile that stopped half way
+leaves objects and no manifest, and that is precisely the case worth showing:
+unnameable leftovers are the ones nobody would otherwise find. What the previous
+layout left is offered the same way, as one row that says what it is, so the
+231 MB is something a person can see and reclaim rather than bytes that simply
+stay.
+
+## The game is hashed when it is picked, not when it is needed (user-decided, 2026-09-17)
+
+The wizard's compile step looks a game up by its hash to say what is already
+compiled, and looking it up is the first thing it does. It used to hash the game
+right there, on the UI thread, while building the page: a silent freeze with no
+progress and no cancel, at the moment somebody arrived at the step. A disc image
+is gigabytes - the game this was found on is 5.1 GB, and one in the same folder
+is 19 GB.
+
+Worse, it was the second hashing of the same bytes. Create hashes every file the
+project takes, through the engine, behind a progress dialog that says which file
+it is on; the compile step had its own private `SHA1.Create()` and its own idea
+of what a file's identity was.
+
+The game is now hashed when it is PICKED, through the engine's hasher, with the
+wait shown where a wait is expected - somebody has just chosen a file. The
+engine answers repeat calls from a cache keyed by path, size and mtime, so
+Create's hashing of the same file costs a lookup, and there is one notion of a
+file's identity rather than two. It is an optimisation and never a duty: a pick
+that fails to hash is a pick the compile step hashes itself, exactly as before.
+
+## A restore is a new context, unless the core says it is not (user-decided, 2026-09-17)
+
+Every state load moves the bridge's context id, so every bridged renderer builds
+its GL objects again (issue #43, 2026-09-15). That was made universal on
+purpose: a restore puts back a renderer's IDEA of its objects but not the
+objects, which stayed as the frames after the restored one left them. xemu
+attached a texture the driver had since given to something else and asserted;
+FlatOut 2 died at step 13 on every build without this, and ran 212 steps with
+it.
+
+For RPCS3 the same rebuild is the damage rather than the repair. Measured on the
+GTX 1060 with Prince of Persia (BLUS30214): one rewind with the rebuild leaves
+the picture 100% near-black, ONE colour, while the machine rewinds and plays on
+correctly; the same rewind with the rebuild skipped reproduces a straight run
+BYTE FOR BYTE. Drawing 1, 5, 30 or 100 frames before the capture changes
+nothing, so this is not the warm-up problem PCSX2 had. Three rewinds and the RSX
+thread aborts inside the texture cache the rebuild emptied, taking all 26
+threads with it.
+
+So the frontend was asking one question where there are two. A cross-session
+REOPEN really is a new context: the names in the state belong to a dead one, and
+every core must rebuild. A same-session LOAD is not: the context is alive and the
+objects are valid, and whether rebuilding is right depends on where the core
+keeps its picture. xemu keeps a cache that goes stale; RPCS3 keeps the picture in
+the render targets and texture cache a rebuild discards.
+
+A core answers for itself: `video.rebuildOnStateLoad`, and ABSENT MEANS TRUE, so
+a package that never mentions it behaves exactly as before - only RPCS3, which
+declares false, is changed. A reopen still mints a new id at `ce_gl_start`, so
+the rebuild patch 0021 exists for still happens where it is needed.
+
+It is parsed and applied in the ENGINE, beside `video.drawEveryFrame`, for that
+declaration's own reason: it is a property of the core, and every host that opens
+the package - the frontend, chimera-run, a gate - needs it to hold without being
+told separately. A first attempt routed it through the frontend and was wrong
+twice over: chimera-run would not have honoured it, and two authorities writing
+one global race.
+
+What was NOT settled: why the flip produces black. The window is cleared to
+opaque black exactly when `image_to_flip` is null, and the CPU-upload fallback
+that should prevent that fires during normal forward play while the picture is
+correct. Five source-level explanations were checked and all were wrong; the
+bisection that would have answered it could not be completed. The declaration
+fixes the symptom and the crash; the mechanism is still open.
+
+RESOLVED the same day. The cause was found by bisecting RPCS3's teardown with a
+runtime-selectable skip per step: `gl::driver_state` caches what is bound so a
+redundant call can be skipped, and the rebuild never reset it. Teardown frees
+the stream buffers' texture views, the driver hands the just-freed names
+straight back, and `bind_texture` finds the name "already bound" and skips the
+bind - while deleting the old texture had unbound it, so every vertex fetch read
+nothing. A full rebuild minus ONLY the stream-buffer reset drew a picture (the
+new names differed, so the cache missed). Fixed in the core (rpcs3 patch 0024,
+`driver_state::reset()` between teardown and setup), with patch 0025 for the
+texture cache's `clear()` sentinel that caused the abort. RPCS3 therefore no
+longer declares `video.rebuildOnStateLoad` and rebuilds on a load like every
+other core; the declaration stays in the engine, default true, for a core that
+genuinely needs it. Verified: rebuild active, five rewinds, 12.34% near-black
+and 44,375 colours against a straight-run control of 12.34% / 44,384.
+
+## RAM Search has no size it refuses (user-decided, 2026-09-17)
+
+Issue #89: DOSBox-X's 1997 machine exposes 95 MiB of extended memory and 96 MiB
+of physical RAM, and RAM Search greyed both out - in fast mode as well as
+detailed - behind a 64 MiB constant whose own comment said it would crash
+beyond that. The user's ruling was general: "There should be no limits for RAM
+search".
+
+The limit was not arbitrary, it was the cost of the design. The inherited
+search held one heap object per candidate address, in an array of references,
+and copied that array whole for every search and every undo level. A hundred
+million objects is gigabytes before the first comparison, and nothing about it
+could be tuned: the shape was the problem. So the search moved into the engine
+(`ram_search.cpp`, `ce_ramsearch_*`), which is also where a
+thing that decides rather than shows belongs, and the C# `RamSearchEngine` is now the settings the
+tool edits and a translation of its enums.
+
+The candidate set has two shapes and the switch between them is nobody's
+business but its own. While most of the domain is still a candidate it is
+DENSE: a bit per slot, and "previous" is a byte image of the domain - so a first
+search costs the domain again plus an eighth, however many candidates there are.
+Once a search has cut it to a thirty-second of the slots it turns SPARSE:
+parallel arrays, a few bytes per survivor, the only shape that can hold an order
+other than by address or an address that was added from a file. Rows of a dense
+set are found by a running count per 4096 slots, so the list view can ask for
+row ninety million as cheaply as row nine.
+
+Memory comes through the domain's pointer when it has one - every waterbox
+domain has - and through a read function in 1 MiB pieces when it has not (a bus
+resolved by the guest's mapper, a test's byte array). The search is independent
+of any session, which is what lets `test_ram_search.cpp` hold it to an oracle
+with no machine: a model that keeps one record per address, exactly as the
+frontend used to, runs a random script of searches, polls, removals, sorts,
+conversions and undos beside it, and every row must agree after every step,
+through both shapes and both ways of reading. Four deliberate breakages of the
+implementation were each caught.
+
+Measured, 256 MiB searched by bytes (four times the old refusal): 0.2 s to
+start, 0.6 s for the first search, 864 MB peak including the domain itself and
+one undo level. The only limit left is the host's memory, and running out is
+reported in the tool's message line with the search left as it was.
+
+Sharp edges, and what changed on the way:
+
+- "Last change" moves one candidate's previous at a time, which a byte image
+  cannot hold when candidates overlap (misaligned, wider than a byte). That one
+  combination is always sparse, and costs what sparse costs.
+- Undo is a real undo now: the state BEFORE a search or a removal is kept, five
+  deep, so the first search can be taken back (it could not before). A dense
+  level costs the image again; if there is no memory for a level the history is
+  dropped rather than the search refused.
+- Sorting by value, previous or difference sorts by what is SHOWN (signed and
+  float order), where it used to sort the raw bits; and a "difference" search in
+  signed display accepts a negative difference, which the raw comparison could
+  never match.
+- Domains of 1 MiB and more still START in fast mode, because detailed polls
+  every candidate every frame. That is a default; the user can switch back.
+- The list view counts rows in an int and "select all" walks them: a search of
+  more than 2^31 candidates lists its first 2^31, and selecting all of a
+  hundred million rows is as slow as it always was. Both are the control's, not
+  the search's.
+
+## A version is listed with its date, newest first (user-decided, 2026-09-17)
+
+Issue #67: with several builds of one core installed, the New Project picker
+listed commits, and a commit does not say which of two is newer. The user's
+ruling: the date is shown whenever a core version is listed, and versions are
+offered latest first with the latest as the default.
+
+Where the date comes from was the only real question, because a package has
+none: it is a byte-reproducible zip and every time inside it is 1980. Three
+sources were on the table - the feed the core manager already fetches, a note
+written at install time, or the package itself - and the user chose the
+package. It is the only one that is true offline, for a core copied in by hand,
+and for a local build; the other two know only what was downloaded through the
+core manager after the change. So every core's `build-package.sh` stamps
+`versionDate` beside `version`: the commit's date in UTC, not the build's, so
+the same commit still makes the same package.
+
+Packages already published have no stamp, so the frontend falls back to the
+core manager's feed cache, matched by commit and read from disk only. Nothing
+is fetched to paint a list. A version with no date from either is listed by its
+commit alone; the file's modification time was rejected as a fallback because
+it answers "when was this copied here", and showing it would look like an
+answer to the question that was asked.
+
+Ordering is one function (`CoreVersionDates.NewestFirst`): cores stay where they
+were, the versions of one core go newest first, undated ones after the dated.
+The wizard sorts its package list with it once, which is what makes "latest is
+the default" true everywhere at no further cost - the picker opens on the first
+line, and guessing a core from a dropped file and seeding from a previous
+project both take the first package that matches. The core manager's version
+selector had the same defect in another shape: a build that was installed but
+not published came after every published one however new it was. It is one
+list by date now.
+
+Found on the way: the UI test gate took its verdict from the pipeline that
+filters the runner's output, which is the grep's status - "there was output".
+A run with five failing tests printed `failed: 5`, exited 0 and never named
+them. It now reads the runner's status and the failed count, and prints the
+tail on failure; a planted failing test turns it red and removing it turns it
+green. What the five were is not known: they appeared in one run straight after
+a partial rebuild and in none of the six runs since.
+
+## The data directory can be moved, and the next start is what moves it (user-decided, 2026-09-17)
+
+Issue #52: everything Chimera keeps per user is under `%LOCALAPPDATA%\Chimera`,
+which is the system drive, and a greenzone or a PS3 game's compiled code is
+gigabytes. The only way to put it elsewhere was `CHIMERA_DATA_HOME`, which
+nobody who needs this will find.
+
+Two things were the user's to decide. WHAT moves: the regenerable caches alone
+(keeping recovery journals and crash notes on the system drive, where a missing
+external disk cannot take unsaved work with it), the caches and the core store,
+or everything - and the answer was everything, the same thing the variable has
+always done. And what becomes of the data already there: the user is asked, and
+may move it or start empty and leave it.
+
+So there is one setting, `DataDirectory`, and one resolver. `CoreStore` used to
+work the same location out for itself and remember it; it asks
+`ProjectCache.DataHome` now, every time, because a second resolver is a second
+place to teach and a remembered answer is one that goes on pointing at the old
+directory. The environment variable still wins: a portable install or a test
+that sets it means it, and the window says so rather than offering a choice it
+would not honour.
+
+The window does not move anything. A running session holds a state history and
+a recovery journal open, the package list holds paths into the core store, and
+Windows holds the crash folder's path; moving the directory under that is moving
+files in use, and every one of those holders would need its own way of letting
+go and picking up again. Instead the change is RECORDED (`DataDirectoryPending`)
+and carried out by the next start, after the config is read and before anything
+else exists. None of those problems has to be solved, because at that moment
+none of them has happened yet. Crash capture is the one thing armed earlier - a
+crash while reading the config should leave a note too - so it is armed at the
+default place and repointed once the directory is known; the helper reads the
+folder out of the process's memory at the moment of the crash, so repointing is
+rewriting it.
+
+A move is a rename where that works and otherwise a copy that is checked before
+any original is deleted. Until the last entry is in the new place the old place
+is whole; a failure or a full disk puts back what was renamed, removes what was
+copied, and leaves the setting alone. The pending change is cleared and the
+config saved BEFORE the user is told anything, so a session that dies cannot
+find the change still waiting and try to move a directory that has gone.
+
+Three refusals, each because the alternative loses data. A folder that already
+has other things in it is not taken over: the data gets a `Chimera` directory
+inside it, so "everything in the data directory is Chimera's" stays true and a
+later move can take all of it. A folder that already holds Chimera data is
+adopted as it is and never merged into. And a directory is not moved into or out
+of itself.
+
+A data directory that cannot be reached at startup - the drive is not plugged in
+today - is a warning and a session on the default location, with the setting
+KEPT. Forgetting it would orphan the data on the drive and start a second set
+growing on the system drive, which is the problem the setting was for.
+
+Proved without a window (`DataDirectoryTests`: a second volume is stood in for
+by a rename that refuses, a failure half way by one that refuses the second
+time) and through the real frontend, headless: a config with a pending move
+starts, the directory is moved, the setting follows and the pending flag is gone;
+a config pointing at a path that cannot exist warns, runs on the default and
+keeps its setting.
+
+## The status bar says which disc is in the drive (user-decided, 2026-09-17)
+
+A machine with four floppies or two discs swaps between them through its own
+inputs, and nothing on screen said which was selected or whether it had gone
+in. The user asked for both, "for all cores where swapping is an option".
+
+They are two facts, not one, and that is the reason the feature is worth more
+than a counter. DOSBox-X's changer is a selector that Previous/Next move and a
+Swap input that puts the selected image in: after a Next the machine is still
+reading the OLD disc, and a person who cannot see the selector cannot tell one
+that moved from one that did not (issue #47 was exactly that, found by reading a
+log line). A Sega CD's tray can also simply be empty. So the guest reports, per
+drive, its list of images, where the selector stands, and which image is in -
+or -1 for none. When the two agree the bar says it once, `2/4 ..(Disk B).fdi`;
+when they do not, `1/2 Disc 1 | selected 2/2 Disc 2`; an open tray reads
+`empty | selected ...`.
+
+It rides the existing drive-light group rather than being a new tool: the drives
+are already enumerated there, per medium the PROJECT put in, and the label that
+held a light now holds a light and a name. The names are copied out once at
+load; the two indices are asked of the running machine as the bar is painted,
+because they are whole-machine state and a rewind takes them back. The engine
+holds what the guest says to the list it declared, so an index can never name
+an image the frontend does not have.
+
+Long names are cut in the MIDDLE. The disks of one game share a long beginning
+and differ at the end - "... (Disk 1 of 4)(Disk A).fdi" - so cutting the tail
+would leave four labels that read the same; the tooltip has the whole name.
+
+Which cores: DOSBox-X (floppy and CD, selector plus swap) and Genesis Plus GX
+(Sega CD, one-step swap, tray can be empty). Opera declares Previous/Next Disc
+on the wire but upstream has no swap entry point yet, so it has nothing to show
+and shows nothing. DOSBox-X had no floppy drive in the list at all, and its
+"Hard Disk" light came on for floppies too - one flag for every FAT image. The
+FAT driver now tells a floppy from a hard disk, so the floppy drive has a light
+of its own and the hard disk's means the hard disk. Neither lights while a
+guest OS booted from the image does its own disk I/O through the BIOS; that was
+already true of the hard disk and is left as it is.
+
+Proved in the sandbox harness with the gate's two discs: untouched reads
+selected 1 / inserted 1; a Next alone reads selected 2 / inserted 1; Next with
+Swap reads 2 / 2; and the Next-alone answer is the same with a save and load
+around every frame. Not yet seen in the real status bar on a running project.
+
+## The game is hashed when the file form is left, and the files can be ordered (user, 2026-09-17)
+
+Two corrections to the New Project wizard's file form, both from using it.
+
+"The game is hashed when it is picked" (above, same day) was the wrong moment.
+It read a multi-gigabyte disc the instant it was dropped, before the person had
+finished choosing; and which file IS the game is "the first of its slot", which
+adding, removing and reordering all change, so a hash taken at pick time could
+be of a file that was no longer the game by the time it was used. The purpose
+stands - the compile step must open on an answer, not on a stall - and it is
+served by hashing at Next: the list is settled, and the file is read once.
+
+And the order of a slot's files could not be changed. It is not a convenience:
+the first file is what is in the drive at boot and the rest follow in swap
+order, and a PC-98 game can want its second disk booted. The order was whatever
+order the files happened to be added in, and the only remedy was to remove
+everything and start again. A slot that takes more than one file now has Up and
+Down beside its list; they follow the selection, the moved file stays selected
+so a button can be pressed again, and a slot that takes one file has neither.
+
+## A branch's state is a file the engine writes (user-decided, 2026-09-17)
+
+Issue #84, and then the user's own machine: creating a TAStudio branch in a PS3
+project threw `OverflowException`. A branch kept a whole copy of the machine in
+a byte array, and an array cannot be more than 2 GiB. Oblivion copies gigabytes
+of disc data onto the console's hard disk, the disk is part of the machine, and
+its state is 4.31 GiB AFTER zstd. The greenzone never had the problem: the
+engine holds its states natively.
+
+Three answers were offered - degrade an oversized branch to "input only, replay
+on load" (the path a GPU project's branch already takes after a reopen), that
+now and the proper fix later, or the proper fix - and the user chose the proper
+fix: the engine holds branch states.
+
+"Holds" became "writes to a file", for three reasons found on the way. The
+sandbox saves and loads a state through a write and a read callback, so the
+engine can stream the machine through zstd straight into a file and back, and
+the state never exists whole anywhere - not in the frontend, and not in the
+engine either, where five 4 GiB branches would otherwise sit in RAM. A file is
+also already persistent: there is no second step at project save in which
+gigabytes are copied into the cache zip (whose lumps had the same 2 GiB problem
+waiting). And the thing the frontend holds shrinks to a NAME, which is what thin
+C# wants it to be.
+
+So: `ce_session_state_save_file` / `_load_file` in the engine, with a small
+caller-owned tag riding along (the frontend's frame and lag counters, which are
+not the machine's). The file is written beside its name and moved into place, so
+a failed save leaves what was there. `TasBranch.CoreData` is gone;
+`TasBranch.StateFile` names a file in `Projects/<id>/Branches/`. WHICH file is
+which branch's is recorded in the cache zip where the state itself used to be,
+under the same rules as before - not for a GPU-drawn machine, not after a
+session that did not end cleanly, not when the cache is another machine's - so
+every reason a branch could lose its state and replay instead still applies,
+unchanged. A cache written before this still holds the old state lumps; they are
+not read, and those branches replay to their frame once.
+
+Files that no branch names are removed: when a project is loaded (a branch that
+was never saved, a cache that was set aside) and as branches are made, updated
+and removed, sparing the one TAStudio's undo may bring back. "Undo Branch Load"
+used to clone the whole machine on EVERY branch load; when the last state written
+was over 512 MB that backup now keeps its input alone and the undo replays to it,
+because a second multi-gigabyte write per load, for an undo rarely used, is the
+wrong trade.
+
+`TasBranchCollection.Save/Load`, a second copy of the branch format nothing
+called, was deleted rather than converted.
+
+Proved: the synthetic gate saves to a file and loads straight back mid-movie in
+all four movies and ends byte-identical to the goldens, and refuses a garbage
+file and a truncated one without taking the process down (57/57). On the GTX
+1060 with Oblivion: a state saved at frame 2400 is 4.31 GiB; saved and loaded
+back at frame 2000, the console's 256 MiB of main memory 200 frames later is
+identical to a run that never did it. Cost, measured roughly: about half a
+minute per save or load of that size. Not yet done: clicking the button in
+TAStudio on Windows.
+
+## The disk floor never costs the whole cache, and it is on screen (user-decided, 2026-09-17)
+
+Issue #88 was titled "Cache value not saved, all cache deleted on every boot",
+and neither half was what it looked like. The value was saved. It was being
+overridden by a second rule the window never showed - leave the disk 20 GB
+free - and on the reporter's machine, 14 GB free of 237, that rule worked out a
+limit of ZERO: the shortfall was 6 GB, the whole cache was 94 MB, and "the cache
+gives back what the floor is short by" clamps at nothing. So every start emptied
+it, greenzones and unpacked cores alike (they had locked the cores to save them),
+and the window explained itself with "held to  rather than to the number beside
+it" - a blank, because the size formatter shows nothing for zero.
+
+The floor is right in its own case: it stops Chimera filling a disk. It was
+wrong here because it did not ask whether the cache was the problem. Four
+changes, all the user's: the floor never takes the cache below a gigabyte (or
+the user's own limit, where smaller); it is a box of its own beside the limit,
+saved like it, with zero for off; the message names the rule and the figures and
+never prints a blank; and it points at Config > Data Directory (issue #52), which
+is what a person with a full system drive actually needs.
+
+A discontinuous alternative was considered and dropped: "a cache that could not
+reach the floor even if emptied is left alone". It would leave a 5.9 GB cache
+untouched and cut a 6.1 GB one to a gigabyte. The guaranteed minimum alone is
+continuous and says the same thing where it matters.
+
+The size formatter still shows nothing for zero - that is deliberate for list
+cells and a test pins it - so the blank was fixed in the sentence that had it.
+The tests that pinned the floor were written in bytes, where a one-gigabyte
+guarantee swallows every case; they are at the sizes the rule is about now.
+
+## What a PS3 state weighs, and why compressing it is not the answer (measured, 2026-09-17)
+
+The user expected compression to help a great deal with PS3 states, and asked
+for it to be built and measured, with a progress window for the wait. It was
+already built - a branch's state file goes through zstd level 1 - so what was
+missing was the measurement. Oblivion at frame 2400, GTX 1060 machine, NVMe,
+one save and one load of the same state:
+
+| how | file | save | load |
+|---|---|---|---|
+| raw (`CHIMERA_STATE_RAW=1`) | 5.45 GiB | 11.6 s | 3.9 s |
+| zstd level 1 (the default) | 4.31 GiB, 1.27x | 11.1 s | 2.7 s |
+| zstd level 3 | 4.25 GiB, 1.28x | 18.3 s | 2.7 s |
+
+Level 1 is free - the save is no slower than raw and the load is faster, there
+being less to read - and it barely helps; level 3 buys nothing for seven
+seconds. Every other machine measured compresses 8 to 118 times. This one does
+not because of WHAT it is: the game's caching thread copies 41 files, 4.30 GiB,
+from the disc to the console's hard disk (its texture, voice and mesh archives),
+and that disk is the machine's memory filesystem. Four fifths of the state is a
+second copy of files that are in the ISO, already compressed by their authors.
+
+So the lever for PS3 is not a better compressor. It is not carrying the disc
+twice: a hard-disk file whose bytes are the disc's could be held as a reference
+to the disc file the project already has, and would then cost a state nothing -
+which would shrink a branch, its save and load, AND every greenzone anchor by
+the same four gigabytes. That is a change to the core's memory filesystem and is
+not done here; it is recorded because the measurement is what found it.
+
+Done the next day, in the core (rpcs3 76b992c, "not carrying the disc twice"):
+a file the game writes whose bytes are provably a stretch of a disc file is
+held as a reference to that stretch. The same state, raw, went from 5.85 GB to
+1.23 GB, its save from 12.7 s to 1.7 s and its load from 4.1 s to 1.0 s, with
+the machine byte-identical to the control through the whole movie and across
+state-file round trips. Compression of PS3 states is now a question about the
+remaining 1.2 GB, which is the machine proper (its 256 MB main memory, the
+SPUs, the RSX's local memory and the emulator's own tables).
+
+What was built: the engine reports progress through a save (against what the
+last state of the machine weighed - the end of a save is not known until it is
+reached) and a load (against the file's length), `ce_session_state_file_bytes`
+says what the last one weighed raw and stored, and the two environment switches
+above exist for measuring. The progress window now has a delay: TAStudio's
+branch save and load open one only if the work has lasted 400 ms, so the same
+button that takes milliseconds on an NES never flashes a window, and the half
+minute it takes on a PS3 no longer looks like a hang.
+
+## The greenzone is packed in memory, one stretch behind the machine (user-asked, 2026-09-18)
+
+With the disc out of the state, the user asked for compression in memory too.
+A stretch of the history that has closed - the next anchor has been taken - is
+only ever read or shortened again, so its bodies are held as zstd frames; the
+newest stretch, the one being written to, stays raw. The packing is a helper's,
+and its result is taken at one moment only, when the next stretch closes, so
+the budget's arithmetic is identical threaded and in line - the property the
+history's differential fuzz pins and the reason "phase 2" was never built. On
+Oblivion (PS3, 8 GB budget) a stretch went from 2.45 GB to 0.26-0.44 GB, the
+frames held from 312 to 817, and a rewind to frame 1200 that used to land on
+frame 434 and replay 766 frames lands on 1198 and decodes for a second. The
+whole account, with the measurements, is in docs/state-manager.md, "A closed
+stretch is packed in memory". Done the same day, at the user's word: a history
+file that carries the bodies as they are held (`ChimeraHistory5`), so a save of
+packed stretches is a copy and a load takes them as they are: the same PS3
+history, 2.57 GB, saved in 4.7 s instead of 18.5 and loaded in 1.0 s instead
+of 23.1.
+
+## A script's input reaches the frames TAStudio invents (issue #95, 2026-09-19)
+
+Reported against a PS2 project: a Lua script opened TAStudio, asked for
+recording mode and pressed a button every frame for a hundred frames, and the
+movie log held the press on none of them - nor did the machine's own pad
+readout. Reproduced on Linux with the synth core in seconds, and the press
+turned out not to be lost where the report pointed.
+
+With TAStudio actually recording, `joypad.set` reaches the log and the core on
+every frame: it lands on `ActiveController` through the override adapter, which
+is where a physical press lands too, and record mode writes whatever is there.
+What loses it is the state the script was really in. TAStudio owns playback, so
+a script drives it with `tastudio.setplayback(target)` - and a seek turns
+recording OFF for its duration (`GoToFrame`), so that the rows it passes over
+are replayed rather than typed over. That rule is right, and it is kept.
+
+Past the END of the log there are no rows to protect. A seek out there cannot
+replay anything: every frame has to be AUTHORED as it is reached, which
+TAStudio does itself in `UpdateBefore` - and it was writing them from
+`MovieSession.StickySource`, the autohold/autofire controller alone. So the
+extension threw away everything actually being pressed, by a hand on the pad as
+much as by a script, and because `MovieSession` then reads that same row back
+to feed the core, the machine saw nothing pressed either. Both halves of the
+report, one cause.
+
+The extension now takes its input from `MovieSession.MovieIn` - the same
+controller record mode would have written - whenever `WasRecording` says the
+person asked to record and a seek is what took it away. Read-only play past the
+end is untouched: with nobody recording, the autoholds remain the only way to
+hold a button out there, which is what that mode has always meant. Witnessed by
+three runs of a new Level-B leg (`T:box:luaInput`, `T:box:luaQuiet`): a held
+button must reach every extended row, the controller the core is handed, and
+the machine's RAM; an unpressed run must leave those rows empty; and a
+read-only run must leave them empty however hard a script presses.
+
+Two traps worth writing down for the next unattended TAStudio script. The piano
+roll pauses again on its own the moment a seek ends, so `client.unpause()`
+belongs INSIDE the loop, with `emu.yield()` and not `emu.frameadvance()` - a
+script parked in frameadvance is never resumed to notice it was paused, and
+what looks like a hang is the run loop spinning beside it. And the order of the
+two calls matters: `setrecording` before `setplayback` is the shape that used
+to lose the input, because the seek is what suspends recording.
+
+Found in the same round: every tastudio Lua method that asked for the tool
+without calling `Engaged()` first handed the script a raw
+NullReferenceException, because `Tools.TAStudio` is a get-or-CREATE - the call
+built a window and died inside it on the project that was not there.
+`getrecording`, `setrecording`, `togglerecording`, `setbranchtext` and
+`get_branch_index_by_id` now answer the way the rest of the library already
+did: false, nil, or nothing done.
+
+## A gate that has never failed has not been tested (2026-09-20)
+
+Seven distinct instances of a gate passing while the thing it vouched for was
+broken were found in one day, across three repositories. Written up as
+[gates.md](gates.md), because seven in a day is a class of mistake and not
+seven accidents.
+
+The worst of them, by how long it lasted and how much it covered: the PCSX2
+core ran EVERY PlayStation 2 game with an empty per-title database - no clamp
+modes, no round modes, no game fixes, none of the corrections upstream keeps
+for hundreds of titles - and the gate was green throughout, because no leg ever
+asked whether the database had anything in it. The user-visible symptom was two
+separate bug reports about Final Fantasy X.
+
+The cheapest of them to have prevented: miniBox's thunk pool ran out at 32 and
+answered 0 for the rest, which `mb_host_proc_addr` reports exactly the way it
+reports a symbol that is not in the ELF. Seventeen of quickerNES's exports read
+as "this core does not have that feature" while sitting in the binary. One line
+on stderr when the pool runs out would have made it obvious on the first run.
+
+The rule the seven come down to, and the one worth keeping when the detail has
+faded: **a leg that has never been seen to fail is a leg that has not been
+tested.** Break the thing, watch the leg go red, revert, and say in the commit
+that you did. It costs minutes and it converts a belief into a fact.
+
+The corollary, learned the same week at the cost of a shipped regression:
+"fixed by construction" is not fixed. A paletted-texture fix went in on 2026-09-19
+with its own commit body saying no disc on hand used the format, so the fix
+"waits for a game of sprites to prove it". A game of sprites arrived the next
+day and the fix was itself the bug.

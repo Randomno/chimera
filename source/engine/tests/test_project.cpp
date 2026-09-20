@@ -12,6 +12,7 @@
 
 #include <cassert>
 #include <cstdio>
+#include <filesystem>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -55,7 +56,13 @@ static const char *SLOTS_DECL =
 
 int main(int argc, char **argv)
 {
-	g_dir = argc > 1 ? argv[1] : ".";
+	/* A directory of its own. These tests scribble files with ordinary
+	 * names - save.hdd, disc2.iso - and two of them scribble the SAME
+	 * names, so sharing the build directory made them race: one removed
+	 * save.hdd to prove a missing file is reported missing while the
+	 * other was writing it back. */
+	g_dir = argc > 1 ? argv[1] : "work-project";
+	std::filesystem::create_directories(g_dir);
 	const char *err = nullptr;
 	const std::string path = g_dir + "/work.chimeraProject";
 
@@ -356,6 +363,37 @@ int main(int argc, char **argv)
 		{
 			std::printf("project: skipped the 5GB entry (no sparse file here)\n");
 		}
+	}
+
+	// ---- TAStudio's layout (issue #83): kept verbatim, only an object, absent unless written ----
+	{
+		const std::string lpath = g_dir + "/layout.chimeraProject";
+		ce_project *p = ce_project_new();
+		ce_project_set_title(p, "layout");
+		uint64_t len = 7;
+		assert(std::string(ce_project_tastudio_text(p, &len)).empty() && len == 0);
+		assert(ce_project_set_tastudio_text(p, "[1,2]", &err) != 0 && err != nullptr);
+		assert(ce_project_set_tastudio_text(p, "{\"Columns\":[[{\"Name\":\"A\",\"Width\":23}]]}", &err) == 0);
+		assert(ce_project_save(p, lpath.c_str(), &err) == 0);
+		ce_project_free(p);
+
+		p = ce_project_open(lpath.c_str(), &err);
+		assert(p != nullptr);
+		assert(std::string(ce_project_tastudio_text(p, &len)).find("\"Width\":23") != std::string::npos);
+		assert(ce_project_set_tastudio_text(p, "", &err) == 0);
+		assert(ce_project_save(p, lpath.c_str(), &err) == 0);
+		ce_project_free(p);
+
+		std::string text;
+		if (FILE *f = std::fopen(lpath.c_str(), "rb"))
+		{
+			char buf[4096];
+			size_t n;
+			while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, n);
+			std::fclose(f);
+		}
+		assert(!text.empty() && text.find("\"tastudio\"") == std::string::npos);
+		std::remove(lpath.c_str());
 	}
 
 	std::printf("project: all assertions passed\n");

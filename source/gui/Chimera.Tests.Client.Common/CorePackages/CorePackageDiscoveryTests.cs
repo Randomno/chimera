@@ -5,6 +5,7 @@ using System.IO.Compression;
 using System.Linq;
 
 using Chimera.Client.Common;
+using Chimera.Emulation.Common.Waterbox;
 
 namespace Chimera.Tests.Client.Common.CorePackages
 {
@@ -17,7 +18,7 @@ namespace Chimera.Tests.Client.Common.CorePackages
 	[TestClass]
 	public class CorePackageDiscoveryTests
 	{
-		private string _root;
+		private string _root = "";
 
 		[TestInitialize]
 		public void SetUp()
@@ -78,7 +79,9 @@ namespace Chimera.Tests.Client.Common.CorePackages
 			Assert.AreEqual("NES", found[0].Extensions[".nes"]);
 			Assert.IsFalse(found[0].IsDirectoryForm);
 			Assert.IsNull(found[0].Error);
-			Assert.AreEqual(40, found[0].Sha1.Length, "a zip package's identity is the SHA1 of the file");
+			var sha1 = found[0].Sha1;
+			Assert.IsNotNull(sha1, "a zip package has an identity");
+			Assert.AreEqual(40, sha1.Length, "a zip package's identity is the SHA1 of the file");
 		}
 
 		[TestMethod]
@@ -129,7 +132,7 @@ namespace Chimera.Tests.Client.Common.CorePackages
 			Assert.AreEqual(2, found.Count);
 			Assert.IsTrue(found.All(static p => p.Error is not null), "both are unreadable and must say so");
 			Assert.IsTrue(found.All(static p => !p.IsLoadable));
-			Assert.IsTrue(found.Any(static p => p.Error.Contains("99")), "the version mismatch must name the version it saw");
+			Assert.IsTrue(found.Any(static p => p.Error?.Contains("99") is true), "the version mismatch must name the version it saw");
 		}
 
 		[TestMethod]
@@ -182,13 +185,75 @@ namespace Chimera.Tests.Client.Common.CorePackages
 		}
 
 		[TestMethod]
+		public void APackageThatDeclaresNoAbiIsTheFirstOne()
+		{
+			// every core published before the field existed says nothing, and all of
+			// them are ABI 1 by definition
+			_ = MakeWaterboxZip("old.chimeraCore", "Published Before The Field");
+			var found = CorePackageDiscovery.Scan([ _root ]);
+			Assert.AreEqual(1, found[0].Abi);
+			Assert.IsFalse(found[0].IsAbiIncompatible);
+			Assert.IsNull(found[0].Error);
+		}
+
+		[TestMethod]
+		public void APackageFromANewerAbiIsListedAndRefused()
+		{
+			// the point of listing it: somebody who just downloaded this must be told
+			// which of the two things they are holding is too old, not left looking at
+			// a Cores folder the frontend pretends is empty
+			_ = MakeZip(
+				"future.chimeraCore",
+				("core.wbx", "stub"),
+				("waterbox.config", $@"{{ ""coreName"": ""FromTheFuture"", ""systemId"": ""NES"", ""abi"": {GuestAbi.Current + 1} }}"));
+			var found = CorePackageDiscovery.Scan([ _root ]);
+			Assert.AreEqual(1, found.Count, "it is still listed");
+			Assert.AreEqual("FromTheFuture", found[0].Name);
+			Assert.IsTrue(found[0].IsAbiIncompatible);
+			Assert.IsFalse(found[0].IsLoadable);
+			StringAssert.Contains(found[0].Error, "Update Chimera");
+		}
+
+		[TestMethod]
+		public void ARefusedPackageIsNotConfusedWithABrokenOne()
+		{
+			_ = MakeZip(
+				"future.chimeraCore",
+				("core.wbx", "stub"),
+				("waterbox.config", $@"{{ ""coreName"": ""FromTheFuture"", ""systemId"": ""NES"", ""abi"": {GuestAbi.Current + 1} }}"));
+			_ = MakeZip("broken.chimeraCore", ("core.wbx", "stub"), ("waterbox.config", "{ not json"));
+			var found = CorePackageDiscovery.Scan([ _root ]);
+			Assert.AreEqual(2, found.Count);
+			Assert.IsTrue(found.Single(static p => p.Name is "FromTheFuture").IsAbiIncompatible);
+			var broken = found.Single(static p => p.Name is not "FromTheFuture");
+			Assert.IsNotNull(broken.Error);
+			Assert.IsFalse(broken.IsAbiIncompatible, "a corrupt package is not a package for another Chimera");
+		}
+
+		[TestMethod]
+		public void AVersionIsShownAtCommitLength()
+		{
+			DiscoveredCorePackage published = new() { Version = "4ed3532117ada82a5491430b8923c07ffe93f397" };
+			Assert.AreEqual("4ed35321", published.ShortVersion);
+			Assert.IsFalse(published.IsLocalBuild);
+
+			// what build-package.sh stamps when no CI told it what commit it is
+			DiscoveredCorePackage handBuilt = new() { Version = "12d65377b7d3-dirty+local" };
+			Assert.AreEqual("12d65377 local", handBuilt.ShortVersion);
+			Assert.IsTrue(handBuilt.IsLocalBuild);
+
+			Assert.AreEqual("", new DiscoveredCorePackage().ShortVersion);
+		}
+
+		[TestMethod]
 		public void SearchPathsAlwaysStartWithTheDefaultCoresFolder()
 		{
 			Config config = new();
 			config.CorePackagePaths.Add("/somewhere/else");
 			var paths = CorePackageDiscovery.SearchPaths(config);
-			Assert.AreEqual(CorePackageDiscovery.DefaultSearchPath, paths[0]);
-			Assert.AreEqual("/somewhere/else", paths[1]);
+			Assert.AreEqual(CorePackageDiscovery.DefaultSearchPath, paths[0], "the bundle's own folder wins: a portable install carries its cores with it");
+			Assert.AreEqual(CoreStore.Path, paths[1], "a core the manager just downloaded has to be found without being added by hand");
+			Assert.AreEqual("/somewhere/else", paths[2]);
 		}
 	}
 }

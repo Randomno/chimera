@@ -1,3 +1,4 @@
+using System;
 ﻿using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -161,8 +162,14 @@ namespace Chimera.Client.GUI
 		private void ScheduleShutdown()
 			=> _exitRequestPending = true;
 
+		/// <summary>See <see cref="IMainFormForTools.ShutdownIsUnattended"/>.</summary>
+		public bool ShutdownIsUnattended { get; private set; }
+
 		public void CloseEmulator(int? exitCode = null)
 		{
+			// asked for through the API - a Lua script, a harness - so there is
+			// nobody to answer a prompt on the way out
+			ShutdownIsUnattended = true;
 			ScheduleShutdown();
 			if (exitCode != null) _exitCode = exitCode.Value;
 		}
@@ -224,12 +231,38 @@ namespace Chimera.Client.GUI
 		private void WindowSizeSubMenu_DropDownOpened(object sender, EventArgs e)
 		{
 			var windowScale = Config.GetWindowScaleFor(Emulator.SystemId);
+			// Which sizes this screen can hold: FrameBufferResized walks the asked
+			// zoom DOWN until the window fits the working area, so on a 1080p
+			// screen a 1280x720 PS3 picture is 1x whatever was picked, and a menu
+			// that showed 2x checked with 1x, 2x and 3x all doing the same thing
+			// was reporting the wish and not the window (issue #101). The entries
+			// that cannot fit say so and are disabled; the check mark sits on the
+			// size the window actually is.
+			var fits = int.MaxValue;
+			if (_currentVideoProvider is not null && WindowState is FormWindowState.Normal)
+			{
+				var area = Screen.FromControl(this).WorkingArea;
+				var borderWidth = Size.Width - _presentationPanel.Control.Size.Width;
+				var borderHeight = Size.Height - _presentationPanel.Control.Size.Height;
+				fits = 0;
+				for (var zoom = 1; zoom <= EmuClientApi.WINDOW_SCALE_MAX; zoom++)
+				{
+					var size = DisplayManager.CalculateClientSize(_currentVideoProvider, zoom);
+					if (size.Width + borderWidth >= area.Width || size.Height + borderHeight >= area.Height) break;
+					fits = zoom;
+				}
+			}
+			var effective = fits is int.MaxValue ? windowScale : Math.Max(1, Math.Min(windowScale, fits));
 			foreach (var item in WindowSizeSubMenu.DropDownItems)
 			{
 				// filter out separators
 				if (item is ToolStripMenuItem menuItem && menuItem.Tag is int itemScale)
 				{
-					menuItem.Checked = itemScale == windowScale && Config.ResizeWithFramebuffer;
+					var tooBig = fits is not int.MaxValue && itemScale > fits;
+					menuItem.Checked = itemScale == effective && Config.ResizeWithFramebuffer;
+					menuItem.Enabled = !tooBig;
+					var label = $"{(itemScale >= 10 ? (itemScale / 10).ToString() : string.Empty)}&{itemScale % 10}x";
+					menuItem.Text = tooBig ? $"{label}  (larger than this screen)" : label;
 				}
 			}
 			DisableResizeWithFramebufferMenuItem.Checked = !Config.ResizeWithFramebuffer;
@@ -404,6 +437,289 @@ namespace Chimera.Client.GUI
 				sysID: Game.System,
 				newPath => MovieSession.BackupDirectory = newPath);
 			if (this.ShowDialogWithTempMute(form).IsOk()) AddOnScreenMessage("Path settings saved");
+		}
+
+		/// <summary>
+		/// Config > Firmware: every installed core surveyed for what it needs, just
+		/// in time - nothing about a core is kept once the window closes, and a
+		/// core that is gone takes its rows with it (its chosen paths stay in the
+		/// config for when it is put back).
+		/// </summary>
+		/// <summary>
+		/// Tools &gt; Pre-Compiled Modules: the games a core has translated code
+		/// for, and the only place that code is removed (docs/compile-cache.md).
+		///
+		/// The old layout's leftovers are handed in as a second root, so that
+		/// what a previous Chimera compiled is something a person can see and
+		/// take away rather than bytes nothing can read and nobody can find.
+		/// </summary>
+		private void PrecompiledModulesMenuItem_Click(object sender, EventArgs e)
+		{
+			using PrecompiledModulesForm form = new(
+				() => PrecompiledCodeSurvey.Take(CacheStore.PrecompiledCode, CacheStore.CompiledCode));
+			this.ShowDialogWithTempMute(form);
+		}
+
+		/// <summary>
+		/// Where everything per-user lives (issue #52). The window records a change and the next
+		/// start carries it out, so the config is saved as it closes: a change that only lived in
+		/// memory would be lost with a session that ends any way but cleanly.
+		/// </summary>
+		private void DataDirectoryMenuItem_Click(object sender, EventArgs e)
+		{
+			var before = (Config.DataDirectoryPending, Config.DataDirectoryPendingMove);
+			using DataDirectoryForm form = new(Config);
+			this.ShowDialogWithTempMute(form);
+			if (before != (Config.DataDirectoryPending, Config.DataDirectoryPendingMove)) SaveConfig();
+		}
+
+		private void FirmwareMenuItem_Click(object sender, EventArgs e)
+		{
+			var firmwareFolder = Config.PathEntries.FirmwareAbsolutePath();
+			IReadOnlyList<FirmwareSurveyGroup> Survey()
+			{
+				var packages = CorePackageDiscovery.ScanFor(Config);
+				var index = FirmwareSurvey.BuildIndex(Config, firmwareFolder, packages.Select(static p => p.Name));
+				return FirmwareSurvey.Build(Config, packages, p => FirmwareSurvey.DeclarationsOf(p.Path), firmwareFolder, index);
+			}
+			using FirmwareSurveyForm form = new(
+				Survey,
+				(row, path) => CoreFirmwareStore.Remember(Config, row.CoreName, row.Decl, path),
+				// Both pickers open in the firmware folder Config > Paths names,
+				// which is the folder this whole form is about (chimera#114);
+				// a folder that is not there is no starting point, so then the
+				// dialog keeps its own default.
+				pickFile: title =>
+				{
+					using OpenFileDialog picker = new()
+					{
+						Title = title,
+						Filter = "All Files|*.*",
+						InitialDirectory = Directory.Exists(firmwareFolder) ? firmwareFolder : "",
+					};
+					return picker.ShowDialog(this) is DialogResult.OK ? picker.FileName.WithoutWslgMirror() : null;
+				},
+				pickFolder: () =>
+				{
+					using FolderBrowserEx picker = new()
+					{
+						Description = "Scan a folder for firmware files",
+						SelectedPath = Directory.Exists(firmwareFolder) ? firmwareFolder : "",
+					};
+					return picker.ShowDialog(this) is DialogResult.OK ? picker.SelectedPath.WithoutWslgMirror() : null;
+				},
+				scanFolder: folder =>
+				{
+					// every pinned declaration of every installed core, answered by hash
+					// from the folder and its subfolders; what is found is remembered
+					// where it lies
+					var packages = CorePackageDiscovery.ScanFor(Config);
+					var scanned = FirmwareLocator.BuildIndex([ ], ProjectFolderScan.Enumerate(folder).Take(ProjectFolderScan.MaxFiles));
+					foreach (var package in packages.Where(static p => p.Error is null))
+					{
+						foreach (var decl in FirmwareSurvey.DeclarationsOf(package.Path).Decls)
+						{
+							if (FirmwareLocator.FindEither(decl, scanned) is { } found)
+							{
+								CoreFirmwareStore.Remember(Config, package.Name, decl, found.Path);
+							}
+						}
+					}
+				});
+			this.ShowDialogWithTempMute(form);
+		}
+
+		/// <summary>
+		/// File &gt; Core Manager. Chimera ships no cores; this is where they come
+		/// from. Opened by hand here, and by itself once when nothing is installed
+		/// (see <see cref="OfferTheCoreManagerIfNothingIsInstalled"/>).
+		/// </summary>
+		private void CoreManagerMenuItem_Click(object sender, EventArgs e) => ShowCacheManagerOrCoreManager(core: true);
+
+		private void CacheManagerMenuItem_Click(object sender, EventArgs e) => ShowCacheManagerOrCoreManager(core: false);
+
+		private void ShowCacheManagerOrCoreManager(bool core)
+		{
+			if (core) ShowCoreManager();
+			else ShowCacheManager();
+		}
+
+		/// <summary>
+		/// Tools &gt; Cache Manager: what Chimera keeps on disk that it could work
+		/// out again, and how much room it is taking. Everything it lists is safe
+		/// to delete - the cost is time, never work - which is why installed cores
+		/// and projects are not in it.
+		/// </summary>
+		public void ShowCacheManager()
+		{
+			using CacheManagerForm form = new(
+				TakeCacheSurvey,
+				setLocked: static (items, locked) => CacheLocks.Set(items, locked),
+				policy: CacheCleanPolicyFromConfig(),
+				savePolicy: p =>
+				{
+					Config.CacheAutoClean = p.Enabled;
+					Config.CacheSizeLimitMb = (int) (p.LimitBytes / 1024 / 1024);
+					Config.CacheFreeSpaceFloorMb = (int) (p.FreeSpaceFloorBytes / 1024 / 1024);
+				},
+				freeSpace: () => CacheSurvey.FreeSpaceAt(ProjectCache.DataHome),
+				editBudgets: EditGreenzoneBudgets);
+			this.ShowDialogWithTempMute(form);
+			// a limit that was just lowered should mean something before the next
+			// project closes, and the window has already asked about anything it
+			// removed itself
+			AutoCleanCaches();
+		}
+
+		/// <summary>
+		/// The greenzone budget: the default for every project, and what one
+		/// project asks for instead. A project row carries its id in Detail, which
+		/// is the key its budgets are kept under.
+		/// </summary>
+		// this project is not yet in a nullable context as a whole (the newer files
+		// opt in one by one), so the annotation has to say where it applies
+#nullable enable annotations
+		private void EditGreenzoneBudgets(CacheItem? project)
+#nullable restore annotations
+		{
+			var id = project?.Detail ?? "";
+			using GreenzoneBudgetsForm form = new(
+				Config.Movies.GreenzoneBudgetMb,
+				Config.Movies.GreenzoneMaxNearStride,
+				projectLabel: id.Length is 0 ? null : project!.Label,
+				projectBudgets: id.Length is 0 ? null : ProjectCache.BudgetsOf(id));
+			if (this.ShowDialogWithTempMute(form) is not DialogResult.OK) return;
+
+			Config.Movies.GreenzoneBudgetMb = form.DefaultMemoryMb;
+			Config.Movies.GreenzoneMaxNearStride = form.DefaultMaxNearStride;
+			if (id.Length is not 0) ProjectCache.RememberBudgets(id, form.ProjectBudgets);
+		}
+
+		/// <summary>
+		/// What is cached right now, from the two roots only the window knows about
+		/// and what this session is standing on. One place, because the cache
+		/// manager and the auto-clean have to be looking at the same list - an
+		/// auto-clean that did not know what was open would take it.
+		/// </summary>
+		private IReadOnlyList<CacheItem> TakeCacheSurvey()
+			=> CacheSurvey.Take(
+				corePackageCacheRoot: CacheStore.UnpackedCores,
+				// what is open right now may not be pulled out from under itself
+				openProjectId: _openProject?.Id,
+				loadedPackageSha1s: CoreRegistry.Instance.LoadedPackages
+					.Select(static p => p.Sha1)
+					.Where(static s => !string.IsNullOrEmpty(s))
+					.ToList()!);
+
+		private CacheCleanPolicy CacheCleanPolicyFromConfig()
+			=> new()
+			{
+				Enabled = Config.CacheAutoClean,
+				LimitBytes = Config.CacheSizeLimitMb * 1024L * 1024L,
+				FreeSpaceFloorBytes = Config.CacheFreeSpaceFloorMb * 1024L * 1024L,
+			};
+
+		/// <summary>
+		/// Said once a session, and only for the half that will still be true
+		/// tomorrow: a cache held over its limit by locks needs a person, while
+		/// one held by an open project sorts itself out at the next close.
+		/// </summary>
+		private bool _saidTheCacheCannotBeCleaned;
+
+		/// <summary>
+		/// Holds the cache to its limit, taking the oldest unlocked entries first
+		/// (docs/cache-manager.md).
+		///
+		/// Runs where a cache has just stopped being needed rather than on a timer:
+		/// at startup, and when a project closes - which is the moment its greenzone
+		/// stops being the one thing that may not be touched, and the moment the
+		/// cache has just grown by however many gigabytes the session added. Doing
+		/// it while a run is open would mean deleting somebody's disk space in the
+		/// middle of their frame advance.
+		/// </summary>
+		/// <param name="spareProjectId">a project whose cache this pass may not
+		/// take - the one that has just been closed</param>
+		private void AutoCleanCaches(string spareProjectId = null)
+		{
+			if (!Config.CacheAutoClean) return;
+			try
+			{
+				var spare = string.IsNullOrEmpty(spareProjectId)
+					? null
+					: new[] { ProjectCache.DirectoryFor(spareProjectId) };
+				var result = CacheSurvey.AutoClean(
+					TakeCacheSurvey(),
+					CacheCleanPolicyFromConfig(),
+					// the limit is a promise about the machine, and the setting alone
+					// cannot keep it on a disk that is nearly full
+					freeBytes: CacheSurvey.FreeSpaceAt(ProjectCache.DataHome),
+					spare: spare);
+
+				if (result.Removed.Count is not 0)
+				{
+					var freed = CacheSurvey.Size(result.Before - result.After);
+					Console.WriteLine($"[cache] removed {result.Removed.Count} of the oldest unlocked item(s), freeing {freed}"
+						+ (result.DiskDecidedTheLimit ? $" (the disk, not the setting, set the limit at {CacheSurvey.Size(result.Limit)})" : "")
+						+ $": {string.Join(", ", result.Removed.Select(static i => i.Label))}");
+					AddOnScreenMessage($"Cache auto-clean freed {freed}");
+				}
+
+				if (!result.StillOver) return;
+				var over = CacheSurvey.Size(result.After - result.Limit);
+				Console.WriteLine($"[cache] still {over} over the {CacheSurvey.Size(result.Limit)} limit. {result.Why}");
+				// An open project is what a session IS; saying so would be telling
+				// somebody off for working. A lock waits for a person, so it is said
+				// - once, because it will be just as true at the next close.
+				if (result.HeldByLocks <= 0 || _saidTheCacheCannotBeCleaned) return;
+				_saidTheCacheCannotBeCleaned = true;
+				AddOnScreenMessage($"The cache is {over} over its limit and what is left is locked");
+			}
+			catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+			{
+				// a cache that will not be measured or removed is not worth stopping
+				// anything for; it is a cache
+				Console.WriteLine($"[cache] auto-clean gave up: {ex.Message}");
+			}
+		}
+
+		public void ShowCoreManager()
+		{
+			using CoreManagerForm form = new(
+				// the shipped roster, plus whatever cores have been added by hand
+				roster: () => CoreRoster.WithExternal(CoreRoster.Read(), Config.ExternalCores),
+				scan: () => CorePackageDiscovery.ScanFor(Config),
+				feed: new CoreFeed(),
+				installer: new CoreInstaller(),
+				rememberExternal: core => Config.ExternalCores.Add(core),
+				forgetExternal: core => Config.ExternalCores.RemoveAll(c => string.Equals(c.Repo, core.Repo, StringComparison.OrdinalIgnoreCase)),
+				askForUrl: () => PromptForCoreUrl(),
+				// a core that has just landed must be usable in this session: discovery
+				// is separate from loading precisely so a package can appear without a
+				// restart, and the menus read from the scan
+				changed: ScanForCorePackages,
+				// installing a build of a core is choosing it, when several are installed
+				installed: package =>
+				{
+					if (package.Sha1 is not null) CoreChoices.MakeDefaultBuild(Config, package.Name, package.Sha1);
+				});
+			this.ShowDialogWithTempMute(form);
+			ScanForCorePackages();
+		}
+
+		/// <summary>
+		/// Asks for the GitHub page of a core published outside the official set. A
+		/// plain input box: the address is all that is needed, and the manager checks
+		/// what is actually there before remembering it.
+		/// </summary>
+		private string PromptForCoreUrl()
+		{
+			using InputPrompt prompt = new()
+			{
+				TextInputType = InputPrompt.InputType.Text,
+				Message = "GitHub page of the core to add:",
+				InitialValue = "https://github.com/",
+			};
+			return this.ShowDialogWithTempMute(prompt).IsOk() ? prompt.PromptText : null;
 		}
 
 		private void SoundMenuItem_Click(object sender, EventArgs e)
@@ -642,6 +958,17 @@ namespace Chimera.Client.GUI
 			Tools.Load<MacroInputTool>();
 		}
 
+		/// <summary>
+		/// A folder becomes one file with a stable hash, so that a game dumped as
+		/// a directory can be named by a project at all (docs/project.md: names
+		/// and SHA1s, never paths).
+		/// </summary>
+		private void MediaMakerMenuItem_Click(object sender, EventArgs e)
+		{
+			using var form = new MediaMakerForm();
+			this.ShowDialogWithTempMute(form);
+		}
+
 		private void BatchRunnerMenuItem_Click(object sender, EventArgs e)
 		{
 			using var form = new BatchRun(this, Config, CreateCoreComm);
@@ -863,10 +1190,19 @@ namespace Chimera.Client.GUI
 			}
 
 			HandlePlatformMenus();
+
+			// After the window is up rather than before it: this walks every cache
+			// directory on the machine, and a frontend that sat on a black screen
+			// counting bytes would look broken.
+			AutoCleanCaches();
 		}
 
 		protected override void OnClosed(EventArgs e)
 		{
+			// The close went ahead, so every question about unsaved work has been answered:
+			// what a crash would have kept is either saved or knowingly let go.
+			_recovery?.End(clean: true);
+			_recovery = null;
 			_windowClosedAndSafeToExitProcess = true;
 			base.OnClosed(e);
 		}

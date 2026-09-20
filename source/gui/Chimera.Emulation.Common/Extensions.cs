@@ -102,10 +102,19 @@ namespace Chimera.Emulation.Common
 			return core.ServiceProvider.GetService<IStatable>();
 		}
 
+		/// <summary>Where the machine has been, kept by the engine (docs/state-manager.md).</summary>
+		public static IStateHistory AsStateHistory(this IEmulator core)
+		{
+			return core.ServiceProvider.GetService<IStateHistory>();
+		}
+
 		public static bool CanPollInput(this IEmulator core)
 		{
 			return core != null && core.ServiceProvider.HasService<IInputPollable>();
 		}
+
+		public static ICorePrecompile AsPrecompile(this IEmulator core)
+			=> core.ServiceProvider.GetService<ICorePrecompile>();
 
 		public static IInputPollable AsInputPollable(this IEmulator core)
 		{

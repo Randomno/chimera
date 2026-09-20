@@ -8,7 +8,22 @@ namespace Chimera.Client.Common
 		bool BindMarkersToInput { get; set; }
 
 		IMovieChangeLog ChangeLog { get; }
-		IStateManager TasStateManager { get; set; }
+		IStateHistory States { get; }
+
+		/// <summary>Before the machine moves, every frame.</summary>
+		void GreenzoneBeforeFrame();
+
+		/// <summary>Re-tells the history which frames must survive its thinning.</summary>
+		void RefreshPins();
+
+		/// <summary>
+		/// Remembers that the core's machine died in this session, so nothing it stored outlives it:
+		/// the greenzone is not written on save, and any earlier one is removed.
+		/// </summary>
+		void NoteCoreDied();
+
+		/// <summary>Whether the machine died at some point in this session. Sticky once set.</summary>
+		bool CoreDiedThisSession { get; }
 
 		/// <summary>
 		/// Why the cache beside the project was set aside on load, or null when it
@@ -28,6 +43,15 @@ namespace Chimera.Client.Common
 		/// </summary>
 		int LastNonEmptyInputFrame { get; }
 		ITasBranchCollection Branches { get; }
+
+		/// <summary>Where a branch's state file is, from the name the branch holds (<see cref="TasBranch.StateFile"/>).</summary>
+		string BranchStatePath(string stateFile);
+
+		/// <summary>A path for a new branch's state, in a directory that exists; <paramref name="stateFile"/> is the name to keep.</summary>
+		string NewBranchStatePath(out string stateFile);
+
+		/// <summary>Removes the state files no branch names, nor <paramref name="alsoKeep"/>.</summary>
+		void RemoveUnusedBranchStates(params string[] alsoKeep);
 		TasLagLog LagLog { get; }
 		IStringLog VerificationLog { get; }
 
@@ -49,6 +73,14 @@ namespace Chimera.Client.Common
 		string DisplayValue(int frame, string buttonName, bool defaultAxisAsBlank);
 		void FlagChanges();
 		void ClearChanges();
+
+		/// <summary>The movie holds work its project file does not: it was opened from recovered work (ProjectRecovery).</summary>
+		void MarkRecovered();
+		/// <summary>
+		/// Saves inputs, markers, branches and settings with no state history - and removes the one an
+		/// earlier save left - for a greenzone nobody should trust (a machine that died mid-frame).
+		/// </summary>
+		FileWriteResult SaveWithoutGreenzone();
 
 		/// <summary>
 		/// Replaces the given frame's input with an empty frame

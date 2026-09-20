@@ -18,9 +18,11 @@
 #include "conditions.hpp"
 #include "sha1.hpp"
 
-#include "../../extern/tools/cjson/cJSON.h"
+#include "../../extern/cjson/cJSON.h"
 
+#include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <set>
 #include <string>
 #include <vector>
@@ -106,12 +108,26 @@ std::string lowerExt(const std::string &name)
 
 struct ce_project
 {
+	/* This project, and no other. The frontend keeps everything regenerable -
+	 * the state history, and where this machine last found the project's files
+	 * - in a per-user cache keyed by it, so the .chimeraProject stays the one
+	 * file that travels (docs/state-manager.md). It has to survive the file
+	 * being renamed, moved, or synced to another machine, which rules out the
+	 * path; and two attempts at the same game must not share a cache, which
+	 * rules out anything derived from the contents. So it is minted once and
+	 * carried. */
+	std::string id;
 	std::string title;
 	std::string description;
 	std::string coreName, coreVersion, coreSha1;
 	uint64_t rerecords = 0;
 	cJSON *settings = nullptr; // always an object
 	cJSON *firmware = nullptr; // always an array
+	cJSON *coreCache = nullptr; // always an array: {name, sha1} per compiled object
+	// TAStudio's own layout of the piano roll - columns, order, widths,
+	// orientation, lag display - kept verbatim for the frontend that wrote it,
+	// or null when it wrote none (issue #83). Not a sync setting.
+	cJSON *tastudio = nullptr;
 	std::string log;           // the ce_movie_log lump (LogKey + entries)
 	std::vector<FileEntry> files;
 	std::vector<Marker> markers;
@@ -122,23 +138,48 @@ struct ce_project
 	std::vector<std::pair<std::string, std::string>> headers;
 
 	// borrowed-buffer returns
-	std::string settingsOut, firmwareOut, slotsOut;
+	std::string settingsOut, firmwareOut, coreCacheOut, slotsOut, tastudioOut;
 
 	ce_project()
 	{
 		settings = cJSON_CreateObject();
 		firmware = cJSON_CreateArray();
+		coreCache = cJSON_CreateArray();
 	}
 	~ce_project()
 	{
 		cJSON_Delete(settings);
 		cJSON_Delete(firmware);
+		cJSON_Delete(coreCache);
+		cJSON_Delete(tastudio);
 	}
 };
 
 extern "C" {
 
-ce_project *ce_project_new(void) { return new ce_project(); }
+/* An identity for one project. It need only be unique - nothing reads meaning
+ * from it - so it is taken from where this process sits in memory (which the
+ * loader decides anew every run), the clock, and a count, the same recipe the
+ * GL bridge uses for a context. It is metadata and touches no machine state,
+ * so there is nothing here for determinism to mind. */
+static std::string mintProjectId()
+{
+	static uint64_t made;
+	uint64_t bits = (static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&made)) << 16)
+		^ (static_cast<uint64_t>(std::time(nullptr)) << 8)
+		^ (++made);
+	if (bits == 0) bits = 1;
+	char buf[17];
+	std::snprintf(buf, sizeof buf, "%016llx", static_cast<unsigned long long>(bits));
+	return std::string(buf);
+}
+
+ce_project *ce_project_new(void)
+{
+	auto *p = new ce_project();
+	p->id = mintProjectId();
+	return p;
+}
 
 void ce_project_free(ce_project *p) { delete p; }
 
@@ -174,9 +215,9 @@ ce_project *ce_project_open(const char *path, const char **error_out)
 
 	/* the format is strict: a key this build does not know is an error, not
 	 * something to drop silently on the next save */
-	static const char *known[] = { "title", "description", "core", "rerecords",
-		"files", "settings", "firmware", "input", "markers", "branches", "subtitles",
-		"headers" };
+	static const char *known[] = { "id", "title", "description", "core", "rerecords",
+		"files", "settings", "firmware", "coreCache", "input", "markers", "branches", "subtitles",
+		"headers", "tastudio" };
 	for (cJSON *item = root->child; item != nullptr; item = item->next)
 	{
 		bool ok = false;
@@ -195,6 +236,12 @@ ce_project *ce_project_open(const char *path, const char **error_out)
 	};
 
 	cJSON *j;
+	if ((j = cJSON_GetObjectItemCaseSensitive(root, "id")) != nullptr)
+	{
+		if (!cJSON_IsString(j)) return rejectP("\"id\" must be a string");
+		p->id = j->valuestring;
+	}
+	if (p->id.empty()) p->id = mintProjectId();  /* a project written before ids had one */
 	if ((j = cJSON_GetObjectItemCaseSensitive(root, "title")) != nullptr)
 	{
 		if (!cJSON_IsString(j)) return rejectP("\"title\" is not a string");
@@ -265,6 +312,17 @@ ce_project *ce_project_open(const char *path, const char **error_out)
 		if (!cJSON_IsArray(j)) return rejectP("\"firmware\" is not an array");
 		cJSON_Delete(p->firmware);
 		p->firmware = cJSON_Duplicate(j, 1);
+	}
+	if ((j = cJSON_GetObjectItemCaseSensitive(root, "coreCache")) != nullptr)
+	{
+		if (!cJSON_IsArray(j)) return rejectP("\"coreCache\" is not an array");
+		cJSON_Delete(p->coreCache);
+		p->coreCache = cJSON_Duplicate(j, 1);
+	}
+	if ((j = cJSON_GetObjectItemCaseSensitive(root, "tastudio")) != nullptr)
+	{
+		if (!cJSON_IsObject(j)) return rejectP("\"tastudio\" is not an object");
+		p->tastudio = cJSON_Duplicate(j, 1);
 	}
 	if ((j = cJSON_GetObjectItemCaseSensitive(root, "input")) != nullptr)
 	{
@@ -398,6 +456,7 @@ int32_t ce_project_save(ce_project *p, const char *path, const char **error_out)
 	}
 
 	cJSON *root = cJSON_CreateObject();
+	cJSON_AddStringToObject(root, "id", p->id.c_str());
 	cJSON_AddStringToObject(root, "title", p->title.c_str());
 	cJSON_AddStringToObject(root, "description", p->description.c_str());
 	cJSON *core = cJSON_AddObjectToObject(root, "core");
@@ -418,6 +477,13 @@ int32_t ce_project_save(ce_project *p, const char *path, const char **error_out)
 	}
 	cJSON_AddItemToObject(root, "settings", cJSON_Duplicate(p->settings, 1));
 	cJSON_AddItemToObject(root, "firmware", cJSON_Duplicate(p->firmware, 1));
+	/* What the core compiled for this game, by name and hash: regenerable from
+	 * the same inputs, recorded so a later run can be told it is running the
+	 * same compiled code (docs/compile-cache.md). */
+	cJSON_AddItemToObject(root, "coreCache", cJSON_Duplicate(p->coreCache, 1));
+	/* only when there is one: a project that never met TAStudio stays exactly
+	 * what an older build can open */
+	if (p->tastudio != nullptr) cJSON_AddItemToObject(root, "tastudio", cJSON_Duplicate(p->tastudio, 1));
 	cJSON_AddStringToObject(root, "input", p->log.c_str());
 	cJSON *markers = cJSON_AddArrayToObject(root, "markers");
 	for (const Marker &m : p->markers)
@@ -482,6 +548,7 @@ int32_t ce_project_save(ce_project *p, const char *path, const char **error_out)
 
 /* ---- identity ---- */
 
+const char *ce_project_id(const ce_project *p) { return p->id.c_str(); }
 const char *ce_project_title(const ce_project *p) { return p->title.c_str(); }
 void ce_project_set_title(ce_project *p, const char *title) { p->title = title != nullptr ? title : ""; }
 const char *ce_project_description(const ce_project *p) { return p->description.c_str(); }
@@ -522,6 +589,58 @@ int32_t ce_project_set_settings_text(ce_project *p, const char *json, const char
 	}
 	cJSON_Delete(p->settings);
 	p->settings = parsed;
+	return 0;
+}
+
+const char *ce_project_core_cache_text(ce_project *p, uint64_t *len_out)
+{
+	char *text = cJSON_PrintUnformatted(p->coreCache);
+	p->coreCacheOut = text != nullptr ? text : "[]";
+	if (text != nullptr) cJSON_free(text);
+	if (len_out != nullptr) *len_out = p->coreCacheOut.size();
+	return p->coreCacheOut.c_str();
+}
+
+int32_t ce_project_set_core_cache_text(ce_project *p, const char *json, const char **error_out)
+{
+	if (error_out != nullptr) *error_out = nullptr;
+	cJSON *parsed = cJSON_Parse(json != nullptr ? json : "");
+	if (parsed == nullptr || !cJSON_IsArray(parsed))
+	{
+		cJSON_Delete(parsed);
+		return failInt("coreCache must be a JSON array", error_out);
+	}
+	cJSON_Delete(p->coreCache);
+	p->coreCache = parsed;
+	return 0;
+}
+
+const char *ce_project_tastudio_text(ce_project *p, uint64_t *len_out)
+{
+	char *text = p->tastudio != nullptr ? cJSON_PrintUnformatted(p->tastudio) : nullptr;
+	p->tastudioOut = text != nullptr ? text : "";
+	if (text != nullptr) cJSON_free(text);
+	if (len_out != nullptr) *len_out = p->tastudioOut.size();
+	return p->tastudioOut.c_str();
+}
+
+int32_t ce_project_set_tastudio_text(ce_project *p, const char *json, const char **error_out)
+{
+	if (error_out != nullptr) *error_out = nullptr;
+	if (json == nullptr || json[0] == '\0')
+	{
+		cJSON_Delete(p->tastudio);
+		p->tastudio = nullptr;
+		return 0;
+	}
+	cJSON *parsed = cJSON_Parse(json);
+	if (parsed == nullptr || !cJSON_IsObject(parsed))
+	{
+		cJSON_Delete(parsed);
+		return failInt("tastudio must be a JSON object", error_out);
+	}
+	cJSON_Delete(p->tastudio);
+	p->tastudio = parsed;
 	return 0;
 }
 

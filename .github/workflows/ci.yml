@@ -9,8 +9,16 @@ on:
     # daily, to catch environment drift even when nothing is committed
     - cron: '0 4 * * *'
 
+# Keyed by the EVENT as well as the ref. A push to main and the nightly
+# schedule are different runs of the same workflow on the same ref, so without
+# the event in the key whichever starts second cancels the first. That happened
+# on 2026-09-12: the nightly (cron says 04:00, GitHub actually started it at
+# 08:16) cancelled a push's CI six minutes in, and because Release only follows
+# a CI that CONCLUDED success, that push's Release was skipped - no failure
+# anywhere, just no release for the commit. A push still supersedes an older
+# push on the same ref, which is what cancel-in-progress is for.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
@@ -30,7 +38,7 @@ jobs:
           submodules: false
 
       - name: Check out miniBox
-        run: git submodule update --init extern/tools/chimera-common-minibox
+        run: git submodule update --init extern/chimera-common-minibox
 
       - name: Install build dependencies
         run: |
@@ -39,8 +47,8 @@ jobs:
 
       - name: Build miniBox (host + guest toolchain)
         run: |
-          meson setup extern/tools/chimera-common-minibox/build/meson-linux extern/tools/chimera-common-minibox
-          meson compile -C extern/tools/chimera-common-minibox/build/meson-linux
+          meson setup extern/chimera-common-minibox/build/meson-linux extern/chimera-common-minibox
+          meson compile -C extern/chimera-common-minibox/build/meson-linux
 
       - name: Build the waterboxed synth core (core.wbx) and its tester
         run: sh tests/synth/package-box/build-box.sh
@@ -73,14 +81,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # NOT recursive: this job builds the frontend and replays the synth
-          # core, and never opens a shipped one. Cloning extern/cores anyway
-          # costs nine gigabytes of runner disk and the time to fetch it - and
-          # the disk is the part that would eventually stop being merely wasteful.
+          # only what the frontend is built from; the cores are separate
+          # repositories now and this job never opens one (see published-cores)
           submodules: false
 
       - name: Check out what the frontend is built from
-        run: git submodule update --init --recursive extern/tools
+        run: git submodule update --init --recursive extern
 
       - name: Install build dependencies
         run: |
@@ -100,6 +106,23 @@ jobs:
           meson setup build/meson-linux --prefix "$PWD/build" --libdir dll
           meson compile -C build/meson-linux
           meson install -C build/meson-linux
+
+      - name: Engine unit tests
+        # The 18 `meson test` cases over the engine: sha1, the movie log and its
+        # text form, the state container and its format, packages, multi-file
+        # media, projects, firmware, the GL flight/sync/buffer-pool bridge, the
+        # stride tuner, greenzone shape and RAM search. The step above already
+        # COMPILES every one of them - they are ordinary targets in meson.build -
+        # so until now CI paid for the build and then threw the result away, and
+        # the engine's own tests gated nothing. They take about eight seconds.
+        run: meson test -C build/meson-linux --print-errorlogs
+
+      - name: Upload engine test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-meson-logs
+          path: build/meson-linux/meson-logs/
 
       - name: Build the managed solution
         run: dotnet build source/gui/Chimera.sln -c Release /nodeReuse:false -p:UseSharedCompilation=false
@@ -131,3 +154,78 @@ jobs:
           name: ui-screenshots
           path: tests/ui/shots/
           if-no-files-found: warn
+
+  published-cores:
+    # The cores as they are actually published. Chimera ships none and builds
+    # none, so nothing else here would notice a frontend change that broke the
+    # generic waterbox adapter for every core at once - it would surface the
+    # first time somebody downloaded one.
+    #
+    # So: fetch what each core last published and check the CONTRACT against it.
+    # No rom, no firmware, no emulation and no core build - that a package can be
+    # read, understood and turned into a working factory. Whether the emulation
+    # is still right is each core repository's own gate, which runs against this
+    # repository's main and is the same check from the other side.
+    #
+    # A core that has published nothing is skipped, not a failure: the cores gain
+    # their release pipeline one at a time. Note what that means when NOTHING is
+    # fetched - every test is inconclusive and the job goes green having checked
+    # nothing at all, which is exactly what hid this job needing the engine until
+    # the first real packages arrived. The step below fails the job if the fetch
+    # produced no packages, so a silent nothing cannot pass again.
+    name: published cores (package contract)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Check out what the engine is built from
+        run: git submodule update --init --recursive extern
+
+      - name: Install build dependencies
+        # mono because the tests are net48 and vstest needs a host for them on
+        # Linux; the rest because reading a package is the ENGINE's job now
+        # (ce_package_open), so this job has to build libchimera like any other.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            meson ninja-build build-essential cmake pkg-config python3 \
+            mono-complete \
+            libgl1-mesa-dev libegl-dev libx11-dev libxext-dev libasound2-dev
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0'
+
+      - name: Build native dependencies (installs into build/dll)
+        run: |
+          meson setup build/meson-linux --prefix "$PWD/build" --libdir dll
+          meson compile -C build/meson-linux
+          meson install -C build/meson-linux
+
+      - name: Build the tests
+        run: dotnet build source/gui/Chimera.Tests.Client.Common/Chimera.Tests.Client.Common.csproj -c Release /nodeReuse:false -p:UseSharedCompilation=false
+
+      - name: Fetch every published core package
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./tools/fetch-cores.sh
+
+      - name: What was fetched
+        # All fifteen cores publish, so an empty build/Cores means the fetch
+        # broke, not that the cores are young. Passing on nothing is how this job
+        # spent its first day validating nothing.
+        run: |
+          ls -la build/Cores || true
+          count=$(find build/Cores -name '*.chimeraCore' 2>/dev/null | wc -l)
+          echo "$count package(s) fetched"
+          [ "$count" -gt 0 ] || { echo "::error::no core packages were fetched; there is nothing to check" >&2; exit 1; }
+
+      - name: The frontend against real packages
+        run: |
+          dotnet test source/gui/Chimera.Tests.Client.Common/Chimera.Tests.Client.Common.csproj \
+            -c Release --no-build --nologo \
+            --filter "FullyQualifiedName~InstalledCorePackagesTests|FullyQualifiedName~MnemonicUniquenessTests"

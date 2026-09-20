@@ -1,4 +1,4 @@
-#nullable enable
+﻿#nullable enable
 
 using System.Collections.Generic;
 using System.IO;
@@ -23,6 +23,18 @@ namespace Chimera.Emulation.Common.Engine
 		/// <summary>JSON: what built this engine (commit, compiler, OS, target).</summary>
 		[ChimeraImport(CallingConvention.Cdecl)]
 		public abstract IntPtr ce_build_info();
+
+		/// <summary>Issue #115: the sentence to show when this build and a core package are far apart, or null.</summary>
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract IntPtr ce_version_skew(string frontendDate, string frontendBuild, string coreDate, string coreBuild, string coreName);
+
+		/// <summary>The build that writes this session's states - the engine's commit, which is the frontend's.</summary>
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract IntPtr ce_state_writer_id();
+
+		/// <summary>The shape of a machine state as this build writes and reads it (issue #115).</summary>
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract uint ce_state_format();
 
 		[ChimeraImport(CallingConvention.Cdecl)]
 		public abstract IntPtr ce_movie_log_new();
@@ -80,6 +92,30 @@ namespace Chimera.Emulation.Common.Engine
 
 		[ChimeraImport(CallingConvention.Cdecl)]
 		public abstract IntPtr ce_movie_log_serialize(IntPtr log, int crlf, ref ulong lenOut);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract int ce_movie_log_journal_open(IntPtr log, string path);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract void ce_movie_log_journal_close(IntPtr log, int remove);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract int ce_movie_log_journaling(IntPtr log);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract long ce_movie_log_journal_replay(IntPtr log, string path);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract int ce_movie_log_journal_open_with(IntPtr log, string path, string? frontendImage);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract void ce_movie_log_journal_note(IntPtr log, string record);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract long ce_movie_log_journal_note_count(IntPtr log);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract IntPtr ce_movie_log_journal_note_at(IntPtr log, long index);
 
 		[ChimeraImport(CallingConvention.Cdecl)]
 		public abstract IntPtr ce_movie_header_new();
@@ -175,6 +211,9 @@ namespace Chimera.Emulation.Common.Engine
 		[ChimeraImport(CallingConvention.Cdecl)]
 		public abstract void ce_sha1_hex(byte[] data, ulong len, byte[] out41);
 
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract int ce_sha1_file(string utf8Path, byte[] out41, ref ulong lenOut);
+
 
 
 
@@ -259,6 +298,9 @@ namespace Chimera.Emulation.Common.Engine
 		public abstract void ce_project_free(IntPtr project);
 
 		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract IntPtr ce_project_id(IntPtr project);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
 		public abstract IntPtr ce_project_title(IntPtr project);
 
 		[ChimeraImport(CallingConvention.Cdecl)]
@@ -299,6 +341,18 @@ namespace Chimera.Emulation.Common.Engine
 
 		[ChimeraImport(CallingConvention.Cdecl)]
 		public abstract int ce_project_set_firmware_text(IntPtr project, string json, ref IntPtr errorOut);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract IntPtr ce_project_core_cache_text(IntPtr project, ref ulong lenOut);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract int ce_project_set_core_cache_text(IntPtr project, string json, ref IntPtr errorOut);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract IntPtr ce_project_tastudio_text(IntPtr project, ref ulong lenOut);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract int ce_project_set_tastudio_text(IntPtr project, string json, ref IntPtr errorOut);
 
 		[ChimeraImport(CallingConvention.Cdecl)]
 		public abstract IntPtr ce_project_log_text(IntPtr project, ref ulong lenOut);
@@ -484,8 +538,49 @@ namespace Chimera.Emulation.Common.Engine
 		[ChimeraImport(CallingConvention.Cdecl)]
 		public abstract IntPtr ce_gl_description();
 
+		/// <summary>the GPU bridge's flight recorder, for the crash module to read out of a dead process (docs/gpu-bridge.md)</summary>
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract IntPtr ce_gl_flight_recorder(out uint bytes);
+
 		[ChimeraImport(CallingConvention.Cdecl)]
 		public abstract void ce_gl_request(int want);
+
+		/// <summary>the progress sink (see <see cref="EngineProgress"/>); fn is a Cdecl (stage, done, total, user) function pointer, or zero to stop</summary>
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract void ce_progress_set(IntPtr fn, IntPtr user);
+
+		// the reproducible media maker: a folder packed into one file whose bytes
+		// depend on its contents and names and on nothing else (docs: a project
+		// stores names and SHA1s, never paths, so a folder has to become a file)
+		/// <summary>0 zip (stored), 1 ISO 9660 + Joliet, 2 FAT12 floppy. progress is a Cdecl (file, bytesDone, bytesTotal, filesDone, filesTotal, user) pointer returning 1 to carry on and 0 to cancel, or zero for none. Returns 1 when the file was written.</summary>
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract int ce_media_make(string folder, string outPath, int format, IntPtr progress, IntPtr user);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract IntPtr ce_media_last_sha1();
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract IntPtr ce_media_last_error();
+
+		// the compile cache and precompile sessions (docs: a core's compiled
+		// objects, kept on the host; never machine state)
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract void ce_cache_dir([MarshalAs(UnmanagedType.LPUTF8Str)] string dir);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract void ce_precompile_request(int index, int count, int firmwareToo);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract ulong ce_session_cache_stored(IntPtr session);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract ulong ce_session_cache_fetched(IntPtr session);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract int ce_session_precompile_done(IntPtr session);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract int ce_session_precompile_progress(IntPtr session, out uint done, out uint total);
 
 		[ChimeraImport(CallingConvention.Cdecl)]
 		public abstract int ce_gl_available();
@@ -510,6 +605,24 @@ namespace Chimera.Emulation.Common.Engine
 
 		[ChimeraImport(CallingConvention.Cdecl)]
 		public abstract int ce_session_drive_light(IntPtr session, int index);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract int ce_session_drive_media_count(IntPtr session, int index);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract int ce_session_state_save_file(IntPtr session, string utf8Path, byte[] tag, uint tagLen);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract int ce_session_state_load_file(IntPtr session, string utf8Path, byte[] tagOut, uint tagCap, ref uint tagLenOut);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract IntPtr ce_session_drive_media_name(IntPtr session, int index, int media);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract int ce_session_drive_media_selected(IntPtr session, int index);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract int ce_session_drive_media_inserted(IntPtr session, int index);
 
 		[ChimeraImport(CallingConvention.Cdecl)]
 		public abstract int ce_session_button_active(IntPtr session, long index);
@@ -541,6 +654,78 @@ namespace Chimera.Emulation.Common.Engine
 		[ChimeraImport(CallingConvention.Cdecl)]
 		public abstract int ce_session_load_state(IntPtr session, byte[] data, ulong len);
 
+		// ---- the state history (docs/state-manager.md) ----
+		// Every declaration keeps its own attribute: an attribute separated from
+		// the declaration it belongs to leaves an unimplemented abstract slot,
+		// and the invoker then fails to load with "invalid vtable method slot".
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract void ce_session_greenzone_enable(IntPtr session, ulong budgetBytes);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract void ce_session_greenzone_disk_budget(IntPtr session, ulong budgetBytes);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract void ce_session_greenzone_max_near_stride(IntPtr session, long maxStride);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract void ce_session_greenzone_bands(
+			IntPtr session, long nearFrames, long midFrames, long midStride, long farStride, long anchorSpacing);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract void ce_session_greenzone_spill(IntPtr session, string dir);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract int ce_session_greenzone_spill_failed(IntPtr session);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract void ce_session_greenzone_pin(IntPtr session, long frame, int pinned);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract void ce_session_greenzone_unpin_all(IntPtr session);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract long ce_session_greenzone_count(IntPtr session);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract long ce_session_frame(IntPtr session);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract long ce_session_greenzone_nearest(IntPtr session, long frame);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract void ce_session_greenzone_invalidate(IntPtr session, long afterFrame);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract void ce_session_greenzone_before_advance(IntPtr session);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		// note: null for a frame with nothing to remember about it
+		public abstract int ce_session_greenzone_capture(IntPtr session, long frame, byte[]? note, uint noteLen);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		// outBuf: null asks only how many bytes there are
+		public abstract uint ce_session_greenzone_note(IntPtr session, long frame, byte[]? outBuf, uint outLen);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract int ce_session_greenzone_restore(IntPtr session, long frame);
+
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract int ce_session_history_save(IntPtr session, string path, string machineId);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract int ce_session_history_load(IntPtr session, string path, string machineId);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract int ce_session_history_save_later(IntPtr session, string path, string machineId);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract int ce_session_history_save_pending(IntPtr session);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract int ce_session_history_save_wait(IntPtr session);
+
 		[ChimeraImport(CallingConvention.Cdecl)]
 		public abstract int ce_session_domain_count(IntPtr session);
 
@@ -558,6 +743,9 @@ namespace Chimera.Emulation.Common.Engine
 
 		[ChimeraImport(CallingConvention.Cdecl)]
 		public abstract IntPtr ce_session_last_error(IntPtr session);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract IntPtr ce_session_guest_death(IntPtr session);
 
 		[ChimeraImport(CallingConvention.Cdecl)]
 		public abstract IntPtr ce_host_build_info();
@@ -649,6 +837,86 @@ namespace Chimera.Emulation.Common.Engine
 		[ChimeraImport(CallingConvention.Cdecl)]
 		public abstract long ce_session_savedata_read(IntPtr session, int index, long offset, byte[] buf, long len);
 
+		// ---- RAM Search (engine.h): the candidate set lives in the engine ----
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract IntPtr ce_ramsearch_create(IntPtr basePtr, IntPtr readFn, IntPtr user, long domainSize);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract void ce_ramsearch_destroy(IntPtr rs);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract int ce_ramsearch_start(IntPtr rs, int size, int misaligned, int bigEndian, int detailed);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract long ce_ramsearch_count(IntPtr rs);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract int ce_ramsearch_row(IntPtr rs, long index, ref ulong address, ref uint current, ref uint previous, ref uint changes);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract long ce_ramsearch_index_of(IntPtr rs, ulong address);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract long ce_ramsearch_search(IntPtr rs, int compare, int op, int display, uint value, uint differentBy, int previousType);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract int ce_ramsearch_would_remove(IntPtr rs, long index, int compare, int op, int display, uint value, uint differentBy);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract int ce_ramsearch_update(IntPtr rs, int previousType);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract int ce_ramsearch_set_previous_to_current(IntPtr rs);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract void ce_ramsearch_clear_change_counts(IntPtr rs);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract void ce_ramsearch_set_big_endian(IntPtr rs, int bigEndian);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract int ce_ramsearch_set_previous_type(IntPtr rs, int previousType);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract int ce_ramsearch_remove_indices(IntPtr rs, long[] indices, long n);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract int ce_ramsearch_remove_addresses(IntPtr rs, ulong[] addresses, long n, int recordUndo);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract int ce_ramsearch_add_addresses(IntPtr rs, ulong[] addresses, long n, int append);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract int ce_ramsearch_convert_to(IntPtr rs, int size);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract int ce_ramsearch_sort(IntPtr rs, int column, int reverse, int display);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract long ce_ramsearch_out_of_range_count(IntPtr rs);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract int ce_ramsearch_remove_out_of_range(IntPtr rs);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract void ce_ramsearch_set_undo_enabled(IntPtr rs, int on);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract int ce_ramsearch_can_undo(IntPtr rs);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract int ce_ramsearch_can_redo(IntPtr rs);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract void ce_ramsearch_clear_history(IntPtr rs);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract long ce_ramsearch_undo(IntPtr rs);
+
+		[ChimeraImport(CallingConvention.Cdecl)]
+		public abstract long ce_ramsearch_redo(IntPtr rs);
+
 
 
 
@@ -684,6 +952,7 @@ namespace Chimera.Emulation.Common.Engine
 			{
 				throw new InvalidOperationException($"{LibName} speaks engine ABI v{abi}; this frontend speaks v1");
 			}
+			EngineProgress.Install(lib);
 			return lib;
 		}
 
@@ -700,6 +969,25 @@ namespace Chimera.Emulation.Common.Engine
 		/// <summary>Engine build provenance (JSON), for the frontend to show and movies to record.</summary>
 		public static string BuildInfo => PtrToStringUtf8(Instance.ce_build_info()) ?? "{}";
 
+		/// <summary>
+		/// The savestate format this build writes and reads (issue #115). A project records it,
+		/// so a whole cache of states can be explained at open rather than one refusal at a time.
+		/// </summary>
+		public static uint StateFormat => Instance.ce_state_format();
+
+		/// <summary>The build that wrote the states this session writes.</summary>
+		public static string StateWriterId => PtrToStringUtf8(Instance.ce_state_writer_id()) ?? "";
+
+		/// <summary>
+		/// Whether this Chimera and the core package a project runs on were built far enough
+		/// apart to be worth a word, and the word to say. Null when they are close enough or
+		/// when either side does not date itself. A heuristic, never a refusal: the engine owns
+		/// the threshold and the wording, this side only shows it.
+		/// </summary>
+		public static string? VersionSkew(string frontendDate, string frontendBuild, string coreDate, string coreBuild, string coreName)
+			=> PtrToStringUtf8(Instance.ce_version_skew(
+				frontendDate ?? "", frontendBuild ?? "", coreDate ?? "", coreBuild ?? "", coreName ?? ""));
+
 		/// <summary>The identity hash the frontend uses everywhere: SHA1, 40 uppercase hex chars.</summary>
 		public static string Sha1Hex(byte[] data)
 		{
@@ -707,6 +995,57 @@ namespace Chimera.Emulation.Common.Engine
 			Instance.ce_sha1_hex(data, (ulong)data.LongLength, buf);
 			return Encoding.ASCII.GetString(buf, 0, 40);
 		}
+
+		/// <summary>
+		/// The same hash of a file, taken by reading it rather than by holding
+		/// it: firmware can be a disk image, and one that does not fit in memory
+		/// still has an identity. Null when the file cannot be read.
+		/// </summary>
+		public static (string Sha1, long Length)? Sha1OfFile(string path)
+		{
+			var buf = new byte[41];
+			ulong len = 0;
+			if (Instance.ce_sha1_file(path, buf, ref len) is 0) return null;
+			return (Encoding.ASCII.GetString(buf, 0, 40), (long)len);
+		}
+
+		/// <summary>
+		/// A folder packed into one file whose bytes depend on its contents and
+		/// names and on nothing else, so that two people packing the same dump
+		/// get the same SHA1. The packing itself is the engine's: this hands it
+		/// the folder and marshals the progress callback back.
+		/// </summary>
+		/// <param name="format">0 zip (stored), 1 ISO 9660 + Joliet, 2 FAT12 floppy.</param>
+		/// <param name="progress">
+		/// (file, bytesDone, bytesTotal, filesDone, filesTotal) -> keep going.
+		/// Returning false cancels, and a cancelled pack leaves no file behind.
+		/// Called on the calling thread, which is not the UI thread.
+		/// </param>
+		public static bool MakeMedia(string folder, string outPath, int format,
+			Func<string, ulong, ulong, ulong, ulong, bool>? progress,
+			out string sha1, out string error)
+		{
+			MediaProgressFn? shim = null;
+			var handle = IntPtr.Zero;
+			if (progress is not null)
+			{
+				shim = (file, done, total, filesDone, filesTotal, _) =>
+					progress(PtrToStringUtf8(file) ?? "", done, total, filesDone, filesTotal) ? 1 : 0;
+				handle = Marshal.GetFunctionPointerForDelegate(shim);
+			}
+
+			var ok = Instance.ce_media_make(folder, outPath, format, handle, IntPtr.Zero) is not 0;
+			// the delegate must outlive the call it was handed to
+			GC.KeepAlive(shim);
+
+			sha1 = ok ? PtrToStringUtf8(Instance.ce_media_last_sha1()) ?? "" : "";
+			error = ok ? "" : PtrToStringUtf8(Instance.ce_media_last_error()) ?? "the pack failed";
+			return ok;
+		}
+
+		[UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+		private delegate int MediaProgressFn(IntPtr file, ulong bytesDone, ulong bytesTotal,
+			ulong filesDone, ulong filesTotal, IntPtr user);
 
 		public static unsafe string? PtrToStringUtf8(IntPtr p)
 		{
@@ -764,23 +1103,28 @@ namespace Chimera.Emulation.Common.Engine
 			return false;
 		}
 
-		public long Count => ChimeraEngine.Instance.ce_movie_log_count(_log);
+		// Every member below answers as an EMPTY log once this one is freed. A finalizer can reach a
+		// log another finalizer already freed - their order is the runtime's - and handing the engine
+		// a null log killed the process on its way out (a headless run that ended on an error).
+		private bool Freed => _log == IntPtr.Zero;
+
+		public long Count => Freed ? 0 : ChimeraEngine.Instance.ce_movie_log_count(_log);
 
 		public string this[long index]
-			=> ChimeraEngine.PtrToStringUtf8(ChimeraEngine.Instance.ce_movie_log_entry(_log, index))
+			=> (Freed ? null : ChimeraEngine.PtrToStringUtf8(ChimeraEngine.Instance.ce_movie_log_entry(_log, index)))
 				?? throw new ArgumentOutOfRangeException(nameof(index));
 
-		public void Add(string entry) => ChimeraEngine.Instance.ce_movie_log_add(_log, entry);
+		public void Add(string entry) { if (!Freed) ChimeraEngine.Instance.ce_movie_log_add(_log, entry); }
 
-		public void Set(long index, string entry) => ChimeraEngine.Instance.ce_movie_log_set(_log, index, entry);
+		public void Set(long index, string entry) { if (!Freed) ChimeraEngine.Instance.ce_movie_log_set(_log, index, entry); }
 
-		public void Insert(long index, string entry) => ChimeraEngine.Instance.ce_movie_log_insert(_log, index, entry);
+		public void Insert(long index, string entry) { if (!Freed) ChimeraEngine.Instance.ce_movie_log_insert(_log, index, entry); }
 
-		public void RemoveRange(long index, long count) => ChimeraEngine.Instance.ce_movie_log_remove_range(_log, index, count);
+		public void RemoveRange(long index, long count) { if (!Freed) ChimeraEngine.Instance.ce_movie_log_remove_range(_log, index, count); }
 
-		public void Truncate(long count) => ChimeraEngine.Instance.ce_movie_log_truncate(_log, count);
+		public void Truncate(long count) { if (!Freed) ChimeraEngine.Instance.ce_movie_log_truncate(_log, count); }
 
-		public void Clear() => ChimeraEngine.Instance.ce_movie_log_clear(_log);
+		public void Clear() { if (!Freed) ChimeraEngine.Instance.ce_movie_log_clear(_log); }
 
 		/// <summary>Replaces this log's entries and LogKey with another's, engine-side.</summary>
 		public void AssignFrom(EngineMovieLog source) => ChimeraEngine.Instance.ce_movie_log_assign(_log, source.Handle);
@@ -792,14 +1136,63 @@ namespace Chimera.Emulation.Common.Engine
 			return result < 0 ? null : result;
 		}
 
-		public bool HasStateFrame => ChimeraEngine.Instance.ce_movie_log_has_state_frame(_log) is not 0;
+		public bool HasStateFrame => !Freed && ChimeraEngine.Instance.ce_movie_log_has_state_frame(_log) is not 0;
 
-		public int StateFrame => ChimeraEngine.Instance.ce_movie_log_state_frame(_log);
+		public int StateFrame => Freed ? 0 : ChimeraEngine.Instance.ce_movie_log_state_frame(_log);
 
 		public string? Key
 		{
-			get => ChimeraEngine.PtrToStringUtf8(ChimeraEngine.Instance.ce_movie_log_key(_log));
-			set => ChimeraEngine.Instance.ce_movie_log_set_key(_log, value);
+			get => Freed ? null : ChimeraEngine.PtrToStringUtf8(ChimeraEngine.Instance.ce_movie_log_key(_log));
+			set { if (!Freed) ChimeraEngine.Instance.ce_movie_log_set_key(_log, value); }
+		}
+
+		/// <summary>
+		/// Journals every change of this log to <paramref name="path"/> from now on, after writing the
+		/// whole log there (ce_movie_log_journal_open). Calling it again rewrites the image and continues,
+		/// which is how the journal is kept short. False when the file could not be written.
+		/// </summary>
+		public bool JournalTo(string path, string? frontendImage = null)
+			=> ChimeraEngine.Instance.ce_movie_log_journal_open_with(_log, path, frontendImage) is 0;
+
+		/// <summary>
+		/// Appends one of the frontend's own records (its markers, its branches) to the journal, flushed and
+		/// synced exactly like an input change. Nothing happens when the log is not journaling.
+		/// </summary>
+		public void JournalNote(string record) { if (!Freed) ChimeraEngine.Instance.ce_movie_log_journal_note(_log, record); }
+
+		/// <summary>The frontend's records the last replay into this log found, in the order they were written.</summary>
+		public IReadOnlyList<string> JournalNotes
+		{
+			get
+			{
+				var count = ChimeraEngine.Instance.ce_movie_log_journal_note_count(_log);
+				List<string> notes = new((int)Math.Min(count, int.MaxValue));
+				for (long i = 0; i < count; i++)
+				{
+					notes.Add(ChimeraEngine.PtrToStringUtf8(ChimeraEngine.Instance.ce_movie_log_journal_note_at(_log, i)) ?? "");
+				}
+				return notes;
+			}
+		}
+
+		/// <summary>Stops journaling; <paramref name="remove"/> also deletes the journal (a session that ended cleanly).</summary>
+		public void JournalClose(bool remove) { if (!Freed) ChimeraEngine.Instance.ce_movie_log_journal_close(_log, remove ? 1 : 0); }
+
+		/// <summary>Whether changes are being journaled right now (a journal that could not be written stops).</summary>
+		public bool Journaling => !Freed && ChimeraEngine.Instance.ce_movie_log_journaling(_log) is not 0;
+
+		/// <summary>
+		/// A log rebuilt from a journal file - everything entered up to the moment the process ended -
+		/// or null with the reason when there is no journal to rebuild from.
+		/// </summary>
+		public static EngineMovieLog? FromJournal(string path, out string error)
+		{
+			EngineMovieLog log = new();
+			var records = ChimeraEngine.Instance.ce_movie_log_journal_replay(log._log, path);
+			error = ChimeraEngine.PtrToStringUtf8(ChimeraEngine.Instance.ce_movie_log_last_error(log._log)) ?? "";
+			if (records >= 0) return log;
+			log.Dispose();
+			return null;
 		}
 
 		/// <summary>The whole [Input] block, ready to write into a movie file.</summary>
@@ -1103,6 +1496,17 @@ namespace Chimera.Emulation.Common.Engine
 			}
 		}
 
+		/// <summary>
+		/// This project and no other, minted when it was created and carried in the
+		/// file. Everything regenerable that belongs to a project - the state
+		/// history, and where this machine last found its files - is kept in a
+		/// per-user cache keyed by this, so the .chimeraProject stays the one file
+		/// that has to travel. Stable across the file being renamed, moved, or
+		/// synced to another machine.
+		/// </summary>
+		public string Id
+			=> ChimeraEngine.PtrToStringUtf8(ChimeraEngine.Instance.ce_project_id(_project)) ?? "";
+
 		public string Title
 		{
 			get => ChimeraEngine.PtrToStringUtf8(ChimeraEngine.Instance.ce_project_title(_project)) ?? "";
@@ -1157,6 +1561,57 @@ namespace Chimera.Emulation.Common.Engine
 				ulong len = 0;
 				var p = ChimeraEngine.Instance.ce_project_firmware_text(_project, ref len);
 				return ChimeraEngine.PtrToStringUtf8(p, len);
+			}
+		}
+
+		/// <summary>
+		/// What the core compiled for this game: [{name, sha1}], one per object
+		/// (docs/compile-cache.md). Not the files, which regenerate; the list, so
+		/// that opening the project later can check it is the same compiled code.
+		/// </summary>
+		public string CoreCacheJson
+		{
+			get
+			{
+				ulong len = 0;
+				var p = ChimeraEngine.Instance.ce_project_core_cache_text(_project, ref len);
+				return ChimeraEngine.PtrToStringUtf8(p, len);
+			}
+		}
+
+		/// <exception cref="InvalidOperationException">not a JSON array</exception>
+		public void SetCoreCacheJson(string json)
+		{
+			var error = IntPtr.Zero;
+			if (ChimeraEngine.Instance.ce_project_set_core_cache_text(_project, json, ref error) is not 0)
+			{
+				throw new InvalidOperationException(ChimeraEngine.PtrToStringUtf8(error) ?? "bad coreCache");
+			}
+		}
+
+		/// <summary>
+		/// TAStudio's layout of the piano roll - columns, their order and widths, orientation, lag
+		/// display - as the JSON object TAStudio wrote; "" when the project has none. It travels with
+		/// the project (issue #83); the engine only keeps it.
+		/// </summary>
+		public string TAStudioJson
+		{
+			get
+			{
+				ulong len = 0;
+				var p = ChimeraEngine.Instance.ce_project_tastudio_text(_project, ref len);
+				return ChimeraEngine.PtrToStringUtf8(p, len) ?? "";
+			}
+		}
+
+		/// <summary>"" or null clears it.</summary>
+		/// <exception cref="InvalidOperationException">not a JSON object</exception>
+		public void SetTAStudioJson(string json)
+		{
+			var error = IntPtr.Zero;
+			if (ChimeraEngine.Instance.ce_project_set_tastudio_text(_project, json ?? "", ref error) is not 0)
+			{
+				throw new InvalidOperationException(ChimeraEngine.PtrToStringUtf8(error) ?? "bad tastudio layout");
 			}
 		}
 
@@ -1348,6 +1803,12 @@ namespace Chimera.Emulation.Common.Engine
 	/// the frontend's adapter. Frame data crosses as borrowed pointers the
 	/// caller copies out of before the next advance.
 	/// </summary>
+	/// <summary>
+	/// A precompile session: worker Index of Count; FirmwareToo sweeps the
+	/// firmware's libraries as well as the game's directories.
+	/// </summary>
+	public sealed record PrecompileRequest(int Index, int Count, bool FirmwareToo);
+
 	public sealed class EngineSession : IDisposable
 	{
 		private IntPtr _session;
@@ -1377,7 +1838,9 @@ namespace Chimera.Emulation.Common.Engine
 			string packagePath, byte[]? rom, string? romPath, string? settingsOverridesJson,
 			IReadOnlyDictionary<string, byte[]>? firmware,
 			IReadOnlyList<CoreFile>? extraFiles = null,
-			bool wantGpu = false)
+			bool wantGpu = false,
+			string? cacheDir = null,
+			PrecompileRequest? precompile = null)
 		{
 			var count = firmware?.Count ?? 0;
 			var ids = new IntPtr[Math.Max(count, 1)];
@@ -1425,6 +1888,10 @@ namespace Chimera.Emulation.Common.Engine
 				}
 				// a global switch, not a per-session one, so it is set every time
 				ChimeraEngine.Instance.ce_gl_request(wantGpu ? 1 : 0);
+				// the compile cache directory for this core and package (empty:
+				// none), and whether this session precompiles instead of running
+				ChimeraEngine.Instance.ce_cache_dir(cacheDir ?? "");
+				ChimeraEngine.Instance.ce_precompile_request(precompile?.Index ?? 0, precompile?.Count ?? 0, precompile?.FirmwareToo == true ? 1 : 0);
 				var error = IntPtr.Zero;
 				var session = ChimeraEngine.Instance.ce_session_open(
 					packagePath, rom, (ulong)(rom?.LongLength ?? 0), romPath, settingsOverridesJson,
@@ -1497,13 +1964,70 @@ namespace Chimera.Emulation.Common.Engine
 
 		public bool DriveLight(int index) => E.ce_session_drive_light(_session, index) is not 0;
 
+		/// <summary>How many images a drive can be given; zero for one that holds a fixed thing, and for most cores.</summary>
+		public int DriveMediaCount(int index) => E.ce_session_drive_media_count(_session, index);
+
+		public string DriveMediaName(int index, int media)
+			=> ChimeraEngine.PtrToStringUtf8(E.ce_session_drive_media_name(_session, index, media)) ?? "";
+
+		/// <summary>Where the drive's selector stands.</summary>
+		public int DriveMediaSelected(int index) => E.ce_session_drive_media_selected(_session, index);
+
+		/// <summary>Which image is actually in the drive, or -1 when it is empty.</summary>
+		public int DriveMediaInserted(int index) => E.ce_session_drive_media_inserted(_session, index);
+
 		public bool ButtonActive(int index) => E.ce_session_button_active(_session, index) is not 0;
 
 		public bool AxisActive(int index) => E.ce_session_axis_active(_session, index) is not 0;
 
 		/// <returns>true when the frame was a lag frame</returns>
+		/// <summary>Objects this session's core stored into the compile cache.</summary>
+		public ulong CacheStored => ChimeraEngine.Instance.ce_session_cache_stored(_session);
+
+		/// <summary>Objects this session's core fetched from the compile cache.</summary>
+		public ulong CacheFetched => ChimeraEngine.Instance.ce_session_cache_fetched(_session);
+
+		/// <summary>For a precompile session: whether the core has finished compiling its share.</summary>
+		public bool PrecompileDone => ChimeraEngine.Instance.ce_session_precompile_done(_session) == 1;
+
+		/// <summary>For a precompile session: module parts done and in total, for a progress bar.</summary>
+		public (uint Done, uint Total) PrecompileProgress
+		{
+			get
+			{
+				if (ChimeraEngine.Instance.ce_session_precompile_progress(_session, out var done, out var total) != 0) return (0, 0);
+				return (done, total);
+			}
+		}
+
+		/// <summary>
+		/// One frame; true when it was a lag frame. When the core's machine died during the frame, or
+		/// had already died, nothing ran: <see cref="Stopped"/> says why, and nothing more runs until a
+		/// state is loaded (a greenzone restore, a branch).
+		/// </summary>
+		/// <remarks>
+		/// A state, not an exception, and deliberately: a managed exception thrown from this frame, just
+		/// back from the engine, crashed Mono in its unwinder more often than not (the same exception
+		/// thrown one frame further up did not). The frontend raises <see cref="CoreStoppedException"/>
+		/// from its own frame instead.
+		/// </remarks>
 		public bool FrameAdvance(ulong buttons, bool render)
-			=> E.ce_session_frame_advance(_session, buttons, render ? 1 : 0) is not 0;
+		{
+			var lag = E.ce_session_frame_advance(_session, buttons, render ? 1 : 0);
+			if (lag < 0)
+			{
+				Stopped = GuestDeath ?? LastError;
+				return false;
+			}
+			Stopped = null;
+			return lag is not 0;
+		}
+
+		/// <summary>Why the last frame did not run - the core's machine is dead - or null when it ran.</summary>
+		public string? Stopped { get; private set; }
+
+		/// <summary>Why the core's machine died, or null while it lives.</summary>
+		public string? GuestDeath => ChimeraEngine.PtrToStringUtf8(E.ce_session_guest_death(_session));
 
 		/// <summary>Borrowed: the last rendered frame, BGRA, Width*Height ints.</summary>
 		public IntPtr VideoBuffer => E.ce_session_video(_session);
@@ -1530,6 +2054,32 @@ namespace Chimera.Emulation.Common.Engine
 			return p;
 		}
 
+		/// <summary>
+		/// The whole machine, streamed by the engine into a compressed file - never through a
+		/// managed array, which cannot be more than 2 GiB and which a PS3's state is (issue #84).
+		/// <paramref name="tag"/> is the caller's own few bytes, kept with it.
+		/// </summary>
+		public void SaveStateToFile(string path, byte[] tag)
+		{
+			if (E.ce_session_state_save_file(_session, path, tag, (uint) tag.Length) is not 0)
+			{
+				throw new InvalidOperationException(LastError);
+			}
+		}
+
+		/// <summary>Loads one back and returns its tag. Throws when the machine refuses it or the file is not one.</summary>
+		public byte[] LoadStateFromFile(string path)
+		{
+			var tag = new byte[256];
+			uint length = 0;
+			if (E.ce_session_state_load_file(_session, path, tag, (uint) tag.Length, ref length) is not 0)
+			{
+				throw new InvalidOperationException(LastError);
+			}
+			Array.Resize(ref tag, (int) Math.Min(length, (uint) tag.Length));
+			return tag;
+		}
+
 		public void LoadState(byte[] data, int length)
 		{
 			if (E.ce_session_load_state(_session, data, (ulong)length) is not 0)
@@ -1537,6 +2087,117 @@ namespace Chimera.Emulation.Common.Engine
 				throw new InvalidOperationException(LastError);
 			}
 		}
+
+		// ---- the state history (docs/state-manager.md) ----
+		//
+		// The engine keeps the history now, deltas, bands, spilling and all. The
+		// caller drives it because the caller owns the movie and the frame
+		// advance: BeforeAdvance marks the epoch before the machine moves,
+		// Capture stores the frame just reached, and Restore puts the machine on
+		// a stored frame and leaves the replay to whoever asked.
+
+		public void GreenzoneEnable(ulong budgetBytes) => E.ce_session_greenzone_enable(_session, budgetBytes);
+
+		public void GreenzoneDiskBudget(ulong budgetBytes) => E.ce_session_greenzone_disk_budget(_session, budgetBytes);
+
+		public void GreenzoneMaxNearStride(long maxStride) => E.ce_session_greenzone_max_near_stride(_session, maxStride);
+
+		public void GreenzoneBands(long nearFrames, long midFrames, long midStride, long farStride, long anchorSpacing)
+			=> E.ce_session_greenzone_bands(_session, nearFrames, midFrames, midStride, farStride, anchorSpacing);
+
+		public void GreenzoneSpillTo(string dir) => E.ce_session_greenzone_spill(_session, dir ?? "");
+
+		/// <summary>
+		/// Whether the far band could not be put on disk - a full disk, near
+		/// enough always. The history carries on by thinning in memory instead,
+		/// so this costs frames rather than the session, but it is the difference
+		/// between a greenzone going sparse for a reason and one doing it for no
+		/// reason anybody can see.
+		/// </summary>
+		public bool GreenzoneSpillFailed => E.ce_session_greenzone_spill_failed(_session) != 0;
+
+		public void GreenzonePin(long frame, bool pinned) => E.ce_session_greenzone_pin(_session, frame, pinned ? 1 : 0);
+
+		public void GreenzoneUnpinAll() => E.ce_session_greenzone_unpin_all(_session);
+
+		public long GreenzoneCount => E.ce_session_greenzone_count(_session);
+
+		/// <summary>
+		/// Which frame the engine believes the machine is on. Normally the
+		/// frontend's own count says the same thing; after a restore that could
+		/// not be walked it does not, because the engine puts the machine back on
+		/// a frame that did exist rather than leave it half way along a chain
+		/// (docs/state-manager.md). This is how the frontend follows it.
+		/// </summary>
+		public long Frame => E.ce_session_frame(_session);
+
+		/// <summary>The greatest stored frame at or before this one, or -1.</summary>
+		public long GreenzoneNearest(long frame) => E.ce_session_greenzone_nearest(_session, frame);
+
+		public void GreenzoneInvalidate(long afterFrame) => E.ce_session_greenzone_invalidate(_session, afterFrame);
+
+		public void GreenzoneBeforeAdvance() => E.ce_session_greenzone_before_advance(_session);
+
+		/// <summary>
+		/// Stores the frame just reached, with the caller's own bookkeeping for
+		/// it. The note rides along so it survives every invalidation, eviction,
+		/// coarsening and spill the history does; keeping it in a table here
+		/// would mean mirroring all of that.
+		/// </summary>
+		public void GreenzoneCapture(long frame, byte[]? note = null)
+			=> E.ce_session_greenzone_capture(_session, frame, note, (uint)(note?.Length ?? 0));
+
+		/// <summary>What was stored with that frame, or null.</summary>
+		public byte[]? GreenzoneNote(long frame)
+		{
+			var len = E.ce_session_greenzone_note(_session, frame, null, 0);
+			if (len is 0) return null;
+			var buf = new byte[len];
+			E.ce_session_greenzone_note(_session, frame, buf, len);
+			return buf;
+		}
+
+		/// <summary>False when that frame is not one the history can produce.</summary>
+		public bool GreenzoneRestore(long frame) => E.ce_session_greenzone_restore(_session, frame) is 0;
+
+		/// <summary>
+		/// Walks backwards towards a frame and answers with the one it reached.
+		/// Stops where the reverse deltas stop rather than failing, so the caller
+		/// compares what it got with what it asked for. -1 = it did not move.
+		/// </summary>
+
+		/// <summary>
+		/// The history across sessions. A history naming a different machine is
+		/// dropped rather than refused, so both of these say "it did not throw",
+		/// never "the states are there" - losing them costs replaying.
+		/// </summary>
+		public bool HistorySave(string path, string machineId)
+			=> E.ce_session_history_save(_session, path, machineId ?? "") is 0;
+
+		public bool HistoryLoad(string path, string machineId)
+			=> E.ce_session_history_load(_session, path, machineId ?? "") is 0;
+
+		/// <summary>
+		/// The same save, queued on the engine's writer instead of waited for.
+		///
+		/// Writing the history is the longest thing a project save does - up to
+		/// fourteen gigabytes under the default budgets - and it was happening on
+		/// the thread that runs the machine, every thirty minutes, because that is
+		/// how often TAStudio autosaves. The file describes the history as it
+		/// stands at this call; the run carries on while it is written.
+		/// </summary>
+		public bool HistorySaveLater(string path, string machineId)
+			=> E.ce_session_history_save_later(_session, path, machineId ?? "") is 0;
+
+		/// <summary>Whether a queued history save is still being written.</summary>
+		public bool HistorySavePending => E.ce_session_history_save_pending(_session) is not 0;
+
+		/// <summary>
+		/// Waits for a queued history save. True when it worked, and when there was
+		/// nothing queued - closing a project is where this belongs, because the
+		/// file has to be whole before the project is let go.
+		/// </summary>
+		public bool HistorySaveWait() => E.ce_session_history_save_wait(_session) is 0;
 
 		public int DomainCount => E.ce_session_domain_count(_session);
 		public string DomainName(int index) => ChimeraEngine.PtrToStringUtf8(E.ce_session_domain_name(_session, index)) ?? $"Domain {index}";
@@ -1779,5 +2440,40 @@ namespace Chimera.Emulation.Common.Engine
 			var n = ChimeraEngine.Instance.ce_subtitle_format_line(ref f, message, buf, (ulong)buf.LongLength);
 			return Encoding.UTF8.GetString(buf, 0, (int)n);
 		}
+	}
+
+	/// <summary>
+	/// How far along a slow thing is, from wherever it is being done - the engine
+	/// hashing a disc image, compressing a greenzone, fetching a boot's compiled
+	/// code, or a frontend step around those. One event, one shape: a stage in
+	/// words, and done over total, where a total of zero means the end is not
+	/// known. A progress window subscribes while it is up; nobody subscribed
+	/// costs a null check. Raised on the thread doing the work, which for the
+	/// engine is the caller's own, so a handler may pump the message loop and
+	/// must not call back into the engine.
+	/// </summary>
+	public static class EngineProgress
+	{
+		[UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+		private delegate void NativeFn(IntPtr stage, ulong done, ulong total, IntPtr user);
+
+		// kept alive for as long as the engine may call it, which is forever
+		private static readonly NativeFn _native = OnNative;
+		private static IntPtr _nativePtr;
+
+		public static event Action<string, ulong, ulong>? Reported;
+
+		internal static void Install(LibChimera lib)
+		{
+			if (_nativePtr == IntPtr.Zero) _nativePtr = Marshal.GetFunctionPointerForDelegate(_native);
+			lib.ce_progress_set(_nativePtr, IntPtr.Zero);
+		}
+
+		private static void OnNative(IntPtr stage, ulong done, ulong total, IntPtr user)
+			=> Reported?.Invoke(ChimeraEngine.PtrToStringUtf8(stage) ?? "", done, total);
+
+		/// <summary>A step the frontend itself is taking, in the same stream as the engine's.</summary>
+		public static void Report(string stage, ulong done = 0, ulong total = 0)
+			=> Reported?.Invoke(stage, done, total);
 	}
 }

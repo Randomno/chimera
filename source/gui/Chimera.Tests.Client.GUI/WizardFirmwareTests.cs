@@ -24,7 +24,7 @@ namespace Chimera.Tests.Client.GUI
 			Directory.CreateDirectory(_dir);
 		}
 
-		[ClassCleanup]
+		[ClassCleanup(ClassCleanupBehavior.EndOfClass)]
 		public static void RemovePlayground() => Directory.Delete(_dir, recursive: true);
 
 		private static NewProjectWizard MakeForm(out string dir)
@@ -97,5 +97,70 @@ namespace Chimera.Tests.Client.GUI
 			form.ProvideFirmware("bios", good);
 			Assert.IsTrue(form.CreateEnabled, "every requirement satisfied - Create returns");
 		}
-	}
+	
+		/// <summary>
+		/// xemu declares four files and pins a hash to none of them: an Xbox
+		/// disk image and a console's own dumps are not files two people share.
+		/// The page found firmware by hash and by nothing else, so all four read
+		/// "not found" with the files sitting in the Firmware folder under
+		/// exactly the names the page was showing, and every xemu project asked
+		/// for all four by hand (issue #38).
+		/// </summary>
+		[TestMethod]
+		public void ADeclarationThatPinsNoHashIsFoundByItsDeclaredName()
+		{
+			using var form = MakeForm(out var dir);
+			File.WriteAllText(Path.Combine(dir, "Mcpx_1.0.bin"), "the secret 512");
+			File.WriteAllText(Path.Combine(dir, "some other file.bin"), "not firmware");
+			var index = FirmwareLocator.BuildIndex([ dir ]);
+
+			var cfg = TestPackages.Config("""
+				{
+				  "coreName": "xemu", "systemId": "XBOX",
+				  "video": { "width": 640, "height": 480 },
+				  "audio": { "samplesPerFrame": 800 },
+				  "input": { "buttons": [] },
+				  "firmware": [
+				    { "id": "mcpx", "display": "MCPX Boot ROM", "size": 512, "name": "mcpx_1.0.bin" },
+				    { "id": "hdd", "display": "Hard Disk Image", "name": "xbox_hdd.qcow2" }
+				  ]
+				}
+				""");
+			form.UseFirmwareNeeds(cfg, [ ("mcpx", 0), ("hdd", 1) ], index);
+
+			Assert.IsTrue(form.FirmwareSatisfied("mcpx"), "the declared name found it, case and all");
+			StringAssert.Contains(form.ChosenFirmwarePath("mcpx"), "Mcpx_1.0.bin");
+			Assert.IsFalse(form.FirmwareSatisfied("hdd"), "and one that is not there is still not there");
+			Assert.IsFalse(form.CreateEnabled);
+		}
+
+		[TestMethod]
+		public void OptionalFirmwareDoesNotExistSoADiscMustAskForThePup()
+		{
+			// RPCS3 declared the PUP "required": false, meaning "homebrew boots
+			// without it". The engine has no such idea - firmware.cpp: "every
+			// applying entry is REQUIRED ... and optional firmware does not
+			// exist" - so the key was ignored, while the WIZARD honoured it and
+			// let a disc project through with no PUP chosen. The config then got
+			// no entry and every precompile session was refused at boot, silently.
+			// "only discs need this" is spelt requiredWhen, as every other core
+			// spells it.
+			const string decl = """
+				[ { "id": "PS3UPDAT.PUP", "name": "PS3UPDAT.PUP",
+				    "requiredWhen": { "slot": "game", "extension": "iso" } } ]
+				""";
+			string Slots(string file) =>
+				Newtonsoft.Json.JsonConvert.SerializeObject(
+					new Dictionary<string, string[]> { [ "game" ] = [ file ] });
+
+			var forDisc = Chimera.Emulation.Common.Engine.EngineFirmware.Evaluate(
+				decl, Slots("gta.iso"), "{}");
+			Assert.AreEqual(1, forDisc.Count, "a disc needs the system software");
+			Assert.AreEqual("PS3UPDAT.PUP", forDisc[0].Id);
+
+			var forHomebrew = Chimera.Emulation.Common.Engine.EngineFirmware.Evaluate(
+				decl, Slots("hello.elf"), "{}");
+			Assert.AreEqual(0, forHomebrew.Count, "homebrew boots without it");
+		}
+}
 }

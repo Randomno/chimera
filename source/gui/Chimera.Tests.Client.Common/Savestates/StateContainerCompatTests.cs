@@ -41,7 +41,7 @@ namespace Chimera.Tests.Client.Common.Savestates
 			}
 			PutText("ChimeraState 1.0", "3\n");
 			PutText("ChimeraVersion.txt", "2.10 (legacy)\n");
-			PutText("Header.txt", "MovieVersion Chimera Tasproj v1.1\n\n");
+			PutText("Header.txt", "MovieVersion Chimera Project File v1.1\n\n");
 
 			// zstd lump the old way: stored entry, STREAMING compression (frames
 			// with no content size in the header - the engine must cope)
@@ -63,7 +63,7 @@ namespace Chimera.Tests.Client.Common.Savestates
 				using var loader = ZipStateLoader.LoadAndDetect(path);
 				Assert.IsNotNull(loader);
 				Assert.AreEqual(3, loader.Version);
-				byte[] read = null;
+				byte[]? read = null;
 				Assert.IsTrue(loader.GetLump(BinaryStateLump.Corestate, abort: false, br => read = br.ReadBytes(coreState.Length + 1)));
 				CollectionAssert.AreEqual(coreState, read, "streaming-compressed zstd lump survived");
 				var header = "";
@@ -105,7 +105,7 @@ namespace Chimera.Tests.Client.Common.Savestates
 				var create = ZipStateSaver.Create(path, compressionLevel: 5);
 				Assert.IsFalse(create.IsError);
 				var saver = create.Value!;
-				saver.PutLump(BinaryStateLump.Movieheader, (TextWriter tw) => tw.Write("MovieVersion Chimera Tasproj v1.1\n\n"));
+				saver.PutLump(BinaryStateLump.Movieheader, (TextWriter tw) => tw.Write("MovieVersion Chimera Project File v1.1\n\n"));
 				saver.PutLump(BinaryStateLump.Corestate, (BinaryWriter bw) => bw.Write(coreState));
 				Assert.IsFalse(saver.CloseAndDispose().IsError);
 
@@ -142,7 +142,7 @@ namespace Chimera.Tests.Client.Common.Savestates
 
 				using var loader = ZipStateLoader.LoadAndDetect(path);
 				Assert.IsNotNull(loader);
-				byte[] read = null;
+				byte[]? read = null;
 				loader.GetCoreState(br => read = br.ReadBytes(coreState.Length + 1), tr => { });
 				CollectionAssert.AreEqual(coreState, read);
 			}

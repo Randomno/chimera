@@ -8,7 +8,7 @@ namespace Chimera.Tests.Client.Common
 	[TestClass]
 	public class ProjectFolderScanTests
 	{
-		private static string _dir;
+		private static string _dir = "";
 
 		[ClassInitialize]
 		public static void MakePlayground(TestContext _)
@@ -17,7 +17,7 @@ namespace Chimera.Tests.Client.Common
 			Directory.CreateDirectory(_dir);
 		}
 
-		[ClassCleanup]
+		[ClassCleanup(ClassCleanupBehavior.EndOfClass)]
 		public static void RemovePlayground() => Directory.Delete(_dir, recursive: true);
 
 		/// <summary>a saved two-file project whose files live nowhere near it</summary>
@@ -42,7 +42,10 @@ namespace Chimera.Tests.Client.Common
 			p.Save(path);
 			// the scan must do the finding: the originals go away
 			Directory.Delete(srcDir, recursive: true);
-			File.Delete(ProjectLocalPaths.PathFor(path));
+			// and so does the record of where they were, or the scan is answered
+			// before it starts
+			var remembered = ProjectLocalPaths.PathFor(p);
+			if (File.Exists(remembered)) File.Delete(remembered);
 			return path;
 		}
 

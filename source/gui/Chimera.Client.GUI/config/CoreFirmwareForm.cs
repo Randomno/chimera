@@ -6,6 +6,7 @@ using System.IO;
 using System.Linq;
 using System.Windows.Forms;
 
+using Chimera.Common.PathExtensions;
 using Chimera.Client.Common;
 
 namespace Chimera.Client.GUI
@@ -20,7 +21,7 @@ namespace Chimera.Client.GUI
 	/// package what it wants, checks that what the user chose is the right size and
 	/// a known dump, and remembers where it is.
 	///
-	/// Like <see cref="OpenCoreForm"/> this window is deliberately thin: the
+	/// Like <see cref="CoreManagerForm"/> this window is deliberately thin: the
 	/// rows and their verdicts come from <see cref="CoreFirmwareStore"/>, which is
 	/// tested without a UI, and choosing a file is handed back to the owner.
 	/// </summary>
@@ -235,11 +236,13 @@ namespace Chimera.Client.GUI
 			{
 				Title = $"{entry.CoreName}: {entry.Decl.DisplayName}",
 				Filter = "All Files|*.*",
-				FileName = entry.Path,
+				// "" and null mean the same thing to the dialog, which answers ""
+				// either way; saying "" keeps what it answers a string
+				FileName = entry.Path ?? "",
 				InitialDirectory = entry.Path is null ? "" : Path.GetDirectoryName(entry.Path) ?? "",
 			};
 			if (ofd.ShowDialog(this) is not DialogResult.OK) return;
-			_setPath(entry, ofd.FileName);
+			_setPath(entry, ofd.FileName.WithoutWslgMirror());
 			Populate();
 		}
 

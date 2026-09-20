@@ -25,6 +25,8 @@ using Chimera.Common.StringExtensions;
 using Chimera.Client.Common;
 
 using Chimera.Emulation.Common;
+using Chimera.Emulation.Common.Engine;
+using Chimera.Emulation.Common.Waterbox;
 
 using Chimera.Client.GUI.ToolExtensions;
 using Chimera.Client.GUI.CoreExtensions;
@@ -92,6 +94,39 @@ namespace Chimera.Client.GUI
 				MainFormContextMenu.Items.Insert(1, new ToolStripSeparatorEx());
 			}
 
+			OfferTheCoreManagerIfNothingIsInstalled();
+		}
+
+		/// <summary>
+		/// A Chimera with no core cannot open anything, and it ships with none. So
+		/// it says so once, and offers to do something about it. Not the manager
+		/// itself: opening a window somebody did not ask for, over an application
+		/// they have not seen yet, is a worse greeting than a sentence explaining
+		/// why the menus will not help them.
+		///
+		/// Never when there is nobody to answer. HEADLESS is the case that matters:
+		/// a witness bootstraps its config by running the frontend with no rom, no
+		/// core and no project, which is precisely the shape this would otherwise
+		/// interrupt - and a modal in a headless run does not get dismissed, it
+		/// gets timed out. (quickernes' gate, first run after this window was
+		/// added: "no meta produced".)
+		///
+		/// Nor when a core package, a rom or a project was named on the command
+		/// line: whoever did that has already said what they want.
+		/// </summary>
+		private void OfferTheCoreManagerIfNothingIsInstalled()
+		{
+			if (HeadlessMode.Enabled) return;
+			if (_discoveredCorePackages.Count is not 0) return;
+			if (_argParser.cmdCorePackage is not null || _argParser.cmdRom is not null || _argParser.cmdProject is not null) return;
+			if (CoreRoster.Read().Count is 0) return; // nothing to offer; a window saying so would only be rude
+
+			// after the main window is up, so the dialog has something to sit over
+			BeginInvoke((Action) (() =>
+			{
+				using CoreManagerPrompt prompt = new();
+				if (this.ShowDialogWithTempMute(prompt).IsOk()) ShowCoreManager();
+			}));
 		}
 
 		static MainForm()
@@ -361,17 +396,34 @@ namespace Chimera.Client.GUI
 
 			var savedOutputMethod = Config.SoundOutputMethod;
 			if (savedOutputMethod is ESoundOutputMethod.Dummy) Config.SoundOutputMethod = ESoundOutputMethod.OpenAL;
+			// A precompile session plays nothing, so it has no business opening a
+			// device - and the wizard runs eight of them at once. It never saves
+			// its config, so this does not follow the person into their next session.
+			if (_argParser.cmdPrecompile is not null) Config.SoundOutputMethod = ESoundOutputMethod.Dummy;
 			try
 			{
 				Sound = new Sound(Config, () => Emulator.VsyncRate());
 			}
 			catch
 			{
-				if (savedOutputMethod is not ESoundOutputMethod.Dummy)
+				const string noDevice = "Couldn't initialize sound device! Try changing the output method in Sound config.";
+				if (savedOutputMethod is ESoundOutputMethod.Dummy)
+				{
+					// said once already, when it last failed
+				}
+				else if (HeadlessMode.Enabled)
+				{
+					// Silence is the fallback either way, so the run carries on and
+					// nothing is lost; a headless run that died here instead turned a
+					// machine with no working sound (WSL, issue #78) into one that could
+					// not compile a game at all.
+					HeadlessMode.LogSuppressedWarning(noDevice);
+				}
+				else
 				{
 					ShowMessageBox(
 						owner: null,
-						text: "Couldn't initialize sound device! Try changing the output method in Sound config.",
+						text: noDevice,
 						caption: "Initialization Error",
 						EMsgBoxIcon.Error);
 				}
@@ -408,11 +460,34 @@ namespace Chimera.Client.GUI
 			// What is in Cores/ is only LISTED here - opening a core is something you do,
 			// like opening a rom (File > Open Core). The scan runs in the constructor
 			// because the commandline load a few lines below needs the list to exist.
+			// The compile cache (docs: a core's compiled objects, kept between
+			// sessions under the Compile Cache path). A precompile session is this
+			// same frontend as a child process; it installs no hook of its own.
+			// Not a configurable path: it is regenerable per-user data, so it lives
+			// where the core store and the project caches do rather than wherever
+			// somebody's config last said (see CacheStore).
+			CacheStore.AdoptLegacy();
+			WaterboxCore.CoreCacheRoot = CacheStore.PrecompiledCode;
+			if (_argParser.cmdPrecompile is { } precompileSpec)
+			{
+				var parts = precompileSpec.Split('/');
+				var preIndex = -1;
+				var preCount = 0;
+				if (parts.Length >= 2) { int.TryParse(parts[0], out preIndex); int.TryParse(parts[1], out preCount); }
+				if (preIndex < 0 || preCount < 1 || preIndex >= preCount)
+				{
+					Console.Error.WriteLine($"bad --precompile {precompileSpec} (want INDEX/COUNT[/game])");
+					Environment.Exit(2);
+				}
+				WaterboxCore.PrecompileRequest = new(preIndex, preCount, FirmwareToo: !parts.Skip(2).Contains("game"));
+			}
 			ScanForCorePackages();
 			// the menus built at construction time predate the packages
 
 			Console.WriteLine($"Chimera {VersionInfo.GetEmuVersion()}");
 
+			// several builds of one core may be registered; the config says which one was chosen
+			CoreRegistry.Instance.ChosenBuildOf = name => Config.DefaultCoreBuilds.TryGetValue(name, out var sha1) ? sha1 : null;
 			if (_argParser.cmdCorePackage != null && !LoadCorePackage(_argParser.cmdCorePackage))
 			{
 				ShowMessageBox(owner: null, $"Failed to load core package {_argParser.cmdCorePackage} specified on commandline");
@@ -438,6 +513,41 @@ namespace Chimera.Client.GUI
 					if (Game.IsNullInstance())
 					{
 						ShowMessageBox(owner: null, $"Failed to load {_argParser.cmdRom} specified on commandline");
+					}
+					else if (WaterboxCore.PrecompileRequest is { } request)
+					{
+						// a precompile session: pump the core until it has compiled
+						// its share, one progress line per change, then leave
+						if (!Emulator.ServiceProvider.HasService<ICorePrecompile>())
+						{
+							Console.Error.WriteLine($"{Emulator.Attributes().CoreName} has no precompile session");
+							Environment.Exit(3);
+						}
+						var pre = Emulator.AsPrecompile();
+						// A redirected stdout is block-buffered, and a progress line
+						// held until the process exits is not progress: whoever
+						// started this session is watching for these.
+						Console.SetOut(new StreamWriter(Console.OpenStandardOutput()) { AutoFlush = true });
+						Console.Error.WriteLine($"precompile session {request.Index} of {request.Count}: cache {WaterboxCore.CoreCacheRoot}");
+						uint lastDone = uint.MaxValue;
+						while (!pre.PrecompileDone)
+						{
+							Emulator.FrameAdvance(InputManager.ControllerOutput, false, false);
+							if (Emulator is ICoreStops { CoreStopped: { } stoppedWhy })
+							{
+								// nobody watches a precompile session, and it would pump a dead machine for ever
+								Console.Error.WriteLine($"precompile session {request.Index} of {request.Count}: the core stopped: {stoppedWhy}");
+								Environment.Exit(HeadlessMode.EXIT_CODE_CORE_STOPPED);
+							}
+							var (done, total) = pre.PrecompileProgress;
+							if (done != lastDone) { Console.WriteLine($"Precompiled {done}/{total} modules"); lastDone = done; }
+						}
+						var (fdone, ftotal) = pre.PrecompileProgress;
+						Console.WriteLine($"Precompiled {fdone}/{ftotal} modules");
+						Console.WriteLine($"precompile session {request.Index} of {request.Count}: {pre.CacheStored} objects stored, {pre.CacheFetched} fetched");
+						// leave the way a script does: the run loop closes the window
+						// and the process exits with its code, nothing torn down early
+						_exitRequestPending = true;
 					}
 				}
 			}
@@ -600,11 +710,26 @@ namespace Chimera.Client.GUI
 				StopAv();
 			}
 
-			TryAgainResult configSaveResult = this.DoWithTryAgainBox(() => SaveConfig(), "Failed to save config file.");
-			if (configSaveResult == TryAgainResult.Canceled)
+			// A precompile session does not rewrite the config. It was started to
+			// fill a cache, it changed nothing anybody asked to keep, and several
+			// of them run at once: eight closing together raced for
+			// config.saving.ini, and whichever lost it died with "the process
+			// cannot access the file", which is not a sentence about compiling a
+			// game (found 2026-09-12, one of eight).
+			//
+			// Only a precompile session, not every headless one. A headless run
+			// that opens a core DOES have something to keep - it adopts the
+			// package's default bindings into the config, which the synthetic
+			// witness reads back (K:box:keybinds), and skipping the write left the
+			// frontend with no bindings at all.
+			if (_argParser.cmdPrecompile is null)
 			{
-				closingArgs.Cancel = true;
-				return;
+				TryAgainResult configSaveResult = this.DoWithTryAgainBox(() => SaveConfig(), "Failed to save config file.");
+				if (configSaveResult == TryAgainResult.Canceled)
+				{
+					closingArgs.Cancel = true;
+					return;
+				}
 			}
 
 			if (!CloseGame())
@@ -658,14 +783,31 @@ namespace Chimera.Client.GUI
 
 			for (; ; )
 			{
+				// A seek is the same situation with a window attached. Its frames go
+				// by faster than anybody can look, and this loop was spending as much
+				// on each of them as the core did - the piano roll refreshed, the frame
+				// presented, the message pump run, per frame, on a core whose frame is
+				// three milliseconds. Measured with CHIMERA_LOOP_TRACE: a Game Boy seek
+				// at 5.9 ms a frame of which 3.0 was the machine. So a seek serves the
+				// host on the headless cadence too: sixty times a second the window is
+				// live, shows where the seek has got to and takes a click to stop it;
+				// the frames in between are emulated and nothing else. The destination
+				// frame is always drawn and always shown (StepRunLoop_Core).
 				bool serviceHost = true;
-				if (headless)
+				if (headless || IsSeeking)
 				{
 					var now = DateTime.UtcNow;
 					serviceHost = (now - lastHostServiceTime).TotalMilliseconds >= 16.0;
 					if (serviceHost) lastHostServiceTime = now;
 				}
+				_seekQuiet = IsSeeking && !serviceHost;
+				if (serviceHost) LoopTrace.Served();
+				// the open project's work, kept recoverable (rate-limited inside)
+				if (serviceHost) _recovery?.Tick();
+				// the frame a crash note names; one write, whatever the loop is doing
+				CrashCapture.NoteFrame(Emulator.Frame);
 
+				long loopStarted = LoopTrace.Enabled ? Stopwatch.GetTimestamp() : 0;
 				if (serviceHost) Input.Instance.Update();
 
 				// handle events and dispatch as a hotkey action, or a hotkey button, or an input button
@@ -732,22 +874,68 @@ namespace Chimera.Client.GUI
 				}
 
 				InputManager.RunControllerChain(Config);
+				NoteThatPlaybackOwnsTheInput();
 
 				// emu.yield()'ing scripts
 				if (Tools.Has<LuaConsole>())
 				{
 					Tools.LuaConsole.ResumeScripts(false);
 				}
-				StepRunLoop_Core();
+				LoopTrace.Add(LoopTrace.Top, loopStarted);
+				long phaseStarted = LoopTrace.Enabled ? Stopwatch.GetTimestamp() : 0;
+				try
+				{
+					StepRunLoop_Core();
+				}
+				catch (Exception ex) when (!Debugger.IsAttached)
+				{
+					// A frame that throws - the core, the movie, a tool - pauses the session instead of
+					// ending it. Headless runs still fail, loudly, once the work is kept.
+					KeepWorkSafe();
+					if (HeadlessMode.Enabled)
+					{
+						// A core whose machine died is not an error IN Chimera, and a run nobody watches has
+						// nobody to ask: say why, keep the journal, and end the ordinary way - rethrowing it
+						// through the run loop took the process down in the runtime on its way out.
+						if ((ex as CoreStoppedException ?? ex.GetBaseException() as CoreStoppedException) is not { } stopped) throw;
+						Console.Error.WriteLine($"[headless] The core stopped: {stopped.Reason}");
+						CloseKeepingRecovery(HeadlessMode.EXIT_CODE_CORE_STOPPED);
+					}
+					else
+					{
+						RecoverFromError(ex, "Emulation stopped on an error");
+					}
+				}
+				LoopTrace.Add(LoopTrace.Core, phaseStarted);
+				phaseStarted = LoopTrace.Enabled ? Stopwatch.GetTimestamp() : 0;
 				if (serviceHost) Render();
+				LoopTrace.Add(LoopTrace.Render, phaseStarted);
+				phaseStarted = LoopTrace.Enabled ? Stopwatch.GetTimestamp() : 0;
 				StepRunLoop_Throttle();
+				LoopTrace.Add(LoopTrace.Throttle, phaseStarted);
 
+				phaseStarted = LoopTrace.Enabled ? Stopwatch.GetTimestamp() : 0;
 				if (serviceHost) CheckMessages();
+				LoopTrace.Add(LoopTrace.Messages, phaseStarted);
 
 				if (_exitRequestPending)
 				{
 					_exitRequestPending = false;
 					Close();
+					/* An unattended close that is REFUSED would otherwise spin
+					 * here forever: the request is spent, the window is still
+					 * up, and nothing will ask again. Whatever cancelled it
+					 * wanted an answer nobody is there to give, so name it and
+					 * stop rather than hang - the same bargain HeadlessMode
+					 * makes, and the same exit code, because it is the same
+					 * situation with a window attached. */
+					if (ShutdownIsUnattended && !IsDisposed && !_windowClosedAndSafeToExitProcess)
+					{
+						Console.Error.WriteLine("[chimera] an unattended shutdown was refused by a window "
+							+ "that wanted an answer; leaving anyway");
+						_exitCode = HeadlessMode.EXIT_CODE_DIALOG;
+						break;
+					}
 				}
 
 				if (IsDisposed || _windowClosedAndSafeToExitProcess)
@@ -849,6 +1037,14 @@ namespace Chimera.Client.GUI
 		public bool IsSeeking => PauseOnFrame.HasValue;
 		private bool IsTurboSeeking => PauseOnFrame.HasValue && Config.TurboSeek;
 
+		/// <summary>
+		/// A frame of a seek that nobody is going to see: the run loop is between
+		/// two services of the host (ProgramRunLoop), so the frame is not drawn, not
+		/// presented and the tools get their fast update only - exactly what a turbo
+		/// seek does to every frame on its way. Never true for the seek's last frame.
+		/// </summary>
+		private bool _seekQuiet;
+
 		// An encode runs as fast as the machine will go, and gets turbo's cheap tool
 		// updates for the same reason a turbo seek does: nobody is watching it.
 		public bool IsTurboing => InputManager.ClientControls["Turbo"] || IsTurboSeeking || IsEncodingVideo;
@@ -859,6 +1055,33 @@ namespace Chimera.Client.GUI
 		/// Used to disable secondary throttling (e.g. vsync, audio) for unthrottled modes or when the primary (clock) throttle is taking over (e.g. during fast forward/rewind).
 		/// </summary>
 		public static bool DisableSecondaryThrottling { get; set; }
+
+		/// <summary>
+		/// When the machine is replaying a movie, the LOG is the input and a hand on
+		/// the pad changes nothing - which is right, and was invisible: a person
+		/// pressing buttons at a game that ignores them has no way to tell that from
+		/// a bug, and reported one (issue #95). Say it, at most once every few
+		/// seconds, and only while something is actually being held.
+		/// </summary>
+		private void NoteThatPlaybackOwnsTheInput()
+		{
+			if (MovieSession.Movie is not { } movie || !movie.IsPlaying()) return;
+			if ((DateTime.UtcNow - _lastPlaybackInputNote).TotalSeconds < 6) return;
+			var held = InputManager.ActiveController;
+			var definition = held?.Definition;
+			if (definition is null) return;
+			foreach (var button in definition.BoolButtons)
+			{
+				if (!held.IsPressed(button)) continue;
+				_lastPlaybackInputNote = DateTime.UtcNow;
+				AddOnScreenMessage(Tools.IsLoaded<TAStudio>()
+					? "Playing back: the movie's input is in charge. Tick Recording mode to type your own."
+					: "Playing back: the movie's input is in charge.");
+				return;
+			}
+		}
+
+		private DateTime _lastPlaybackInputNote = DateTime.MinValue;
 
 		public void AddOnScreenMessage(string message, [LiteralExpected] int? duration = null)
 		{
@@ -1523,6 +1746,10 @@ namespace Chimera.Client.GUI
 				GenericCoreSubMenu.DropDownItems.Add(firmwareMenuItem);
 			}
 
+			// Compiled code is no longer emptied from here. It is filed per game
+			// rather than per core now, so "clear what this core compiled" is not
+			// a thing that can be pointed at: Tools > Pre-Compiled Modules...
+			// lists the games and removes them one at a time.
 			if (Emulator.SystemId is VSystemID.Raw.NULL) return; // a core, but no machine running yet
 
 			// The way OUT for what this machine keeps (docs/save-data.md): present
@@ -1850,7 +2077,7 @@ namespace Chimera.Client.GUI
 		public IReadOnlyList<(DiscoveredCorePackage Package, string Error)> CorePackageLoadFailures => _corePackageLoadFailures;
 
 		/// <summary>Loads and registers a core package (dir or zip). Returns false (after telling the user) on failure.</summary>
-		public bool LoadCorePackage(string path)
+		public bool LoadCorePackage(string path, bool chooseBuild = true)
 		{
 			try
 			{
@@ -1863,6 +2090,9 @@ namespace Chimera.Client.GUI
 				foreach (var factory in factories)
 				{
 					foreach (var sysID in factory.SystemIds) CoreChoices.MakeDefault(Config, sysID, factory.CoreName);
+					// and which BUILD of it, when several are installed - unless this is a project
+					// loading the build it pins, which is not a choice anybody made
+					if (chooseBuild && packageSha1 is not null) CoreChoices.MakeDefaultBuild(Config, factory.CoreName, packageSha1);
 				}
 					AddOnScreenMessage(packageSha1 is null
 					? $"Loaded core package: {manifest.Name} (directory form, unhashed)"
@@ -2141,7 +2371,13 @@ namespace Chimera.Client.GUI
 					label.Image = lights.DriveLightOn(i)
 						? _statusBarDiskLightOnImage
 						: _statusBarDiskLightOffImage;
-					label.ToolTipText = lights.DriveLightName(i);
+					// WHICH image, for a drive that swaps: the one that is in, and the one the
+					// selector is on when that is another. Asked as the bar is painted because it
+					// is the running machine's state - a rewind takes it back with everything else.
+					var media = lights.DriveMediaOf(i);
+					var text = media is null ? "" : DriveMediaText.Short(media);
+					if (label.Text != text) label.Text = text; // a status bar that is re-laid-out every frame flickers
+					label.ToolTipText = media is null ? lights.DriveLightName(i) : DriveMediaText.Long(lights.DriveLightName(i), media);
 					label.Visible = true;
 				}
 				for (int i = lights.DriveLightCount; i < _extraDriveLights.Count + 1; i++)
@@ -2311,6 +2547,16 @@ namespace Chimera.Client.GUI
 			}
 		}
 
+		/// <summary>
+		/// A frame the core's machine died in did not run, and the frontend says so HERE, from its own
+		/// frame: thrown from the emulator's frame advance, just back from the engine, the same exception
+		/// crashed Mono in its unwinder more often than not.
+		/// </summary>
+		private void ThrowIfCoreStopped()
+		{
+			if (Emulator is ICoreStops { CoreStopped: { } why }) throw new CoreStoppedException(why);
+		}
+
 		private void StepRunLoop_Core(bool force = false)
 		{
 			var runFrame = false;
@@ -2390,7 +2636,25 @@ namespace Chimera.Client.GUI
 			{
 				var isFastForwarding = IsFastForwarding;
 				var isFastForwardingOrRewinding = isFastForwarding || isRewinding || Config.Unthrottled;
-				bool atTurboSeekEnd = IsTurboSeeking && Emulator.Frame == PauseOnFrame.Value - 1;
+				// A seek's destination.
+				//
+				// Drawing only the destination is right for almost every core:
+				// a frame is composed from the machine and nothing else, so the
+				// frames a seek passed through cost nothing to have skipped.
+				// A renderer whose picture lives on the far side of the GPU
+				// bridge is the exception, and no amount of drawing NEAR the
+				// destination fixes it. That is handled where it belongs, in
+				// the engine: a package that says video.drawEveryFrame is never
+				// told to stop drawing at all, and only the readback this flag
+				// controls is skipped.
+				bool atSeekEnd = IsSeeking && Emulator.Frame == PauseOnFrame.Value - 1;
+				bool atTurboSeekEnd = IsTurboSeeking && atSeekEnd;
+				// the frames a seek passes through get the turbo treatment whether or
+				// not it is a turbo seek; what turbo adds is that none of them is
+				// shown even when the host is served
+				// IsSeeking again, not the flag alone: this runs from outside the loop
+				// too (a tool's frame advance), and the flag is the loop's last word
+				bool quietFrame = ((IsSeeking && _seekQuiet) || (IsTurboing && !atTurboSeekEnd)) && !atSeekEnd;
 
 				if (isFastForwardingOrRewinding != _lastFastForwardingOrRewinding)
 				{
@@ -2408,7 +2672,8 @@ namespace Chimera.Client.GUI
 				InputManager.ClickyVirtualPadController.FrameTick();
 				InputManager.ButtonOverrideAdapter.FrameTick();
 
-				if (IsTurboing && !atTurboSeekEnd)
+				long toolsStarted = LoopTrace.Enabled ? Stopwatch.GetTimestamp() : 0;
+				if (quietFrame)
 				{
 					Tools.FastUpdateBefore();
 				}
@@ -2416,6 +2681,7 @@ namespace Chimera.Client.GUI
 				{
 					Tools.UpdateToolsBefore();
 				}
+				LoopTrace.Add(LoopTrace.ToolsBefore, toolsStarted);
 
 				CaptureRewind(isRewinding);
 
@@ -2443,7 +2709,9 @@ namespace Chimera.Client.GUI
 					}
 				}
 
+				long movieStarted = LoopTrace.Enabled ? Stopwatch.GetTimestamp() : 0;
 				MovieSession.HandleFrameBefore();
+				LoopTrace.Add(LoopTrace.Movie, movieStarted);
 
 				// why not skip audio if the user doesn't want sound
 				bool renderSound = (Config.SoundEnabled && !IsTurboing)
@@ -2458,19 +2726,25 @@ namespace Chimera.Client.GUI
 				// a real saving rather than a skipped memcpy - most of a frame, on
 				// a console with a 3D chip in it.
 				//
-				// A turbo SEEK has a destination and draws it (atTurboSeekEnd);
-				// the frames on the way are nobody's business, so none of them are
-				// drawn. A held Turbo key is a different thing - the person is
-				// watching to see where they are, and the throttle's one-in-four is
-				// what they are watching.
-				bool render = (!_throttle.skipNextFrame && !(IsTurboSeeking && !atTurboSeekEnd))
+				// A SEEK has a destination and draws it (atSeekEnd). The frames on
+				// the way are drawn only when the host is about to be served, so
+				// that the window shows where the seek has got to - and a turbo seek
+				// does not draw even those. A held Turbo key is a different thing -
+				// the person is watching to see where they are, and the throttle's
+				// one-in-four is what they are watching.
+				bool render = (!_throttle.skipNextFrame && !(IsTurboSeeking && !atTurboSeekEnd) && !(IsSeeking && _seekQuiet))
 					|| _currAviWriter?.UsesVideo is true
-					|| atTurboSeekEnd;
+					|| atSeekEnd;
+				long advanceStarted = LoopTrace.Enabled ? Stopwatch.GetTimestamp() : 0;
 				bool newFrame = Emulator.FrameAdvance(InputManager.ControllerOutput, render, renderSound);
+				ThrowIfCoreStopped();
+				LoopTrace.Add(LoopTrace.Advance, advanceStarted);
 
 				// an encode reaching the end of the movie is the encode finishing, not
 				// the movie ending on the person - so it bypasses the end action too
+				movieStarted = LoopTrace.Enabled ? Stopwatch.GetTimestamp() : 0;
 				MovieSession.HandleFrameAfter(ToolBypassingMovieEndAction is not null || IsEncodingVideo);
+				LoopTrace.Add(LoopTrace.Movie, movieStarted);
 
 				if (returnToRecording)
 				{
@@ -2495,7 +2769,8 @@ namespace Chimera.Client.GUI
 
 				PressFrameAdvance = false;
 
-				if (IsTurboing && !atTurboSeekEnd)
+				toolsStarted = LoopTrace.Enabled ? Stopwatch.GetTimestamp() : 0;
+				if (quietFrame)
 				{
 					Tools.FastUpdateAfter();
 				}
@@ -2503,6 +2778,8 @@ namespace Chimera.Client.GUI
 				{
 					UpdateToolsAfter();
 				}
+				LoopTrace.Add(LoopTrace.ToolsAfter, toolsStarted);
+				if (newFrame) LoopTrace.Frame();
 
 				if (newFrame)
 				{
@@ -2534,6 +2811,7 @@ namespace Chimera.Client.GUI
 						frameCount++;
 						MovieSession.HandleFrameBefore();
 						Emulator.FrameAdvance(InputManager.ControllerOutput, true, false);
+						ThrowIfCoreStopped();
 						CheatList.Pulse();
 						// No tools updates here. No existing tool (except Lua, but that gets the ShowFutureFrameCallback) needs to do anything.
 						// Maybe in the future we'll add a special update type, or add a callback for this.
@@ -2558,7 +2836,9 @@ namespace Chimera.Client.GUI
 				UpdateToolsAfter();
 			}
 
+			long soundStarted = LoopTrace.Enabled ? Stopwatch.GetTimestamp() : 0;
 			Sound.UpdateSound(atten, DisableSecondaryThrottling);
+			LoopTrace.Add(LoopTrace.Sound, soundStarted);
 		}
 
 		private void CalcFramerateAndUpdateDisplay(long currentTimestamp, bool isRewinding, bool isFastForwarding)
@@ -3135,7 +3415,7 @@ namespace Chimera.Client.GUI
 			if (Emulator.IsNull()) return;
 			if (Emulator is IGpuRendered { GpuRenderer: { Length: > 0 } driver })
 			{
-				AddOnScreenMessage($"GPU: {driver} - this run is not deterministic", 5);
+				AddOnScreenMessage($"GPU: {driver}", 5);
 			}
 		}
 
@@ -3149,7 +3429,7 @@ namespace Chimera.Client.GUI
 		private void WarnAboutNonStandardFirmware()
 		{
 			if (Emulator.IsNull()) return;
-			foreach (var entry in CoreFirmwareStore.NonStandard(Config, CoreRegistry.Instance, Emulator.Attributes().CoreName))
+			foreach (var entry in CoreFirmwareStore.NonStandard(Config, CoreRegistry.Instance, Emulator.Attributes().CoreName, CoreRegistry.Instance.PackageSha1Of(Emulator)))
 			{
 				AddOnScreenMessage(entry.WarningText, 5);
 			}
@@ -3241,7 +3521,7 @@ namespace Chimera.Client.GUI
 
 		/// <summary>
 		/// This closes the game but does not set things up for using the client with the new null emulator.
-		/// This method should only be called (outside of <see cref="LoadNullRom(bool)"/>) if the caller is about to load a new game with no user interaction between close and load.
+		/// This method should only be called (outside of <see cref="LoadNullRom()"/>) if the caller is about to load a new game with no user interaction between close and load.
 		/// </summary>
 		/// <returns>True if the game was closed. False if the user cancelled due to unsaved changes.</returns>
 		private bool CloseGame()
@@ -3408,7 +3688,7 @@ namespace Chimera.Client.GUI
 			};
 			var result = dialogParent.ShowDialogWithTempMute(ofd);
 			filterIndex = ofd.FilterIndex;
-			return result.IsOk() && ofd.FileNames.Length is not 0 ? ofd.FileNames : null;
+			return result.IsOk() && ofd.FileNames.Length is not 0 ? ofd.FileNames.Select(static f => f.WithoutWslgMirror()).ToArray() : null;
 		}
 
 		public string/*?*/ ShowFileSaveDialog(
@@ -3431,7 +3711,7 @@ namespace Chimera.Client.GUI
 				ValidateNames = false, // only raises confusing errors, doesn't affect result
 			};
 			var result = dialogParent.ShowDialogWithTempMute(sfd);
-			return result.IsOk() ? sfd.FileName : null;
+			return result.IsOk() ? sfd.FileName.WithoutWslgMirror() : null;
 		}
 
 		public string ShowFolderSelectDialog(
@@ -3441,21 +3721,11 @@ namespace Chimera.Client.GUI
 		{
 			subtitle ??= string.Empty;
 			initDir = SanitiseForFileDialog(initDir ?? string.Empty);
-			if (OSTailoredCode.IsUnixHost)
-			{
-				// FolderBrowserEx doesn't work in Mono for obvious reasons
-				using FolderBrowserDialog f = new();
-				f.Description = subtitle;
-				f.SelectedPath = initDir;
-				return f.ShowDialog().IsOk() ? f.SelectedPath : null;
-			}
-			else
-			{
-				using FolderBrowserEx f = new();
-				f.Description = subtitle;
-				f.SelectedPath = initDir;
-				return f.ShowDialog().IsOk() ? f.SelectedPath : null;
-			}
+			// FolderBrowserEx chooses the dialog: the one with an address bar on Windows, the toolkit's elsewhere
+			using FolderBrowserEx f = new();
+			f.Description = subtitle;
+			f.SelectedPath = initDir;
+			return f.ShowDialog(dialogParent as IWin32Window).IsOk() ? f.SelectedPath.WithoutWslgMirror() : null;
 		}
 
 		public void ShowMessageBox(

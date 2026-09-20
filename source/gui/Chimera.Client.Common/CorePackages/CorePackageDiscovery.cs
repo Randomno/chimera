@@ -44,6 +44,59 @@ namespace Chimera.Client.Common
 		/// </summary>
 		public string Version { get; init; } = "";
 
+		/// <summary>
+		/// True when this package was built by hand rather than published: its version
+		/// carries the "+local" the build script stamps when no CI told it what commit
+		/// it is. Worth knowing (a local build is nobody else's build, so a movie made
+		/// on it is only replayable by whoever made it) and not worth spelling out in
+		/// full every time the package is named.
+		/// </summary>
+		public bool IsLocalBuild => Version.Contains("+local");
+
+		/// <summary>
+		/// The version at the length a commit is normally read at, with the build
+		/// script's bookkeeping ("+local", "-dirty") reduced to one trailing word.
+		/// A published core reads as <c>4ed35321</c>, a hand-built one as
+		/// <c>12d65377 local</c>.
+		/// </summary>
+		public string ShortVersion
+		{
+			get
+			{
+				if (Version.Length is 0) return "";
+				var plus = Version.IndexOf('+');
+				var core = plus >= 0 ? Version.Substring(0, plus) : Version;
+				var dirty = core.EndsWith("-dirty", StringComparison.Ordinal);
+				if (dirty) core = core.Substring(0, core.Length - "-dirty".Length);
+				if (core.Length > 8) core = core.Substring(0, 8);
+				return core + (IsLocalBuild || dirty ? " local" : "");
+			}
+		}
+
+		/// <summary>
+		/// When this version was made, as the package itself says (see
+		/// <see cref="Chimera.Emulation.Common.Waterbox.WaterboxConfig.VersionDate"/>). Null for a package
+		/// from before packages said; <see cref="CoreVersionDates.Of"/> then asks what the core
+		/// manager last heard.
+		/// </summary>
+		public DateTimeOffset? VersionDate { get; init; }
+
+		/// <summary>
+		/// How a version is written wherever one is listed (issue #67): the date first, because
+		/// that is what says which of two is newer, then the commit that says which it IS -
+		/// <c>2026-09-17  (4ed35321)</c>. Just the commit when no date is known.
+		/// </summary>
+		public string DatedVersion
+		{
+			get
+			{
+				var date = CoreVersionDates.Of(this);
+				if (date is null) return ShortVersion;
+				var day = date.Value.ToLocalTime().ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture);
+				return ShortVersion.Length is 0 ? day : $"{day}  ({ShortVersion})";
+			}
+		}
+
 		/// <summary>Rom extension (leading dot, lowercase) -&gt; system id.</summary>
 		public IReadOnlyDictionary<string, string> Extensions { get; init; } = new Dictionary<string, string>();
 
@@ -55,6 +108,22 @@ namespace Chimera.Client.Common
 
 		/// <summary>Non-null if the package could not be read; it is listed but not loadable.</summary>
 		public string? Error { get; init; }
+
+		/// <summary>
+		/// The guest ABI the package declares (see <see cref="GuestAbi"/>). Zero for a
+		/// package too broken to read one out of, and for adapter packages, which are
+		/// versioned by their manifest's formatVersion instead.
+		/// </summary>
+		public int Abi { get; init; }
+
+		/// <summary>
+		/// True when the package is intact but this build cannot run it: its guest ABI
+		/// is outside the supported range. Distinguished from an ordinary
+		/// <see cref="Error"/> because the remedy is different - update one side or the
+		/// other, rather than replace a corrupt file - and because the core manager
+		/// greys these out rather than offering them.
+		/// </summary>
+		public bool IsAbiIncompatible { get; init; }
 
 		/// <summary>
 		/// Identity for deduplication: the SHA1 where there is one, so the same
@@ -168,12 +237,17 @@ namespace Chimera.Client.Common
 
 		/// <summary>
 		/// The directories to scan, in order: the default <c>Cores/</c> beside the
-		/// executable, then any the user added. The default is not removable: a
-		/// package dropped into Cores/ must always be found, that being the whole
-		/// point of the directory.
+		/// executable, then the core manager's store, then any the user added. Neither
+		/// of the first two is removable: a package dropped into Cores/ must always be
+		/// found, that being the whole point of the directory, and a core that was
+		/// downloaded must be there the moment it lands.
+		///
+		/// The bundle's own folder comes first so a portable install carrying its own
+		/// cores wins over whatever else the machine has. The two collapse into one
+		/// entry when CHIMERA_DATA_HOME points the store back at the bundle.
 		/// </summary>
 		public static IReadOnlyList<string> SearchPaths(Config config)
-			=> new[] { DefaultSearchPath }.Concat(config.CorePackagePaths).ToList();
+			=> new[] { DefaultSearchPath, CoreStore.Path }.Concat(config.CorePackagePaths).ToList();
 
 		/// <summary>Scans the directories <paramref name="config"/> designates.</summary>
 		public static IReadOnlyList<DiscoveredCorePackage> ScanFor(Config config)
@@ -185,6 +259,12 @@ namespace Chimera.Client.Common
 		/// <see cref="DiscoveredCorePackage.Error"/> set if it looks like one but
 		/// cannot be read; that distinction is what keeps a broken package visible
 		/// instead of silently missing.
+		///
+		/// Note the gate below is on the NAME, before anything is opened: a scan must
+		/// not hash every file it meets in a directory. The cost is that a caller
+		/// handing over one known path has to name it like a package - a good package
+		/// under any other extension is invisible here, which is exactly how every
+		/// install once failed as "not a core package".
 		/// </summary>
 		public static DiscoveredCorePackage? Peek(string path)
 		{
@@ -227,14 +307,23 @@ namespace Chimera.Client.Common
 			{
 				throw new InvalidOperationException($"{WaterboxCoreFactory.ConfigFileName} names no machine (systemId, or machines)");
 			}
+			// An ABI this build does not understand is not an error in the package: it
+			// is a perfectly good core for a different Chimera. It is still listed -
+			// silently dropping it would leave someone staring at a Cores folder that
+			// contains the core they just downloaded and a frontend that denies it.
+			var refusal = GuestAbi.Refuse(cfg.Abi);
 			return new DiscoveredCorePackage
 			{
 				Path = path,
 				Sha1 = sha1,
-				Name = string.IsNullOrWhiteSpace(cfg.CoreName) ? fallbackName : cfg.CoreName,
+				Name = cfg.CoreName is { } named && !string.IsNullOrWhiteSpace(named) ? named : fallbackName,
 				Version = cfg.Version ?? "",
+				VersionDate = CoreVersionDates.Parse(cfg.VersionDate),
 				Systems = systems,
 				Extensions = NormaliseExtensions(cfg.AllExtensions),
+				Abi = cfg.Abi,
+				IsAbiIncompatible = refusal is not null,
+				Error = refusal,
 			};
 		}
 

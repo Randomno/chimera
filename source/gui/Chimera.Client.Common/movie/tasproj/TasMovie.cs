@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
@@ -10,7 +11,7 @@ namespace Chimera.Client.Common
 {
 	internal sealed partial class TasMovie : MovieBase, ITasMovie
 	{
-		public new const string Extension = "chimeraProject";
+		public const string Extension = "chimeraProject";
 		private IInputPollable _inputPollable;
 
 		public const double CurrentVersion = 1.1;
@@ -21,7 +22,7 @@ namespace Chimera.Client.Common
 		{
 			Branches = new TasBranchCollection(this);
 			ChangeLog = new TasMovieChangeLog(this);
-			Header[HeaderKeys.MovieVersion] = $"Chimera Tasproj v{CurrentVersion.ToString(CultureInfo.InvariantCulture)}";
+			Header[HeaderKeys.MovieVersion] = $"Chimera Project File v{CurrentVersion.ToString(CultureInfo.InvariantCulture)}";
 			Markers = new TasMovieMarkerList(this);
 			Markers.CollectionChanged += Markers_CollectionChanged;
 		}
@@ -40,17 +41,62 @@ namespace Chimera.Client.Common
 
 			_inputPollable = emulator.AsInputPollable();
 
-			TasStateManager ??= Session.Settings.DefaultTasStateManagerSettings.CreateManager(IsReserved);
-			if (StartsFromSavestate)
+			// The history is the engine's (docs/state-manager.md). Attaching turns
+			// it on, which captures the machine as it stands - frame zero, here -
+			// as the anchor everything else is reached from.
+			States = emulator.AsStateHistory();
+			// Memory only (user-decided, 2026-09-15). No spill directory is set, so
+			// the history never writes to disk while the project is open: it keeps
+			// every frame until its budget is full, then thins toward bands that
+			// double in length behind the newest frame (docs/state-manager.md). The disk is written when the project is
+			// SAVED. Spill files an earlier build left here would now never be swept
+			// by anybody, and they are gigabytes each, so they go as it opens.
+			ProjectCache.DeleteSpillFiles(Project.Id);
+			// The setting is only the DEFAULT: a project can carry its own, kept
+			// beside its greenzone rather than in the file people hand each other
+			// (ProjectCache.ProjectBudgets).
+			var budgets = ProjectCache.BudgetsOf(Project.Id);
+			var memoryMb = Math.Max(
+				budgets.MemoryMb ?? Session.Settings.GreenzoneBudgetMb,
+				MovieConfig.MinimumBudgetMb);
+			// Before enabling, so the first stretch is already held to it.
+			States.MaxNearStride(Math.Min(Math.Max(
+				budgets.MaxNearStride ?? Session.Settings.GreenzoneMaxNearStride,
+				MovieConfig.MinimumNearStride), MovieConfig.MaximumNearStride));
+			States.Enable((long)memoryMb * 1024 * 1024);
+			// Read here and not with the rest of the cache, because until the
+			// emulator arrives there is nowhere to put it.
+			//
+			// A greenzone is trusted only when the session that wrote it FINISHED.
+			// What bricked nss102 was not that a GPU drew it - a clean GPU session's
+			// history reloads and lands correctly, measured on the real 8916-frame
+			// project - but that its history came from a session already dying of
+			// guest heap corruption: restoring a state from it killed the process
+			// inside the NVIDIA driver, every open, before anything in Chimera could
+			// catch it (docs/design-principles.md, 2026-09-14/2026-09-16).
+			//
+			// So the gate is the shutdown, not the renderer. A crashed session's
+			// history is left on disk and ignored; the movie replays instead.
+			// Two conditions, and both are about EVIDENCE rather than a promise: the
+			// core must be one whose greenzone has been shown to reload correctly
+			// (see GreenzoneMayOutliveSession), and the session that wrote this one
+			// must have finished.
+			if (GreenzoneMayOutliveSession && ProjectRecovery.LastSessionEndedCleanly(Project.Id))
 			{
-				TasStateManager.Engage(BinarySavestate);
+				States.Load(StateHistoryFilename, MachineIdentityOf(Project));
 			}
-			else
-			{
-				TasStateManager.Engage(emulator.AsStatable().CloneSavestate());
-			}
+			RefreshPins();
 
 			base.Attach(emulator);
+
+			// Where the run's input stops is found by comparing entries against an
+			// empty one, and what "empty" looks like is the machine's to say. A
+			// project is READ before its core boots, so the pass done there had
+			// only the null emulator's controller to ask and cannot be trusted.
+			// The machine is here now, so the answer - and the marker that shows
+			// it - are worked out again.
+			RefreshLastNonEmptyInput(0);
+			Markers.RefreshPermanent();
 		}
 
 		public override bool StartsFromSavestate
@@ -72,7 +118,12 @@ namespace Chimera.Client.Common
 		public TasLagLog LagLog { get; } = new TasLagLog();
 
 		public override string PreferredExtension => Extension;
-		public IStateManager TasStateManager { get; set; }
+		/// <summary>
+		/// Where the machine has been. Held by the engine, and this is the remote
+		/// control - there is deliberately no copy up here of which frames exist,
+		/// because a second copy is a second thing to keep true.
+		/// </summary>
+		public IStateHistory States { get; private set; }
 
 		public Action<int> GreenzoneInvalidated { get; set; }
 
@@ -92,7 +143,7 @@ namespace Chimera.Client.Common
 
 				return new TasMovieRecord
 				{
-					HasState = TasStateManager.HasState(index),
+					HasState = States is not null && States.Has(index),
 					LogEntry = GetInputLogEntry(index),
 					Lagged = lagged,
 					WasLagged = LagLog.History(lagIndex),
@@ -167,7 +218,9 @@ namespace Chimera.Client.Common
 			}
 
 			LagLog.RemoveFrom(frame);
-			var anyStateInvalidated = TasStateManager.InvalidateAfter(frame);
+			// asked before the drop, because afterwards there is nothing to see
+			var anyStateInvalidated = States.Nearest(int.MaxValue) > frame;
+			States.InvalidateAfter(frame);
 
 			Changes = true;
 			LastEditedFrame = frame;
@@ -189,7 +242,8 @@ namespace Chimera.Client.Common
 		public void InvalidateEntireGreenzone()
 			=> InvalidateAfter(0);
 
-		private (int Frame, IMovieController Controller) _displayCache = (-1, null);
+		private (int Frame, IMovieController Controller, ControllerDefinition Definition, string LogKey) _displayCache
+			= (-1, null, null, null);
 
 		/// <summary>
 		/// Returns the mnemonic value for boolean buttons, and actual value for axes,
@@ -197,9 +251,20 @@ namespace Chimera.Client.Common
 		/// </summary>
 		public string DisplayValue(int frame, string buttonName, bool defaultAxisAsBlank)
 		{
+			// The shape this reader was built for can change under it - see
+			// MovieBase.DefaultValueController for how - and a reader built for
+			// another shape gets every entry wrong, so it is thrown away and made
+			// again rather than kept for the movie's lifetime.
+			var definition = Session.MovieController.Definition;
+			if (_displayCache.Controller is null
+				|| !ReferenceEquals(_displayCache.Definition, definition)
+				|| _displayCache.LogKey != LogKey)
+			{
+				_displayCache = (-1, new MovieController(definition, LogKey), definition, LogKey);
+			}
+
 			if (_displayCache.Frame != frame || Log.Count == 1)
 			{
-				_displayCache.Controller ??= new MovieController(Session.MovieController.Definition, LogKey);
 				_displayCache.Controller.SetFromMnemonic(Log[frame]);
 				_displayCache.Frame = frame;
 			}
@@ -214,7 +279,7 @@ namespace Chimera.Client.Common
 			if (adapter.Definition.BoolButtons.Contains(buttonName))
 			{
 				return adapter.IsPressed(buttonName)
-					? adapter.Definition.MnemonicsCache![buttonName].ToString()
+					? adapter.Definition.MnemonicFor(buttonName).ToString()
 					: "";
 			}
 
@@ -236,8 +301,36 @@ namespace Chimera.Client.Common
 		{
 			LagLog[Emulator.Frame] = _inputPollable.IsLagFrame;
 
-			// We will forcibly capture a state for the last edited frame (requested by https://github.com/TASEmulators/BizHawk/issues/916 for case of "platforms with analog stick")
-			TasStateManager.Capture(Emulator.Frame, Emulator.AsStatable(), Emulator.Frame == LastEditedFrame - 1);
+			// Every frame, unconditionally: the engine decides what a frame near
+			// the playhead costs to keep and what it costs once the playhead has
+			// moved on, which is what "force this one" used to be for.
+			States.Capture(Emulator.Frame);
+		}
+
+		/// <summary>
+		/// Before the machine moves, every frame. A delta is what changed since a
+		/// marked moment, and the moment has to be marked first.
+		/// </summary>
+		public void GreenzoneBeforeFrame() => States?.BeforeAdvance();
+
+		/// <summary>
+		/// Tells the history which frames it must keep whatever its thinning would
+		/// otherwise do with them. Markers want instant navigation, and a branch
+		/// is somebody's alternative route; both are cheap to name and impossible
+		/// for the engine to guess. Rebuilt wholesale because the sets are small
+		/// and a missed removal would pin a frame forever.
+		/// </summary>
+		public void RefreshPins()
+		{
+			if (States is null) return;
+			States.UnpinAll();
+			// the frame BEFORE, because navigating to a marker emulates one frame
+			// from there so the screen has a framebuffer
+			foreach (var m in Markers)
+			{
+				if (m.WantsState && m.Frame > 0) States.Pin(m.Frame - 1, true);
+			}
+			foreach (var b in Branches) States.Pin(b.Frame, true);
 		}
 
 
@@ -300,6 +393,17 @@ namespace Chimera.Client.Common
 				}
 			}
 
+			// A log that is shorter or longer than ours disagrees from where one of
+			// them ends, even when every entry both have matches. The history no
+			// longer drops what is ahead of a frame it replays, so it has to be told.
+			// Only against a log that is there: a project being opened reads its
+			// own log through here, into a movie that has none yet, and that is not
+			// a divergence - it is the greenzone it saved being given back.
+			if (!timelineBranchFrame.HasValue && Log is { Count: > 0 } && newLog.Count != Log.Count)
+			{
+				timelineBranchFrame = Math.Min(newLog.Count, Log.Count);
+			}
+
 			Log.Clear();
 			Log.AddRange(newLog);
 
@@ -335,7 +439,7 @@ namespace Chimera.Client.Common
 			if (timelineBranchFrame.HasValue)
 			{
 				LagLog.RemoveFrom(timelineBranchFrame.Value);
-				TasStateManager.InvalidateAfter(timelineBranchFrame.Value);
+				States.InvalidateAfter(timelineBranchFrame.Value);
 				GreenzoneInvalidated?.Invoke(timelineBranchFrame.Value);
 			}
 
@@ -348,6 +452,7 @@ namespace Chimera.Client.Common
 
 			Log?.Dispose();
 			Log = branch.InputLog.Clone();
+			InputLogReplaced?.Invoke();
 
 			if (BindMarkersToInput) // pretty critical not to erase them
 			{
@@ -379,8 +484,15 @@ namespace Chimera.Client.Common
 		public override void Dispose()
 		{
 			base.Dispose();
-			TasStateManager?.Dispose();
-			TasStateManager = null;
+			// A queued save is waited for by the SESSION, in WaterboxCore.Dispose
+			// and in the engine's own teardown - not here. By the time a movie is
+			// disposed the emulator it borrowed may already be gone, and calling
+			// into a freed session is a crash rather than a barrier: a 4000-frame
+			// soak survived every seek and died on the way out doing exactly that.
+			//
+			// not disposed: the history belongs to the emulator, which outlives
+			// the movie and is disposed by whoever made it
+			States = null;
 		}
 	}
 }

@@ -22,9 +22,13 @@ namespace Chimera.Emulation.Common.Waterbox
 		public WaterboxCoreFactory(string packageDir)
 		{
 			_packageDir = packageDir;
-			_cfg = WaterboxConfig.FromJson(File.ReadAllText(Path.Combine(packageDir, ConfigFileName)));
-			if (_cfg is null) throw new InvalidOperationException($"{ConfigFileName} is empty or invalid");
-			if (_cfg.HasMachines)
+			_cfg = WaterboxConfig.FromJson(File.ReadAllText(Path.Combine(packageDir, ConfigFileName)))
+				?? throw new InvalidOperationException($"{ConfigFileName} is empty or invalid");
+			// before anything else is read out of it: a package from the far side of an
+			// ABI change may declare fields this build has no idea how to interpret, so
+			// the version check cannot come after the interpreting
+			if (GuestAbi.Refuse(_cfg.Abi) is { } refusal) throw new NotSupportedException($"core package \"{_cfg.CoreName}\" is {refusal}");
+			if (_cfg.Machines is { Count: > 0 } machines)
 			{
 				// a package of machines must say which setting picks one, and that
 				// setting must be one it actually declares - otherwise every session
@@ -37,7 +41,7 @@ namespace Chimera.Emulation.Common.Waterbox
 				{
 					throw new InvalidOperationException($"{ConfigFileName}: machineSetting \"{_cfg.MachineSetting}\" is not one of this package's settings");
 				}
-				foreach (var machine in _cfg.Machines)
+				foreach (var machine in machines)
 				{
 					if (string.IsNullOrEmpty(machine.Id)) throw new InvalidOperationException($"{ConfigFileName}: a machine has no id");
 					// a machine without its own controller uses the package's -
@@ -64,6 +68,10 @@ namespace Chimera.Emulation.Common.Waterbox
 
 		/// <summary>The package's identity, so lists of available cores name the core rather than the adapter.</summary>
 		public CoreAttribute CoreIdentity => WaterboxCore.IdentityOf(_cfg);
+
+		public WaterboxConfig Config => _cfg;
+		public string PackageDir => _packageDir;
+
 
 		/// <summary>Rom-extension -&gt; systemId map from waterbox.config, over every machine.</summary>
 		public Dictionary<string, string> Extensions => _cfg.AllExtensions;
@@ -111,24 +119,30 @@ namespace Chimera.Emulation.Common.Waterbox
 		/// Without this a .sms opened with no project would boot the package's first
 		/// machine, which is a Mega Drive, and refuse the cartridge.
 		/// </summary>
-		private WaterboxCoreSettings MachinePinnedSettings(CoreCreationContext ctx)
+		private WaterboxCoreSettings? MachinePinnedSettings(CoreCreationContext ctx)
 		{
 			var settings = ctx.Settings as WaterboxCoreSettings;
-			if (!_cfg.HasMachines) return settings;
+			// both together: the constructor above refuses a package that declares
+			// machines without naming the setting that picks between them
+			if (_cfg.Machines is not { Count: > 0 } machines
+				|| _cfg.MachineSetting is not { Length: > 0 } machineSetting)
+			{
+				return settings;
+			}
 
 			// what the CALLER said, not what the package defaults to: every package
 			// has a default machine, so asking the effective settings would mean the
 			// rom never gets a say
-			var pinned = settings?.Values is not null && settings.Values.TryGetValue(_cfg.MachineSetting, out var value)
+			var pinned = settings?.Values is not null && settings.Values.TryGetValue(machineSetting, out var value)
 				? value?.ToString() ?? ""
 				: "";
-			if (_cfg.Machines.Exists(m => m.Selects(pinned))) return settings;
+			if (machines.Exists(m => m.Selects(pinned))) return settings;
 
 			var routed = _cfg.MachineForSystem(ctx.Game?.System);
 			if (routed is null) return settings;
 
 			settings = settings?.Clone() ?? new WaterboxCoreSettings();
-			settings.Values[_cfg.MachineSetting] = routed.When is { Count: > 0 } ? routed.When[0] : routed.Id;
+			settings.Values[machineSetting] = routed.When is { Count: > 0 } ? routed.When[0] : routed.Id ?? "";
 			return settings;
 		}
 
@@ -155,8 +169,16 @@ namespace Chimera.Emulation.Common.Waterbox
 					}
 				}
 			}
+			// A rom opened directly - no project, so no slot map - still fills a
+			// slot: it is the game. Without saying so, every firmware condition
+			// written over the slots reads false and the firmware is silently not
+			// asked for, which is how a PS3 disc reached the machine with no system
+			// software and refused itself. A precompile session loads exactly this
+			// way, so this is the path its firmware depends on.
 			var effective = WaterboxCore.EffectiveSettingsFor(
-				_cfg, ctx.Settings as WaterboxCoreSettings);
+				_cfg, MachinePinnedSettings(ctx));
+			if (slotsJson is "{}") slotsJson = SlotsFromRom(ctx, effective);
+
 			var applicable = Engine.EngineFirmware.Evaluate(
 				_cfg.RawFirmwareJson, slotsJson, Newtonsoft.Json.JsonConvert.SerializeObject(effective));
 
@@ -178,12 +200,52 @@ namespace Chimera.Emulation.Common.Waterbox
 					if (!decl.Required) continue;
 					throw new MissingFirmwareException(
 						$"{CoreName} needs firmware that has not been provided: {decl.DisplayName}."
-							+ " Put the file in the Firmware folder and open the project again"
-							+ " (a new project's wizard can also point at it).");
+							+ " Put the file in the Firmware folder, or point at it in Config > Firmware,"
+							+ " and open the project again.");
 				}
 				resolved[decl.Id] = bytes;
 			}
 			return resolved;
+		}
+
+		/// <summary>
+		/// The slot map a directly-opened rom implies: its file in the package's
+		/// first required slot, which is the one the wizard calls the game. Only
+		/// the name is needed - conditions test the slot and its extension.
+		/// Among the slots THIS MACHINE exposes: a package that is several
+		/// machines declares a slot per machine (a Dreamcast's disc, a NAOMI's
+		/// rom set), and the rom belongs in the one its machine has.
+		/// </summary>
+		private string SlotsFromRom(CoreCreationContext ctx, Dictionary<string, object> effective)
+		{
+			var path = ctx.Roms is { Count: > 0 } roms ? roms[0]?.RomPath : null;
+			if (string.IsNullOrEmpty(path)) return "{}";
+			string primary;
+			try
+			{
+				var declJson = File.ReadAllText(Path.Combine(_packageDir, "file_slots.json"));
+				var decl = Newtonsoft.Json.Linq.JObject.Parse(declJson);
+				var slots = decl["slots"] as Newtonsoft.Json.Linq.JArray;
+				if (slots is null || slots.Count is 0) return "{}";
+				var exposed = Engine.EngineSlotsGate.Evaluate(
+					declJson, "{}", Newtonsoft.Json.JsonConvert.SerializeObject(effective));
+				var candidates = slots.Where(sl => exposed.Contains((string?) sl["id"] ?? "")).ToList();
+				if (candidates.Count is 0) candidates = slots.ToList();
+				// the game slot is the first that must be filled; failing that, the first
+				var chosen = candidates.FirstOrDefault(sl => (int?)sl["min"] >= 1) ?? candidates[0];
+				primary = (string?) chosen["id"] ?? "";
+				if (primary.Length is 0) return "{}";
+			}
+			catch (Exception)
+			{
+				// no declaration, or an unreadable one: say nothing rather than guess
+				return "{}";
+			}
+			Newtonsoft.Json.Linq.JObject map = new()
+			{
+				[ primary ] = new Newtonsoft.Json.Linq.JArray(Path.GetFileName(path)),
+			};
+			return map.ToString(Newtonsoft.Json.Formatting.None);
 		}
 	}
 }

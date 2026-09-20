@@ -55,3 +55,9 @@ mono_crash.*.json
 # game data for local testing - never shipped, never committed
 /roms/
 projects/
+
+# The cores are separate repositories now (docs/core-manager.md): Chimera ships
+# none, builds none, and downloads them through File > Core Manager. They live
+# outside this tree - ~/chimera-cores/<name> on the machine this was written on
+# - and this only keeps the old path free for anyone who still clones one here.
+/extern/cores/

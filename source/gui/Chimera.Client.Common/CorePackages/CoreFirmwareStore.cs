@@ -50,7 +50,7 @@ namespace Chimera.Client.Common
 		public string? Sha1 { get; init; }
 
 		/// <summary>The SHA1s the core says are right, in declaration order. Empty when it pins none.</summary>
-		public IReadOnlyList<string> ExpectedSha1 => string.IsNullOrEmpty(Decl.Sha1) ? [ ] : [ Decl.Sha1 ];
+		public IReadOnlyList<string> ExpectedSha1 => Decl.Sha1 is { Length: > 0 } pinned ? [ pinned ] : [ ];
 
 		/// <summary>Short form for a column; the full value goes in the detail line.</summary>
 		public static string Short(string? sha1) => sha1 is null ? "" : sha1.ToUpperInvariant()[..8];
@@ -106,6 +106,57 @@ namespace Chimera.Client.Common
 		/// <summary>The config key a choice is remembered under. Keyed by core name, not by package hash: rebuilding a core package must not make the user find their BIOS again.</summary>
 		public static string KeyFor(string coreName, string id) => $"{coreName}/{id}";
 
+		/// <summary>
+		/// The key one particular dump is remembered under. A core may declare one
+		/// id many times - PCSX2 lists seventy-three releases of its bios under
+		/// "bios.bin" - and a person may own several; the plain key can only say
+		/// which one is in use. A pinned declaration's file is remembered under its
+		/// hash as well, so the wizard, an opening project and the firmware survey
+		/// can all find every dump a person ever pointed at. An unpinned
+		/// declaration has no hash to remember by and keeps the plain key.
+		/// </summary>
+		public static string KeyFor(string coreName, CoreFirmwareDecl decl)
+			=> decl.Sha1 is { Length: > 0 } pinned ? $"{coreName}/{decl.Id}#{pinned.ToUpperInvariant()}" : KeyFor(coreName, decl.Id);
+
+		/// <summary>The remembered path for THIS declaration: its own dump's first, then whatever is in use for its id.</summary>
+		public static string? GetPath(Config config, string coreName, CoreFirmwareDecl decl)
+		{
+			if (!string.IsNullOrEmpty(decl.Sha1)
+				&& config.CoreFirmware.TryGetValue(KeyFor(coreName, decl), out var own) && !string.IsNullOrWhiteSpace(own))
+			{
+				return own;
+			}
+			return GetPath(config, coreName, decl.Id);
+		}
+
+		/// <summary>Remembers (or, for null, forgets) the file chosen for one declaration, under its own dump's key.</summary>
+		public static void Remember(Config config, string coreName, CoreFirmwareDecl decl, string? path)
+		{
+			var key = KeyFor(coreName, decl);
+			if (string.IsNullOrWhiteSpace(path)) config.CoreFirmware.Remove(key);
+			else config.CoreFirmware[key] = path!;
+		}
+
+		/// <summary>Every path remembered for a core, whichever key it sits under. Hints, all of them: hashed before they are believed.</summary>
+		public static IReadOnlyList<string> RememberedPaths(Config config, string coreName)
+			=> config.CoreFirmware
+				.Where(kv => CoreOf(kv.Key).Equals(coreName, StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(kv.Value))
+				.Select(static kv => kv.Value)
+				.Distinct(StringComparer.OrdinalIgnoreCase)
+				.ToList();
+
+		// What is remembered for a core is kept whether or not the core is
+		// installed right now: a package that is removed and put back finds its
+		// dumps where they were, and a person is never made to point at a
+		// PlayStation 3 update twice. Only the SURVEY forgets an absent core -
+		// its rows come from the packages present - never the config.
+
+		private static string CoreOf(string key)
+		{
+			var slash = key.IndexOf('/');
+			return slash < 0 ? key : key[..slash];
+		}
+
 		public static string? GetPath(Config config, string coreName, string id)
 			=> config.CoreFirmware.TryGetValue(KeyFor(coreName, id), out var path) && !string.IsNullOrWhiteSpace(path)
 				? path
@@ -123,15 +174,74 @@ namespace Chimera.Client.Common
 			=> registry.AllFactories
 				.OfType<ICoreFirmwareUser>()
 				.SelectMany(user => user.Firmware.Select(decl => Describe(config, ((ICoreFactory) user).CoreName, decl)))
+				// two builds of one core loaded side by side declare the same files once
+				.GroupBy(static e => KeyFor(e.CoreName, e.Decl), StringComparer.OrdinalIgnoreCase)
+				.Select(static g => g.First())
 				.ToList();
 
 		/// <summary>True if any loaded package expects firmware at all (the firmware window is pointless otherwise).</summary>
 		public static bool AnyExpected(CoreRegistry registry)
 			=> registry.AllFactories.OfType<ICoreFirmwareUser>().Any(static u => u.Firmware.Count != 0);
 
-		public static CoreFirmwareEntry Describe(Config config, string coreName, CoreFirmwareDecl decl)
+		/// <summary>
+		/// What the Firmware folder can answer for a declaration nothing else
+		/// has: the file with the hash it pins, or - when it pins none, as an
+		/// Xbox disk image or a console's own identity dump cannot - the file
+		/// bearing the name the core says it goes by.
+		///
+		/// Until this, "put the file in the Firmware folder and open the project
+		/// again" was advice the frontend did not take: only the wizard and a
+		/// project's own hash pins ever looked in that folder, so a saved project
+		/// whose remembered path had moved refused with the file sitting exactly
+		/// where the message asked for it (issue #40).
+		/// </summary>
+		private static string? InFirmwareFolder(Config config, CoreFirmwareDecl decl)
 		{
-			var path = GetPath(config, coreName, decl.Id);
+			string dir;
+			try
+			{
+				dir = config.PathEntries.FirmwareAbsolutePath();
+			}
+			catch (Exception ex) when (ex is IOException or ArgumentException)
+			{
+				return null;
+			}
+			if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) return null;
+			if (string.IsNullOrEmpty(decl.Sha1))
+			{
+				// nothing to ask by but the name, and a name is compared the way
+				// the platform that wrote it would: a dump called Complex_4627.bin
+				// is the file a core declares as complex_4627.bin
+				if (string.IsNullOrEmpty(decl.Name)) return null;
+				try
+				{
+					return Directory.EnumerateFiles(dir, "*", SearchOption.TopDirectoryOnly)
+						.FirstOrDefault(f => Path.GetFileName(f).Equals(decl.Name, StringComparison.OrdinalIgnoreCase));
+				}
+				catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+				{
+					return null;
+				}
+			}
+			return FirmwareLocator.FindFor(decl, FirmwareLocator.BuildIndex([ dir ]))?.Path;
+		}
+
+		public static CoreFirmwareEntry Describe(Config config, string coreName, CoreFirmwareDecl decl)
+			=> Describe(config, coreName, decl, null);
+
+		/// <summary>
+		/// The same, answering the Firmware folder from an index the caller built
+		/// once: a survey of seventy-three declarations must not hash the folder
+		/// seventy-three times.
+		/// </summary>
+		public static CoreFirmwareEntry Describe(Config config, string coreName, CoreFirmwareDecl decl, IReadOnlyList<FirmwareLocator.IndexedFile>? index)
+		{
+			var path = GetPath(config, coreName, decl);
+			// a choice that has moved is no longer an answer; the folder may hold one
+			if (path is null || !File.Exists(path))
+			{
+				path = (index is null ? InFirmwareFolder(config, decl) : FirmwareLocator.FindEither(decl, index)?.Path) ?? path;
+			}
 			if (path is null) return new() { CoreName = coreName, Decl = decl, State = CoreFirmwareState.Missing };
 
 			byte[] bytes;
@@ -145,7 +255,7 @@ namespace Chimera.Client.Common
 			}
 			var sha1 = Sha1Of(bytes); // computed even for a file that will be refused: the user wants to see WHAT they pointed at
 			// the verdict is the engine's (see docs/engine-migration.md)
-			var state = EngineFirmware.Classify(decl.Size, string.IsNullOrEmpty(decl.Sha1) ? [ ] : [ decl.Sha1 ], bytes.Length, sha1) switch
+			var state = EngineFirmware.Classify(decl.Size, decl.Sha1 is { Length: > 0 } pinned ? [ pinned ] : [ ], bytes.Length, sha1) switch
 			{
 				EngineFirmware.Verdict.WrongSize => CoreFirmwareState.Custom,
 				EngineFirmware.Verdict.Unrecognised => CoreFirmwareState.Unrecognised,
@@ -160,9 +270,52 @@ namespace Chimera.Client.Common
 		/// over, whatever its size or hash - see <see cref="CoreFirmwareEntry.Usable"/>
 		/// for why, and <see cref="NonStandard"/> for the warning that goes with it.
 		/// </summary>
+		/// <summary>
+		/// Firmware named on the command line, by id: what THIS run must use,
+		/// ahead of anything the config remembers. A precompile session is a child
+		/// process, and it cannot be told through the config - the parent would
+		/// have to have written the file first, and the wizard may hold a path
+		/// that was never written there (a core can call a firmware optional that
+		/// the game in hand cannot boot without). So it is told outright, and the
+		/// answer lives for the process, which is exactly one run.
+		/// </summary>
+		public static IReadOnlyDictionary<string, string> CommandLineFirmware { get; set; }
+			= new Dictionary<string, string>(StringComparer.Ordinal);
+
+		/// <summary>Parses "&lt;id&gt;=&lt;path&gt;" pairs; a pair without an "=" is skipped.</summary>
+		public static IReadOnlyDictionary<string, string> ParseFirmwareArgs(IEnumerable<string> pairs)
+		{
+			var map = new Dictionary<string, string>(StringComparer.Ordinal);
+			foreach (var pair in pairs ?? [ ])
+			{
+				if (string.IsNullOrWhiteSpace(pair)) continue;
+				var eq = pair.IndexOf('=');
+				if (eq <= 0 || eq == pair.Length - 1) continue;
+				map[pair[..eq]] = pair[(eq + 1)..];
+			}
+			return map;
+		}
+
 		public static Func<CoreFirmwareDecl, byte[]?> ProviderFor(Config config, string coreName)
 			=> decl =>
 			{
+				// the delegate is declared to take a declaration, and everything
+				// below needs one; nothing to answer about is answered with nothing
+				if (decl is null) return null;
+				// said on the command line: use it, and say so if it cannot be read
+				// rather than quietly falling back to a different machine
+				if (CommandLineFirmware.TryGetValue(decl.Id, out var named))
+				{
+					try
+					{
+						return File.ReadAllBytes(named);
+					}
+					catch (IOException e)
+					{
+						Console.Error.WriteLine($"firmware {decl.Id}: cannot read {named}: {e.Message}");
+						return null;
+					}
+				}
 				var entry = Describe(config, coreName, decl);
 				if (!entry.Usable || entry.Path is null) return null;
 				try
@@ -181,8 +334,8 @@ namespace Chimera.Client.Common
 		/// movie that does not carry this is not reproducible; and it has to be canonical,
 		/// or replay would report a difference that is only an ordering.
 		/// </summary>
-		public static string RecordFor(Config config, CoreRegistry registry, string coreName)
-			=> EngineFirmware.RecordLine(InUse(config, registry, coreName)
+		public static string RecordFor(Config config, CoreRegistry registry, string coreName, string? runningSha1 = null)
+			=> EngineFirmware.RecordLine(InUse(config, registry, coreName, runningSha1)
 				// what the core was actually given, not merely what the user pointed at:
 				// a file the frontend never handed over did not shape this machine
 				.Where(static e => e.Usable && e.Sha1 is not null)
@@ -204,11 +357,11 @@ namespace Chimera.Client.Common
 		/// this exists to stop. A package whose declarations are unconditional gets
 		/// the same answer either way.
 		/// </summary>
-		public static IReadOnlyList<CoreFirmwareEntry> InUse(Config config, CoreRegistry registry, string coreName)
+		public static IReadOnlyList<CoreFirmwareEntry> InUse(Config config, CoreRegistry registry, string coreName, string? runningSha1 = null)
 		{
-			var user = registry.AllFactories
-				.OfType<ICoreFirmwareUser>()
-				.FirstOrDefault(u => string.Equals(((ICoreFactory) u).CoreName, coreName, StringComparison.OrdinalIgnoreCase));
+			// with several builds of the core registered, the one running (or the one that would run)
+			var named = registry.AllFactories.FirstOrDefault(f => string.Equals(f.CoreName, coreName, StringComparison.OrdinalIgnoreCase));
+			var user = named is null ? null : registry.FactoryFor(named.CoreName, runningSha1) as ICoreFirmwareUser;
 			if (user is null) return [ ];
 			return InUse(config, coreName, user.Firmware, user.FirmwareInUse);
 		}
@@ -233,8 +386,8 @@ namespace Chimera.Client.Common
 		/// recorded in movies like any firmware, so the user is told rather than left
 		/// to wonder why a movie will not sync elsewhere.
 		/// </summary>
-		public static IReadOnlyList<CoreFirmwareEntry> NonStandard(Config config, CoreRegistry registry, string coreName)
-			=> InUse(config, registry, coreName)
+		public static IReadOnlyList<CoreFirmwareEntry> NonStandard(Config config, CoreRegistry registry, string coreName, string? runningSha1 = null)
+			=> InUse(config, registry, coreName, runningSha1)
 				.Where(static e => e.Usable && !e.IsStandard)
 				.ToList();
 

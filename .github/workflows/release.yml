@@ -4,6 +4,12 @@ name: Release
 #
 # Two kinds of build, deliberately:
 #
+# The bundle is the FRONTEND. It carries no cores: those are fifteen other
+# repositories that publish themselves, and Chimera downloads them through File
+# > Core Manager (docs/core-manager.md). Each core's own releases are its
+# archive; the `cores` release here is the OLD one, kept because movies recorded
+# before the split cite packages in it, and it no longer grows.
+#
 #   dev      a ROLLING prerelease, replaced on every green push to main. One
 #            link that is always the newest; the assets carry the short commit
 #            in their names, so a downloaded file still says what it is.
@@ -70,16 +76,27 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ steps.what.outputs.sha }}
-          submodules: recursive
+          # NOT recursive: the bundle carries no cores (docs/core-manager.md), so
+          # what it needs checked out is what the FRONTEND is built from
+          submodules: false
           fetch-depth: 0
+
+      - name: Check out what the frontend is built from
+        run: git submodule update --init --recursive extern
 
       - name: Has main moved since the last nightly?
         id: moved
         if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          # a nightly of an unchanged commit is a second copy of yesterday's
+          # a nightly of an unchanged commit is a second copy of yesterday's -
+          # but only a nightly that HOLDS its bundles counts: a publish that died
+          # between create and upload leaves a tag at this very commit, and
+          # counting it would make every later run skip the repair
           last=$(git tag -l 'nightly-*' --sort=-creatordate | head -1)
-          if [ -n "$last" ] && [ "$(git rev-list -n1 "$last")" = "$(git rev-parse HEAD)" ]; then
+          if [ -n "$last" ] && [ "$(git rev-list -n1 "$last")" = "$(git rev-parse HEAD)" ] \
+             && gh release view "$last" --json assets --jq '.assets[].name' 2>/dev/null | grep -q '^chimera-.*\.zip$'; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "main has not moved since $last; nothing to release"
           else
@@ -115,25 +132,6 @@ jobs:
         with:
           dotnet-version: '8.0'
 
-      - name: What the cores are pinned at
-        id: pins
-        if: steps.moved.outputs.skip != 'true'
-        run: |
-          # the cache key is the exact core commits plus the guest kit they
-          # build against: bump one core, rebuild one core
-          git submodule status extern/cores/* extern/tools/chimera-common-minibox > core-pins.txt
-          cat core-pins.txt
-
-      - name: Cache the core guest builds
-        if: steps.moved.outputs.skip != 'true'
-        uses: actions/cache@v4
-        with:
-          path: |
-            extern/cores/*/build
-            extern/cores/*/waterbox/obj-guest
-            extern/cores/*/waterbox/bin
-          key: cores-${{ hashFiles('core-pins.txt') }}-${{ runner.os }}
-
       - name: Build the Linux bundle
         if: steps.moved.outputs.skip != 'true'
         run: ./tools/build-bundle.sh --platform linux --out build/bundle-linux
@@ -141,9 +139,7 @@ jobs:
       - name: Build the Windows bundle
         if: steps.moved.outputs.skip != 'true'
         # only the natives differ between the two: the managed assemblies are IL
-        # and every core.wbx is OS-independent, so both bundles ship the same
-        # packages byte for byte
-        run: ./tools/build-bundle.sh --platform windows --out build/bundle-windows --skip-cores
+        run: ./tools/build-bundle.sh --platform windows --out build/bundle-windows
 
       - name: Pack
         id: pack
@@ -160,33 +156,61 @@ jobs:
       - name: Release notes
         id: notes
         if: steps.moved.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           short="${{ steps.what.outputs.short }}"
+          # Everything that landed since the previous build of this kind, not
+          # just the top commit (issue #76): the last nightly tag for a
+          # nightly, the dev release's commit for dev. With nothing to measure
+          # from (the first build, a shallow clone) the top commit alone.
+          if [ "${{ steps.what.outputs.kind }}" = "dev" ]; then
+            since=$(gh release view dev --json targetCommitish --jq .targetCommitish 2>/dev/null || true)
+          else
+            since=$(git tag -l 'nightly-*' --sort=-creatordate | head -1)
+          fi
+          if [ -n "$since" ] && git rev-parse -q --verify "$since^{commit}" >/dev/null 2>&1 \
+             && [ "$(git rev-parse "$since^{commit}")" != "$(git rev-parse HEAD)" ]; then
+            changes=$(git log --no-merges --format='- %s (`%h`)' "$since..HEAD")
+          else
+            changes=""
+          fi
           {
             echo "Built from \`$short\` - $(git log -1 --format=%s)"
             echo
+            if [ -n "$changes" ]; then
+              echo "Since ${since#nightly-}:"
+              echo
+              echo "$changes"
+              echo
+            fi
             echo "| what | file |"
             echo "| --- | --- |"
             echo "| Windows x64 | \`chimera-win-x64-$short.zip\` |"
             echo "| Linux x64 | \`chimera-linux-x64-$short.tar.gz\` |"
             echo
-            echo "Both carry the frontend, its natives and every core package."
-            echo "\`BUILD.txt\` names the exact commit of each, and \`LICENSES.md\`"
-            echo "states the terms of the whole bundle."
+            echo "Both carry the frontend and its natives. They carry **no cores**:"
+            echo "open **File > Core Manager** and download the ones you want, from the"
+            echo "projects that build them. \`BUILD.txt\` names the exact commit this"
+            echo "was built from and \`LICENSES.md\` states its terms."
             echo
-            echo "**This bundle is NON-COMMERCIAL**: it includes cores (Genesis Plus GX,"
-            echo "Opera, Snes9x) whose licences forbid commercial use, and that binds the"
-            echo "whole distribution. See LICENSES.md."
+            echo "Each core brings its own licence with it, and some (Genesis Plus GX,"
+            echo "Opera, Snes9x) forbid commercial use - which binds whatever they are"
+            echo "installed into. Chimera shows a core's terms once it is installed."
             echo
             echo "Windows will warn that the executable is unsigned and from an unknown"
             echo "publisher; it is not signed, and there is no way around that warning"
             echo "short of buying a certificate."
             echo
-            echo "### Cores in this build"
-            echo
-            echo '```'
-            git submodule status extern/cores/* | sed 's/^ //'
-            echo '```'
+            if [ "${{ steps.what.outputs.kind }}" = "dev" ]; then
+              echo "> **Not for submissions.** A development build is replaced on every"
+              echo "> change, so it may stop being downloadable - which means a movie made"
+              echo "> on it can stop being replayable. Do **not** use a dev build to"
+              echo "> produce a TAS for submission to toolAssisted.run; use a"
+              echo "> [nightly](https://github.com/ToolAssisted-run/chimera/releases),"
+              echo "> which is dated and kept forever."
+              echo
+            fi
           } > build/release/NOTES.md
 
       - name: Publish the rolling dev release
@@ -203,57 +227,35 @@ jobs:
           # release with its tag and recreating it at the built commit goes
           # through the releases API, which has no such restriction, and keeps
           # the tag honest about which build the assets came from.
+          #
+          # Every call is retried and the release is ENSURED, not created: the
+          # API answers 5xx now and then, and on 2026-09-13 a 500 on this create
+          # cost the day's dev build. A create whose answer was lost may still
+          # have happened, so it looks before it tries again.
+          source tools/release-retry.sh
           gh release delete dev --yes --cleanup-tag 2>/dev/null || true
-          gh release create dev --target "${{ steps.what.outputs.sha }}" \
-            --title "Development build ${{ steps.what.outputs.short }}" \
-            --notes-file build/release/NOTES.md --prerelease
+          ensure_release dev "${{ steps.what.outputs.sha }}" \
+            "Development build ${{ steps.what.outputs.short }}" build/release/NOTES.md
 
           # straight away, so the window in which /releases/tag/dev has nothing
           # to download is as short as an upload
-          gh release upload dev build/release/chimera-*.zip build/release/chimera-*.tar.gz \
+          retry gh release upload dev build/release/chimera-*.zip build/release/chimera-*.tar.gz \
             build/release/LICENSES.md build/release/BUILD.txt --clobber
-
-      - name: Archive every distinct core package, forever
-        if: steps.moved.outputs.skip != 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          # A movie cites the SHA1 of the CORE PACKAGE that recorded it, and
-          # what a replay must match is that package: sync is the core, its
-          # settings and its firmware, not the frontend built around them. Core
-          # packages also change rarely - only when a core's submodule is bumped
-          # - and are small (five of the seven are about a megabyte).
-          #
-          # So every DISTINCT package is kept forever under one tag, named by
-          # its own hash. Whatever CorePackageSha1 a movie names, years later,
-          # is still downloadable - even if it was recorded on a rolling dev
-          # build whose bundle has long since been replaced.
-          gh release view cores >/dev/null 2>&1 || \
-            gh release create cores --title "Core package archive" --prerelease --notes \
-              "Every distinct core package Chimera has published, named <core>-<sha1>.chimeraCore. A movie cites the SHA1 of the package that recorded it; this is where that package stays. Assets named <core>-<sha1>.zip are the same format under the older name."
-          existing=$(gh release view cores --json assets --jq '.assets[].name')
-          for zip in build/bundle-windows/Cores/*.chimeraCore; do
-            base=$(basename "$zip" .chimeraCore)
-            sha=$(sha1sum "$zip" | cut -c1-12)
-            asset="$base-$sha.chimeraCore"
-            if printf '%s\n' "$existing" | grep -qx "$asset"; then
-              echo "already archived: $asset"
-              continue
-            fi
-            cp "$zip" "build/release/$asset"
-            gh release upload cores "build/release/$asset"
-            echo "archived $asset"
-          done
 
       - name: Publish the nightly
         if: steps.moved.outputs.skip != 'true' && steps.what.outputs.kind == 'nightly'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          source tools/release-retry.sh
           tag="nightly-${{ steps.what.outputs.date }}"
-          gh release view "$tag" >/dev/null 2>&1 && { echo "$tag already exists"; exit 0; }
-          gh release create "$tag" --target "${{ steps.what.outputs.sha }}" \
-            --title "Nightly ${{ steps.what.outputs.date }} (${{ steps.what.outputs.short }})" \
-            --notes-file build/release/NOTES.md --prerelease
-          gh release upload "$tag" build/release/chimera-*.zip build/release/chimera-*.tar.gz \
+          # A nightly that holds its bundles is never republished; one that
+          # exists EMPTY is a publish that died between create and upload, and
+          # finishing it is the only way it becomes what its name says.
+          if gh release view "$tag" --json assets --jq '.assets[].name' 2>/dev/null | grep -q '^chimera-.*\.zip$'; then
+            echo "$tag already exists"; exit 0
+          fi
+          ensure_release "$tag" "${{ steps.what.outputs.sha }}" \
+            "Nightly ${{ steps.what.outputs.date }} (${{ steps.what.outputs.short }})" build/release/NOTES.md
+          retry gh release upload "$tag" build/release/chimera-*.zip build/release/chimera-*.tar.gz \
             build/release/LICENSES.md build/release/BUILD.txt --clobber

@@ -29,6 +29,40 @@ namespace Chimera.Client.GUI
 		[return: MarshalAs(UnmanagedType.Bool)]
 		private static extern bool DeleteFileW(string lpFileName);
 
+		private static void SettleDataDirectory(Config config, string configPath)
+		{
+			static void Tell(string message)
+			{
+				if (HeadlessMode.Enabled) HeadlessMode.LogSuppressedWarning(message);
+				else MessageBox.Show(message, "Chimera's data directory", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+			}
+
+			if (config.DataDirectoryPending is not null)
+			{
+				var told = DataDirectory.ApplyPending(config, static (from, to) =>
+				{
+					using var progress = ProgressDialog.Begin(null, "Moving Chimera's data");
+					return DataDirectory.Move(from, to, (done, total) => progress.Report($"moving to {to}", done, total));
+				});
+				// now, not at exit: a session that dies must not find the change still waiting and
+				// try to move a directory that has already gone
+				if (ConfigService.Save(configPath, config).IsError) Console.WriteLine("[data] the config could not be saved");
+				if (told is not null) Tell(told);
+			}
+
+			var custom = config.DataDirectory;
+			if (custom.Length is not 0 && !ProjectCache.DecidedByEnvironment && !DataDirectory.Writable(custom))
+			{
+				// a drive that is not plugged in today. The setting is KEPT: tomorrow it may be back,
+				// and forgetting it would leave the data there orphaned and a fresh set growing here.
+				Tell($"Chimera's data directory, {custom}, cannot be used right now (is the drive there?).\n\n"
+					+ $"This session keeps its data in {ProjectCache.DefaultDataHome} instead. The setting has not been changed.");
+				custom = "";
+			}
+			ProjectCache.CustomDataHome = custom;
+			if (CrashCapture.Repoint() is { } why) Console.WriteLine($"[crash] notes stay where they were: {why}");
+		}
+
 		public static void EnsureWinFormsInitialized()
 		{
 			Application.EnableVisualStyles();
@@ -101,12 +135,66 @@ namespace Chimera.Client.GUI
 		private static int Main(string[] args)
 			=> SubMain(args);
 
+		// What the crash handlers call on the window, once there is one. Delegates of framework types
+		// and not a MainForm field: a static field's TYPE is loaded with Program itself, which is before
+		// the resolver that finds Chimera's own assemblies is in place - a MainForm field made every
+		// start fail with a TypeLoadException.
+		private static Action _keepWorkSafe;
+
+		private static Action<Exception, string> _recoverFromError;
+
+		private static void OnUiThreadException(object sender, System.Threading.ThreadExceptionEventArgs e)
+		{
+			try
+			{
+				_keepWorkSafe?.Invoke();
+			}
+			catch (Exception)
+			{
+				// keeping the work is best effort here; the journal already holds every input
+			}
+			if (IsHeadless())
+			{
+				// nobody can answer a dialog, and an unattended run that swallowed an error would pass
+				Console.Error.WriteLine($"[headless] fatal exception: {e.Exception}");
+				Environment.Exit(1);
+			}
+			_recoverFromError?.Invoke(e.Exception, "Chimera hit an error");
+		}
+
+		private static void OnUnhandledException(object sender, UnhandledExceptionEventArgs e)
+		{
+			Console.Error.WriteLine($"fatal exception: {e.ExceptionObject}");
+			try
+			{
+				_keepWorkSafe?.Invoke();
+			}
+			catch (Exception)
+			{
+				// the process is ending either way; every input is already on disk
+			}
+		}
+
+		[System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+		private static bool IsHeadless() => HeadlessMode.Enabled;
+
 		// NoInlining should keep this code from getting jammed into Main() which would create dependencies on types which havent been setup by the resolver yet... or something like that
 		[System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
 		private static int SubMain(string[] args)
 		{
 			// raw scan, not ArgParser: several dialogs below can fire before arguments are parsed
-			if (Array.IndexOf(args, "--headless") >= 0) HeadlessMode.Enabled = true;
+			if (Array.IndexOf(args, "--headless") >= 0 || Array.Exists(args, a => a.StartsWith("--precompile", StringComparison.Ordinal))) HeadlessMode.Enabled = true;
+
+			// An error that can be caught must not be what ends a session (docs/project.md,
+			// "Recovery"). On the UI thread it is survived: the work is snapshotted, emulation
+			// pauses and the person is told. On any other thread the runtime ends the process
+			// whatever a handler does, so the handler keeps the work and lets it go - and the
+			// inputs themselves never depended on either, being journaled as they are entered.
+			if (!Debugger.IsAttached)
+			{
+				Application.ThreadException += OnUiThreadException;
+				AppDomain.CurrentDomain.UnhandledException += OnUnhandledException;
+			}
 
 			// this check has to be done VERY early.  i stepped through a debug build with wrong .dll versions purposely used,
 			// and there was a TypeLoadException before the first line of SubMain was reached (some static ColorType init?)
@@ -192,6 +280,14 @@ namespace Chimera.Client.GUI
 				}
 			}
 
+			// A crash that no handler sees - a graphics driver's fast fail - still leaves a
+			// note saying what failed and where, written from outside the process by Windows
+			// Error Reporting (docs/project.md, "Crash notes").
+			if (!OSTailoredCode.IsUnixHost && CrashCapture.Arm(Path.Combine(AppContext.BaseDirectory, "dll")) is { } crashNotesOff)
+			{
+				Console.Error.WriteLine($"[crash] no crash notes this session: {crashNotesOff}");
+			}
+
 			TempFileManager.Start();
 
 			ChimeraFile.DearchivalMethod = SharpCompressDearchivalMethod.Instance;
@@ -217,6 +313,11 @@ namespace Chimera.Client.GUI
 			typeof(Form).GetField(OSTailoredCode.IsUnixHost ? "default_icon" : "defaultIcon", BindingFlags.NonPublic | BindingFlags.Static)!
 				.SetValue(null, Properties.Resources.Logo);
 
+			// before any rom is loaded: firmware named on the command line is what
+			// this run uses, whatever the config remembers
+			CoreFirmwareStore.CommandLineFirmware =
+				CoreFirmwareStore.ParseFirmwareArgs(cliFlags.cmdFirmware);
+
 			var configPath = cliFlags.cmdConfigFile ?? Path.Combine(PathUtils.ExeDirectoryPath, "config.ini");
 
 			Config initialConfig;
@@ -239,6 +340,12 @@ namespace Chimera.Client.GUI
 			initialConfig.ResolveDefaults();
 			// initialConfig should really be globalConfig as it's mutable
 
+			// Where everything per-user lives (issue #52), settled HERE: after the config that says
+			// so has been read and before anything has opened a file there. A change asked for in
+			// the last session is carried out now for the same reason - nothing holds a state
+			// history, a package or a journal open yet, so nothing has to be closed to move it.
+			SettleDataDirectory(initialConfig, configPath);
+
 			// must be done VERY early, before any SDL_Init calls can be done
 			// if this isn't done, SIGINT/SIGTERM get swallowed by SDL
 			if (OSTailoredCode.IsUnixHost)
@@ -249,31 +356,44 @@ namespace Chimera.Client.GUI
 			// OpenGL is the one display driver: no multiplexing, no fallbacks. A machine
 			// that cannot give us a 3.2 context gets a clear refusal, not a degraded mode.
 			IGL workingGL;
+			// Which step gave up, and what the driver said: everything in here used
+			// to surface as one sentence about OpenGL 3.2, whether the driver had
+			// refused a context, answered with a lower version, or compiled the GUI
+			// shaders badly - and the probe's own findings went to standard error,
+			// which a Windows user never sees (issue #39).
+			var glStep = "probing the display driver";
 			try
 			{
-				if (!IGL_OpenGL.Available) throw new InvalidOperationException("no OpenGL 3.2 context could be created");
+				if (!IGL_OpenGL.Available) throw new InvalidOperationException(OpenGLVersion.LastProbe);
 
 				// need to have a context active for checking the renderer, will be disposed afterwards
+				glStep = "creating a 3.2 core context";
 				using (new SDL2OpenGLContext(3, 2, true))
 				{
+					glStep = "setting up the GL state";
 					using var testOpenGL = new IGL_OpenGL();
 					testOpenGL.InitGLState();
+					glStep = "building the GUI renderer";
 					using (testOpenGL.CreateGuiRenderer()) {}
 				}
 
 				// don't return the same IGL, we don't want the test context to be part of this IGL
+				glStep = "creating the display's own context";
 				workingGL = new IGL_OpenGL();
 			}
 			catch (Exception ex)
 			{
-				const string GL_FATAL_MSG = "This frontend requires OpenGL 3.2, and this machine's display driver did not provide it.\nUpdate or install a graphics driver with OpenGL 3.2 support.";
+				var glFatalMsg = "This frontend requires OpenGL 3.2, and this machine's display driver did not provide it."
+					+ "\nUpdate or install a graphics driver with OpenGL 3.2 support."
+					+ $"\n\nIt failed while {glStep}: {ex.Message}"
+					+ $"\nThe probe found: {OpenGLVersion.LastProbe}";
 				if (HeadlessMode.Enabled)
 				{
-					Console.Error.WriteLine($"{GL_FATAL_MSG}\n{ex}");
+					Console.Error.WriteLine($"{glFatalMsg}\n{ex}");
 				}
 				else
 				{
-					new ExceptionBox(new Exception(GL_FATAL_MSG, ex)).ShowDialog();
+					new ExceptionBox(new Exception(glFatalMsg, ex)).ShowDialog();
 				}
 				return -1;
 			}
@@ -348,6 +468,8 @@ namespace Chimera.Client.GUI
 					// ReSharper disable once AccessToDisposedClosure
 					mf.Config = initialConfig;
 				};
+				_keepWorkSafe = mf.KeepWorkSafe;
+				_recoverFromError = mf.RecoverFromError;
 				mf.Show();
 				try
 				{
@@ -357,6 +479,15 @@ namespace Chimera.Client.GUI
 				}
 				catch (Exception e) when (movieSession.Movie.IsActive() && !Debugger.IsAttached)
 				{
+					// kept before anything is asked: whatever the answer below, the work survives
+					try
+					{
+						mf.KeepWorkSafe();
+					}
+					catch (Exception)
+					{
+						// best effort; every input is already journaled
+					}
 					if (HeadlessMode.Enabled)
 					{
 						Console.Error.WriteLine($"[headless] fatal exception (movie active, not saving): {e}");

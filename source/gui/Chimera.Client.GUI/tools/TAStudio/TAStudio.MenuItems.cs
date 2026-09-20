@@ -71,6 +71,50 @@ namespace Chimera.Client.GUI
 		public void SaveProjectBackup()
 			=> DisplayMessageIfFailed(() => SaveTas(saveBackup: true), "Failed to save backup.");
 
+		/// <summary>
+		/// The project's inputs, markers and branches, saved with no greenzone (a core that stopped
+		/// leaves one nobody should trust). True when it was saved; a Save As that was cancelled is not.
+		/// </summary>
+		public bool SaveProjectWithoutGreenzone()
+		{
+			FileWriteResult result = null;
+			DisplayMessageIfFailed(() => result = SaveTas(withoutGreenzone: true), "Failed to save the project.");
+			return result is { IsError: false };
+		}
+
+		/// <summary>
+		/// After the core stopped: the machine put back on a stored frame, which brings it back to life,
+		/// and one short seek to <paramref name="frame"/> so there is a picture again. False when the
+		/// greenzone cannot produce anything at or before it.
+		/// </summary>
+		public bool GoBackToSafePoint(int frame)
+		{
+			var prior = CurrentTasMovie.States.Nearest(frame > 0 ? frame - 1 : 0);
+			if (prior < 0 || !CurrentTasMovie.States.RestoreTo(prior)) return false;
+			AfterStateLoaded(prior, null);
+			if (prior != frame) GoToFrame(frame);
+			RefreshDialog();
+			return true;
+		}
+
+		/// <summary>
+		/// After the core stopped: the greenzone cleared back to its first frame, the machine put back
+		/// on frame 0 - the state it booted to - and played from there. Nothing is reloaded, so nothing
+		/// unsaved is lost; the inputs replay into a machine that starts again. False when the greenzone
+		/// does not hold frame 0.
+		/// </summary>
+		public bool RestartFromFrameZero()
+		{
+			if (CurrentTasMovie.States.Nearest(0) != 0) return false;
+			CurrentTasMovie.States.InvalidateAfter(0);
+			if (!CurrentTasMovie.States.RestoreTo(0)) return false;
+			AfterStateLoaded(0, null);
+			TastudioPlayMode();
+			RefreshDialog();
+			MainForm.UnpauseEmulator();
+			return true;
+		}
+
 		private void SaveSelectionToMacroMenuItem_Click(object sender, EventArgs e)
 		{
 			if (!AnyRowsSelected)
@@ -177,7 +221,7 @@ namespace Chimera.Client.GUI
 					&& Clipboard.ContainsText();
 
 			ClearGreenzoneMenuItem.Enabled =
-				CurrentTasMovie != null && CurrentTasMovie.TasStateManager.Count > 1;
+				CurrentTasMovie?.States is { Count: > 1 };
 
 			GreenzoneICheckSeparator.Visible =
 				StateHistoryIntegrityCheckMenuItem.Visible =
@@ -512,12 +556,20 @@ namespace Chimera.Client.GUI
 		/// Frame 0's state survives the clear (it is reserved), so this is a load
 		/// rather than a reboot.
 		/// </summary>
-		private void ClearGreenzoneMenuItem_Click(object sender, EventArgs e)
+		public void ClearGreenzone()
 		{
-			CurrentTasMovie.TasStateManager.Clear();
+			CurrentTasMovie.States.InvalidateAfter(0);   // everything but the anchor
 			GoToFrame(0);
 			RefreshDialog();
 		}
+
+		/// <summary>
+		/// The menu item, and the Lua binding beside it (tastudio.cleargreenzone),
+		/// are the same action: a crash that only happens after the greenzone is
+		/// thrown away has no other way to be reproduced unattended, and the soak
+		/// script is where that reproduction has to live.
+		/// </summary>
+		private void ClearGreenzoneMenuItem_Click(object sender, EventArgs e) => ClearGreenzone();
 
 		private void StateHistoryIntegrityCheckMenuItem_Click(object sender, EventArgs e)
 		{
@@ -531,17 +583,26 @@ namespace Chimera.Client.GUI
 
 			GoToFrame(0);
 			int lastState = 0;
-			int goToFrame = CurrentTasMovie.TasStateManager.Last;
+			int goToFrame = CurrentTasMovie.States.Nearest(int.MaxValue);
+			if (goToFrame <= 0)
+			{
+				DialogController.ShowMessageBox("The state history holds nothing to check yet.", "Integrity Check");
+				return;
+			}
 			do
 			{
 				MainForm.FrameAdvance();
 
-				if (CurrentTasMovie.TasStateManager.HasState(Emulator.Frame))
+				if (CurrentTasMovie.States.Has(Emulator.Frame))
 				{
-					Stream greenStream = CurrentTasMovie.TasStateManager.GetStateClosestToFrame(Emulator.Frame).Value;
-					byte[] greenZone = new byte[greenStream.Length];
-					greenStream.Read(greenZone);
+					// The history no longer holds a frame as bytes - most frames
+					// are reached by walking deltas from an anchor - so the check
+					// is "does it put me back where I am": save the machine, ask
+					// the history for this frame, save again, compare. It lands on
+					// the frame it started on either way, so the walk goes on.
 					byte[] state = StatableEmulator.CloneSavestate();
+					CurrentTasMovie.States.RestoreTo(Emulator.Frame);
+					byte[] greenZone = StatableEmulator.CloneSavestate();
 
 					if (!state.SequenceEqual(greenZone))
 					{
@@ -958,8 +1019,6 @@ namespace Chimera.Client.GUI
 				{
 					GeneralClientSettings = Settings,
 					MovieSettings = _movieSettings,
-					CurrentStateManagerSettings = CurrentTasMovie.TasStateManager.Settings,
-					DefaultStateManagerSettings = Config.Movies.DefaultTasStateManagerSettings,
 				},
 				MovieSession.MovieController.Definition,
 				(s) =>
@@ -981,13 +1040,6 @@ namespace Chimera.Client.GUI
 					foreach (InputRoll roll in _inputRolls) roll.ResumeDrawing();
 
 					UpdateAutoFire();
-
-					if (CurrentTasMovie.TasStateManager.Settings != s.CurrentStateManagerSettings)
-					{
-						bool keep = DialogController.ShowMessageBox2("Attempt to keep old states?", "Keep old states?");
-						CurrentTasMovie.TasStateManager = CurrentTasMovie.TasStateManager.UpdateSettings(s.CurrentStateManagerSettings, keep);
-					}
-					Config.Movies.DefaultTasStateManagerSettings = s.DefaultStateManagerSettings;
 
 					UpdateChangeLogMaxSteps(Settings.MaxUndoSteps);
 					CurrentTasMovie.BindMarkersToInput = Settings.BindMarkersToInput;

@@ -7,7 +7,7 @@
 #
 #   Windows artifacts (.dll, cross-built via mingw-w64):
 #     meson setup build/meson-windows --prefix "$(pwd)/build" --libdir dll \
-#         --cross-file extern/tools/meson/mingw-w64.ini
+#         --cross-file extern/meson/mingw-w64.ini
 #     meson compile -C build/meson-windows
 #     meson install -C build/meson-windows
 #
@@ -36,21 +36,41 @@ thread_dep = dependency('threads')
 # libchimerahash: hardware-accelerated hashing (in-repo sources)
 # ---------------------------------------------------------------------------
 chimerahash_src = files(
-  'extern/tools/LibChimeraHash/chimerainterface.c',
-  'extern/tools/LibChimeraHash/common/x86_features.c',
-  'extern/tools/LibChimeraHash/crc32/crc32_braid.c',
-  'extern/tools/LibChimeraHash/crc32/crc32_fold_pclmulqdq.c',
-  'extern/tools/LibChimeraHash/crc32/crc32_fold_vpclmulqdq.c',
-  'extern/tools/LibChimeraHash/sha1/sha1_sha.c',
+  'extern/LibChimeraHash/chimerainterface.c',
+  'extern/LibChimeraHash/common/x86_features.c',
+  'extern/LibChimeraHash/crc32/crc32_braid.c',
+  'extern/LibChimeraHash/crc32/crc32_fold_pclmulqdq.c',
+  'extern/LibChimeraHash/crc32/crc32_fold_vpclmulqdq.c',
+  'extern/LibChimeraHash/sha1/sha1_sha.c',
 )
 shared_library(
   'chimerahash',
   chimerahash_src,
-  include_directories: include_directories('extern/tools/LibChimeraHash/common'),
+  include_directories: include_directories('extern/LibChimeraHash/common'),
   gnu_symbol_visibility: 'hidden',
   install: true,
   install_dir: 'dll',
 )
+
+# ---------------------------------------------------------------------------
+# chimera_crash: the crash note a Windows fast-fail cannot stop (in-repo source;
+# runs inside WerFault.exe, never in Chimera - see source/crash/chimera_crash.c)
+# ---------------------------------------------------------------------------
+if host_windows
+  # the GL calls in a note are named from the same master list the bridge numbers by
+  chimera_crash_gl_names = custom_target('chimera-crash-gl-names',
+    output: 'gl_names.h',
+    command: [find_program('python3'), files('source/crash/gen-gl-names.py'),
+      files('extern/chimera-common-minibox/source/gl/gl-entry-points.txt'), '@OUTPUT@'])
+  shared_library(
+    'chimera_crash',
+    ['source/crash/chimera_crash.c', chimera_crash_gl_names],
+    name_prefix: '',
+    dependencies: [cc.find_library('dbghelp'), cc.find_library('psapi')],
+    install: true,
+    install_dir: 'dll',
+  )
+endif
 
 # ---------------------------------------------------------------------------
 # lua54: the Lua 5.4 runtime (stock upstream sources, pinned submodule)
@@ -63,7 +83,7 @@ foreach f : [
   'lstate', 'lstring', 'lstrlib', 'ltable', 'ltablib', 'ltm', 'lundump',
   'lutf8lib', 'lvm', 'lzio',
 ]
-  lua_src += files('extern/tools/lua' / f + '.c')
+  lua_src += files('extern/lua' / f + '.c')
 endforeach
 lua54 = shared_library(
   'lua54',
@@ -89,7 +109,7 @@ if host_windows
 endif
 shared_library(
   'e_sqlite3',
-  files('extern/tools/sqlite3/sqlite3/sqlite3.c'),
+  files('extern/sqlite3/sqlite3/sqlite3.c'),
   name_prefix: host_windows ? '' : 'lib',
   c_args: sqlite_args,
   dependencies: [m_dep, dl_dep, thread_dep],
@@ -109,12 +129,12 @@ endif
 shared_library(
   'cimgui',
   files(
-    'extern/tools/cimgui/cimgui.cpp',
-    'extern/tools/cimgui/imgui/imgui.cpp',
-    'extern/tools/cimgui/imgui/imgui_demo.cpp',
-    'extern/tools/cimgui/imgui/imgui_draw.cpp',
-    'extern/tools/cimgui/imgui/imgui_tables.cpp',
-    'extern/tools/cimgui/imgui/imgui_widgets.cpp',
+    'extern/cimgui/cimgui.cpp',
+    'extern/cimgui/imgui/imgui.cpp',
+    'extern/cimgui/imgui/imgui_demo.cpp',
+    'extern/cimgui/imgui/imgui_draw.cpp',
+    'extern/cimgui/imgui/imgui_tables.cpp',
+    'extern/cimgui/imgui/imgui_widgets.cpp',
   ),
   name_prefix: host_windows ? '' : 'lib',
   cpp_args: cimgui_args,
@@ -131,7 +151,7 @@ luasocket_common = [
 ]
 luasocket_src = []
 foreach f : luasocket_common + [host_windows ? 'wsocket' : 'usocket']
-  luasocket_src += files('extern/tools/luasocket/src' / f + '.c')
+  luasocket_src += files('extern/luasocket/src' / f + '.c')
 endforeach
 luasocket_args = []
 luasocket_deps = []
@@ -140,23 +160,23 @@ if host_windows
   luasocket_deps += cc.find_library('ws2_32')
 endif
 # both modules must be named "core" on disk; meson target names and per-dir
-# outputs are unique, so each builds in its own subdir (extern/tools/meson/luasocket-*)
-lua_inc = include_directories('extern/tools/lua')
-subdir('extern/tools/meson/luasocket-socket')
-subdir('extern/tools/meson/luasocket-mime')
+# outputs are unique, so each builds in its own subdir (extern/meson/luasocket-*)
+lua_inc = include_directories('extern/lua')
+subdir('extern/meson/luasocket-socket')
+subdir('extern/meson/luasocket-mime')
 
 # ---------------------------------------------------------------------------
 # zstd: savestate compression; upstream's own meson build, nested
 # ---------------------------------------------------------------------------
-nested_tool = files('extern/tools/meson/nested-build.sh')
-cross_arg = host_windows ? '--cross-file=' + repo_root / 'extern/tools/meson/mingw-w64.ini' : ''
+nested_tool = files('extern/meson/nested-build.sh')
+cross_arg = host_windows ? '--cross-file=' + repo_root / 'extern/meson/mingw-w64.ini' : ''
 zstd_out = host_windows ? 'libzstd.dll' : 'libzstd.so'
 custom_target(
   'zstd',
   output: zstd_out,
   command: [
     nested_tool, 'meson',
-    repo_root / 'extern/tools/zstd/build/meson',
+    repo_root / 'extern/zstd/build/meson',
     '@OUTDIR@' / 'zstd-build',
     '@OUTPUT@',
     cross_arg,
@@ -170,13 +190,13 @@ custom_target(
 # ---------------------------------------------------------------------------
 # SDL2 + OpenAL Soft: cmake-driven, via the wrapper script
 # ---------------------------------------------------------------------------
-cmake_toolchain = host_windows ? repo_root / 'extern/tools/meson/mingw-toolchain.cmake' : ''
+cmake_toolchain = host_windows ? repo_root / 'extern/meson/mingw-toolchain.cmake' : ''
 custom_target(
   'sdl2',
   output: host_windows ? 'SDL2.dll' : 'libSDL2.so',
   command: [
     nested_tool, 'cmake',
-    repo_root / 'extern/tools/SDL2',
+    repo_root / 'extern/SDL2',
     '@OUTDIR@' / 'sdl2-build',
     '@OUTPUT@',
     cmake_toolchain,
@@ -190,7 +210,7 @@ custom_target(
   output: host_windows ? 'OpenAL32.dll' : 'libopenal.so',
   command: [
     nested_tool, 'cmake',
-    repo_root / 'extern/tools/openal-soft',
+    repo_root / 'extern/openal-soft',
     '@OUTDIR@' / 'openal-build',
     '@OUTPUT@',
     cmake_toolchain,
@@ -203,13 +223,13 @@ custom_target(
 )
 
 # ---------------------------------------------------------------------------
-# libminiboxhost: the miniBox waterbox host (from the extern/tools/chimera-common-minibox submodule).
+# libminiboxhost: the miniBox waterbox host (from the extern/chimera-common-minibox submodule).
 # Chimera is waterbox-only: this host loads every core's core.wbx, so it ships
 # with the frontend. It is self-contained C (no external deps, no guest
 # toolchain), so we compile it directly here rather than driving miniBox's own
 # meson build - the guest toolchain (musl) is a core-author kit, never built here.
 # ---------------------------------------------------------------------------
-minibox_host = repo_root / 'extern/tools/chimera-common-minibox/source/host'
+minibox_host = repo_root / 'extern/chimera-common-minibox/source/host'
 minibox_host_src = files(
   minibox_host / 'diag.c',
   minibox_host / 'sha256.c',
@@ -217,6 +237,7 @@ minibox_host_src = files(
   minibox_host / 'tripguard.c',
   minibox_host / 'interop_bin.c',
   minibox_host / 'context.c',
+  minibox_host / 'guarded.S',
   minibox_host / 'elf.c',
   minibox_host / 'fs.c',
   minibox_host / 'host.c',
@@ -229,7 +250,7 @@ minibox_host_src = files(
 # frontend shows it and a movie records it, so every binary in the emulation path can
 # say where it came from. Inputs only, never a timestamp.
 minibox_commit = run_command(
-  'git', '-C', repo_root / 'extern/tools/chimera-common-minibox', 'rev-parse', '--short=12', 'HEAD',
+  'git', '-C', repo_root / 'extern/chimera-common-minibox', 'rev-parse', '--short=12', 'HEAD',
   check: false).stdout().strip()
 if minibox_commit == ''
   minibox_commit = 'unknown'
@@ -242,7 +263,7 @@ shared_library(
   'miniboxhost',
   minibox_host_src,
   name_prefix: 'lib',  # libminiboxhost.{so,dll} on both targets (the adapter resolves this name)
-  include_directories: include_directories('extern/tools/chimera-common-minibox/source/host'),
+  include_directories: include_directories('extern/chimera-common-minibox/source/host'),
   c_args: [
     '-fno-strict-aliasing',
     '-DMB_BUILD_COMMIT="' + minibox_commit + '"',
@@ -264,11 +285,14 @@ shared_library(
 engine_inc = include_directories('source/engine/include')
 engine_src = files(
   'source/engine/source/engine.cpp',
+  'source/engine/source/cache_bridge.cpp',
   'source/engine/source/movie_log.cpp',
   'source/engine/source/movie_text.cpp',
   'source/engine/source/state_container.cpp',
+  'source/engine/source/state_format.cpp',
   'source/engine/source/zstd_dyn.cpp',
   'source/engine/source/sha1.cpp',
+  'source/engine/source/progress.cpp',
   'source/engine/source/firmware.cpp',
   'source/engine/source/conditions.cpp',
   'source/engine/source/multifile.cpp',
@@ -279,9 +303,15 @@ engine_src = files(
   'source/engine/source/host_dyn.cpp',
   'source/engine/source/movie_entry.cpp',
   'source/engine/source/session.cpp',
+  'source/engine/source/state_history.cpp',
+  'source/engine/source/work_thread.cpp',
+  'source/engine/source/media_maker.cpp',
+  'source/engine/source/media_iso.cpp',
+  'source/engine/source/media_fat12.cpp',
   'source/engine/source/gl_bridge.cpp',
-  'extern/tools/miniz/miniz.c',  # vendored (MIT): the zip half of the state container
-  'extern/tools/cjson/cJSON.c',  # vendored (MIT): bundle JSON
+  'source/engine/source/ram_search.cpp',
+  'extern/miniz/miniz.c',  # vendored (MIT): the zip half of the state container
+  'extern/cjson/cJSON.c',  # vendored (MIT): bundle JSON
 )
 # Provenance: this repo's commit, since the engine lives in-tree. Inputs only.
 engine_commit = run_command(
@@ -291,7 +321,11 @@ if engine_commit == ''
   engine_commit = 'unknown'
 endif
 engine_build_args = [
+  '-I' + repo_root / 'extern/chimera-common-minibox/source/cache',
   '-DCE_BUILD_COMMIT="' + engine_commit + '"',
+  # where the tree is, for the one test that reads it: test_state_format checks
+  # the sandbox's own magic strings still say what the state layout claims
+  '-DCE_REPO_ROOT="' + repo_root + '"',
   '-DCE_BUILD_COMPILER="' + meson.get_compiler('cpp').get_id() + ' ' + meson.get_compiler('cpp').version() + '"',
   '-DCE_BUILD_OS="' + minibox_build_os + '"',
   # miniz's zlib-name-compat macros (#define compress mz_compress) leak into
@@ -316,19 +350,25 @@ if gl_bridge
   gl_bridge_gen = custom_target('ce-gl-bridge',
     output: ['gl-bridge-host.inc', 'gl-bridge-ops.h', 'gl-bridge-guest.cpp'],
     command: [find_program('python3'),
-      repo_root / 'extern/tools/chimera-common-minibox/source/gl/gen-gl-bridge.py',
-      repo_root / 'extern/tools/glad/include/glad/gl.h',
-      repo_root / 'extern/tools/chimera-common-minibox/source/gl/gl-entry-points.txt',
-      '@OUTDIR@'])
+      repo_root / 'extern/chimera-common-minibox/source/gl/gen-gl-bridge.py',
+      repo_root / 'extern/glad/include/glad/gl.h',
+      repo_root / 'extern/chimera-common-minibox/source/gl/gl-entry-points.txt',
+      '@OUTDIR@'],
+    # the list and the generator are inputs: without saying so, appending an
+    # entry point leaves the host still answering the old numbering
+    depend_files: [
+      files('extern/chimera-common-minibox/source/gl/gl-entry-points.txt'),
+      files('extern/chimera-common-minibox/source/gl/gen-gl-bridge.py'),
+    ])
 
-  gl_bridge_src = [gl_bridge_gen[0], files('extern/tools/glad/src/gl.c')]
+  gl_bridge_src = [gl_bridge_gen[0], files('extern/glad/src/gl.c')]
   engine_build_args += ['-DCE_GL_BRIDGE',
-    '-I' + repo_root / 'extern/tools/glad/include',
-    '-I' + repo_root / 'extern/tools/chimera-common-minibox/source/gl',
+    '-I' + repo_root / 'extern/glad/include',
+    '-I' + repo_root / 'extern/chimera-common-minibox/source/gl',
     '-I' + meson.current_build_dir()]
 
   if host_windows
-    gl_bridge_src += files('extern/tools/glad/src/wgl.c')
+    gl_bridge_src += files('extern/glad/src/wgl.c')
     gl_bridge_deps = [meson.get_compiler('cpp').find_library('opengl32', required: true)]
   else
     gl_bridge_deps = [meson.get_compiler('cpp').find_library('EGL', required: true)]
@@ -353,12 +393,27 @@ executable(
   cpp_args: engine_build_args,
   c_args: engine_build_args,
   dependencies: [dl_dep] + gl_bridge_deps,
+  # CommandLineToArgvW: the tool takes its arguments from the wide command line on Windows
+  link_args: host_machine.system() == 'windows' ? ['-lshell32'] : [],
   install: true,
   install_dir: 'dll',  # beside libminiboxhost + libzstd, which it loads from its own directory
 )
 
 if not meson.is_cross_build()
-  foreach engine_test : ['sha1', 'movie_log', 'movie_text', 'movie_entry', 'state_container', 'package', 'multifile', 'project', 'firmware']
+  # Not a test: what a captured frame costs when the budget is full and
+  # stretches are going to disk, in line and on the writer. Built with the
+  # tests because it needs the engine; run by tests/perf/run-spillbench.sh.
+  executable(
+    'spillbench',
+    ['tests/perf/spillbench.cpp'] + engine_src + gl_bridge_src,
+    include_directories: engine_inc,
+    cpp_args: engine_build_args,
+    c_args: engine_build_args,
+    dependencies: [dl_dep] + gl_bridge_deps,
+    build_by_default: false,
+  )
+
+  foreach engine_test : ['sha1', 'movie_log', 'movie_text', 'movie_entry', 'state_container', 'state_format', 'package', 'multifile', 'project', 'firmware', 'state_history', 'media', 'gl_flight', 'gl_sync', 'gl_buffer_pool', 'stride_tuner', 'greenzone_shape', 'ram_search']
     test(
       'engine_' + engine_test,
       executable(

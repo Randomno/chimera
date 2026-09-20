@@ -42,6 +42,35 @@ CE_API uint32_t ce_abi_version(void);
  * Static string, never invalidated. */
 CE_API const char *ce_build_info(void);
 
+/* ---- do this build and this state understand each other? (issue #115) ----
+ *
+ * Three answers to one question, weakest first. The first two are for a person
+ * to read; the third is what actually decides.
+ *
+ * 1. ce_version_skew: whether this Chimera and the core package a project runs
+ *    on were built far enough apart to be worth mentioning. Both dates are
+ *    YYYY-MM-DD - the frontend's is its commit's date, the core's is the
+ *    "versionDate" its package stamps (issue #67). Returns the sentence to show,
+ *    or NULL when they are close enough or either side does not say. It is a
+ *    guess and never a refusal: an old pairing that works must keep working.
+ *    Borrowed until the next call on this thread.
+ *
+ * 2. ce_state_writer_id: the build that wrote the states this session writes.
+ *    The engine and the frontend come out of one repository at one commit, so
+ *    this names the frontend too. Static string.
+ *
+ * 3. ce_state_format: the shape of a machine state as this build writes and
+ *    reads it (source/engine/source/state_format.hpp). Every state file carries
+ *    it and every load checks it, so a state of another format is refused by
+ *    name instead of reaching a machine that cannot read it. The frontend
+ *    records it in the project so a whole cache can be explained at open,
+ *    before any one state is asked for. */
+CE_API const char *ce_version_skew(
+	const char *frontend_date, const char *frontend_build,
+	const char *core_date, const char *core_build, const char *core_name);
+CE_API const char *ce_state_writer_id(void);
+CE_API uint32_t ce_state_format(void);
+
 /* ---- movie input log ----
  *
  * The [Input] lump of a movie: an ordered list of frame entries (the "|..|"
@@ -111,6 +140,42 @@ CE_API int64_t ce_movie_log_divergent_point(const ce_movie_log *a, const ce_movi
  * when the log has none. Returns the text and stores its byte length in
  * *len_out (may be NULL). Invalidated by any other call on the same log. */
 CE_API const char *ce_movie_log_serialize(ce_movie_log *log, int32_t crlf, uint64_t *len_out);
+
+/* The input journal: what somebody entered survives any end of the process.
+ *
+ * _journal_open writes the whole log to `path` (through a fresh file that then
+ * replaces it, so a crash mid-rewrite still leaves a whole journal) and from
+ * then on appends every change to this log as one line, flushed to the OS the
+ * moment it happens and synced to the disk at most once a second. Opening again
+ * rewrites the image and continues; that is how the journal is kept short.
+ * Returns 0 on success.
+ *
+ * _journal_close stops appending; with `remove` nonzero it also deletes the
+ * journal (a session that ended cleanly has nothing to recover). Freeing the
+ * log closes the journal but keeps the file.
+ *
+ * _journal_replay rebuilds `log` from a journal file (or from its ".new"
+ * sibling when the journal itself is missing). A last line with no line end -
+ * a record the crash cut short - is not replayed, and replay stops at the first
+ * record it cannot read. Returns the number of records applied, or -1 when the
+ * file is missing or not a journal (see _last_error). `log` should not itself
+ * be journaling. */
+CE_API int32_t ce_movie_log_journal_open(ce_movie_log *log, const char *path);
+CE_API void ce_movie_log_journal_close(ce_movie_log *log, int32_t remove);
+CE_API int32_t ce_movie_log_journaling(const ce_movie_log *log);
+CE_API int64_t ce_movie_log_journal_replay(ce_movie_log *log, const char *path);
+
+/* The frontend's own records ride the same journal - its markers and branches, which the engine
+ * carries without interpreting. _journal_open_with is _journal_open with the frontend's whole image
+ * (newline-separated records) written into the same fresh file right after the log's, so no rewrite
+ * can separate them. _journal_note appends one record, flushed and synced exactly like an input
+ * change (a record cannot hold a line end; one that does is written with spaces). A replay keeps the
+ * records it found, in the order they were written, readable through _note_count and _note_at
+ * (NULL out of range; invalidated by the next replay into the same log). */
+CE_API int32_t ce_movie_log_journal_open_with(ce_movie_log *log, const char *path, const char *frontend_image);
+CE_API void ce_movie_log_journal_note(ce_movie_log *log, const char *record);
+CE_API int64_t ce_movie_log_journal_note_count(const ce_movie_log *log);
+CE_API const char *ce_movie_log_journal_note_at(const ce_movie_log *log, int64_t index);
 
 /* ---- movie header ----
  *
@@ -257,11 +322,66 @@ CE_API const uint8_t *ce_state_reader_lump(
  * call on the same reader. */
 CE_API const char *ce_state_reader_last_error(ce_state_reader *r);
 
+/* ---- progress ----
+ *
+ * How far along a slow call is, for a frontend that shows a bar. The engine
+ * reports as it works: hashing a file (bytes of its length), compressing or
+ * reading a state lump (bytes), a boot's stages (no total), the compiled
+ * objects a boot fetches (a count, no total). The callback runs on the thread
+ * doing the work - the caller's own - so a frontend may pump its message loop
+ * from it; it must not call back into the engine. Pass a null fn to stop. */
+typedef void (*ce_progress_fn)(const char *stage, uint64_t done, uint64_t total, void *user);
+CE_API void ce_progress_set(ce_progress_fn fn, void *user);
+
 /* ---- identity hashing ----
  *
  * The hash the frontend identifies files by: roms, firmware.
  * Writes 40 uppercase hex characters plus a NUL into out41. */
 CE_API void ce_sha1_hex(const uint8_t *data, uint64_t len, char *out41);
+
+/* The same hash of a file, taken by reading it rather than by holding it: a
+ * firmware may be a disk image, and one that does not fit in memory still has
+ * an identity. Writes 40 uppercase hex characters plus a NUL into out41, and
+ * the length hashed into lenOut when it is given. Answers repeat calls from a
+ * cache keyed by path, size and mtime, so hashing the same file twice in a
+ * session costs one read. Returns 1 when the file was read, 0 when it was not. */
+CE_API int ce_sha1_file(const char *utf8Path, char *out41, uint64_t *lenOut);
+
+/* ---- reproducible media ----
+ *
+ * A folder turned into ONE file whose bytes depend on the folder's contents and
+ * names and on nothing else - not the clock, not the modification times the
+ * files carry, not the mode bits a copy left behind, not the order a directory
+ * listing came back in. Two people packing the same dump get the same SHA1.
+ *
+ * That is the whole point of it: a project stores names and SHA1s and never
+ * paths (docs/project.md), so a game that was dumped as a FOLDER can only
+ * become a project by becoming a file first, and it has to become the SAME file
+ * for everyone or a movie made on it cannot be verified by anybody else. */
+enum
+{
+	CE_MEDIA_ZIP_STORED = 0, /* one file, no compression: read by seeking */
+	CE_MEDIA_ISO9660 = 1,    /* ISO 9660 + Joliet, the disc the cores read */
+	CE_MEDIA_FAT12 = 2,      /* a 1.44 MB floppy image */
+};
+
+/* Called as the pack runs, often enough to drive a bar and name the file being
+ * written. Return 1 to carry on, 0 to cancel - a cancelled pack deletes what it
+ * had written, because a half-written image that still looks like an image is
+ * worse than no image. */
+typedef int32_t (*ce_media_progress_fn)(const char *file, uint64_t bytes_done,
+	uint64_t bytes_total, uint64_t files_done, uint64_t files_total, void *user);
+
+/* Returns 1 when the file was written. On 0, ce_media_last_error says why (and
+ * says "cancelled" when that is why). One pack at a time: the last hash and the
+ * last error are the caller's until the next call. */
+CE_API int32_t ce_media_make(const char *folder, const char *out_path, int32_t format,
+	ce_media_progress_fn progress, void *user);
+
+/* The SHA1 of what the last successful ce_media_make wrote - what a project
+ * would record - or "" if it did not finish. */
+CE_API const char *ce_media_last_sha1(void);
+CE_API const char *ce_media_last_error(void);
 
 /* ---- firmware ----
  *
@@ -431,6 +551,15 @@ CE_API ce_project *ce_project_open(const char *path, const char **error_out);
 CE_API int32_t ce_project_save(ce_project *p, const char *path, const char **error_out);
 CE_API void ce_project_free(ce_project *p);
 
+/* This project's identity, and no other's: minted when it is created, carried
+ * in the file, and stable across the file being renamed, moved or synced to
+ * another machine. The frontend keeps everything REGENERABLE that belongs to a
+ * project - the state history, and where this machine last found the project's
+ * files - in a per-user cache keyed by this, so the .chimeraProject stays the
+ * one file that has to travel (docs/state-manager.md). A project written
+ * before ids existed is given one when it is opened, and keeps it from its
+ * next save. Borrowed; valid until the project is freed. */
+CE_API const char *ce_project_id(const ce_project *p);
 CE_API const char *ce_project_title(const ce_project *p);
 CE_API void ce_project_set_title(ce_project *p, const char *title);
 CE_API const char *ce_project_description(const ce_project *p);
@@ -454,6 +583,19 @@ CE_API int32_t ce_project_set_settings_text(ce_project *p, const char *json, con
 /* The firmware pins, as a JSON array carried verbatim (the firmware
  * channel's record: id + SHA1 entries). Borrowed as above; the setter
  * rejects anything that does not parse as a JSON array. */
+/* What the core compiled for this game: a JSON array of {name, sha1}, one per
+ * cached object (docs/compile-cache.md). Regenerable from the same rom and
+ * package, recorded so a later open can check it is the same compiled code. */
+CE_API const char *ce_project_core_cache_text(ce_project *p, uint64_t *len_out);
+CE_API int32_t ce_project_set_core_cache_text(ce_project *p, const char *json, const char **error_out);
+/* TAStudio's layout of the piano roll (columns, order, widths, orientation, lag
+ * display) as a JSON object the frontend wrote and reads back; the engine only
+ * keeps it. "" when the project has none. The setter clears it on "" or null,
+ * and otherwise rejects anything that is not a JSON object. Not a sync setting:
+ * it travels with the project because it is part of the work somebody set up
+ * (issue #83). */
+CE_API const char *ce_project_tastudio_text(ce_project *p, uint64_t *len_out);
+CE_API int32_t ce_project_set_tastudio_text(ce_project *p, const char *json, const char **error_out);
 CE_API const char *ce_project_firmware_text(ce_project *p, uint64_t *len_out);
 CE_API int32_t ce_project_set_firmware_text(ce_project *p, const char *json, const char **error_out);
 
@@ -719,10 +861,70 @@ CE_API const char *ce_gl_description(void);
  * guest code by some other route can call it too. Harmless with no bridge, no
  * context, or nothing borrowed. */
 CE_API void ce_gl_release(void);
+
+/* The bridge's flight recorder: the last calls that crossed, an opcode each,
+ * with markers where a frame took and gave back the context, a state was
+ * loaded and a session took the bridge. A fixed block in this library's
+ * memory, written as calls cross, so a crash module reading the dead process
+ * finds what the driver was doing (docs/gpu-bridge.md, "The flight recorder").
+ * Null and 0 bytes in a build without the bridge. */
+/* Whether a SAME-SESSION state load should move the context id.
+ *
+ * A load moves it by default (issue #43): the state puts back a renderer's idea
+ * of its GL objects but not the objects, so the renderer must build them again
+ * or attach handles the driver has since given to something else. That is right
+ * for a renderer whose caches survive the load holding stale names.
+ *
+ * It is wrong for one whose picture lives in the objects the rebuild throws
+ * away: RPCS3 tears down its render targets and texture cache on a moved id,
+ * and a rewind then presents an opaque black clear while the machine plays on
+ * (and, after a few rewinds, aborts in its texture cache). Such a core declares
+ * video.rebuildOnStateLoad false and keeps its renderer across a rewind.
+ *
+ * A genuinely new context still mints a new id at ce_gl_start, so a core that
+ * opts out here still rebuilds when a project is reopened - which is the case
+ * the rebuild exists for. Default 1: a core that says nothing is unaffected. */
+CE_API void ce_gl_rebuild_on_state_load(int32_t on);
+CE_API void *ce_gl_flight_recorder(uint32_t *bytes);
+
+/* ---------------------------------------------------------------------------
+ * The compile cache. A core that recompiles its machine's code keeps the
+ * compiled objects between sessions in a directory the host owns: an object
+ * is a pure function of the module, the core package and the target CPU, so a
+ * warm run is a cold run minus the compile, and nothing about determinism,
+ * movies or projects depends on whether the cache was warm. The contract is
+ * miniBox's source/cache/cache-bridge.h; a core that keeps such files exports
+ * SetCacheBridge and receives the dispatcher before Init.
+ */
+/* The directory for the sessions opened after this call (NULL: none). The
+ * caller names it by core and package identity; the engine creates it and
+ * keeps whatever the core names under it, relative paths only. */
+CE_API void ce_cache_dir(const char *dir);
+CE_API const char *ce_cache_dir_get(void);
+/* Objects stored into and fetched from the cache by this session's core. */
+CE_API uint64_t ce_session_cache_stored(const ce_session *s);
+CE_API uint64_t ce_session_cache_fetched(const ce_session *s);
+
+/* ---------------------------------------------------------------------------
+ * Precompile sessions. A core that can fill its compile cache without running
+ * exports SetPrecompile(index, count, firmware_too): the session boots, never
+ * runs, compiles every module part whose name hashes to its index (so several
+ * sessions side by side, in separate processes, each compile a share), and
+ * reports when it is done. The caller pumps ce_session_frame_advance until
+ * ce_session_precompile_done and reads the progress for its bar.
+ */
+/* Sessions opened after this call are precompile sessions (count 0: off). */
+CE_API void ce_precompile_request(int32_t index, int32_t count, int32_t firmware_too);
+/* -1 when this session is no precompile session or the core has none. */
+CE_API int32_t ce_session_precompile_done(const ce_session *s);
+CE_API int32_t ce_session_precompile_progress(const ce_session *s, uint32_t *done_out, uint32_t *total_out);
 CE_API int64_t ce_session_button_count(const ce_session *s);
 CE_API const char *ce_session_button_name(const ce_session *s, int64_t index);
 CE_API int64_t ce_session_axis_count(const ce_session *s);
 CE_API const char *ce_session_axis_name(const ce_session *s, int64_t index);
+/* The value an axis rests at when nothing moves it (the package's `neutral`;
+ * 127 on an Apple II paddle, 0 on a signed stick). What idle input carries. */
+CE_API int32_t ce_session_axis_neutral(const ce_session *s, int64_t index);
 
 /* Whether a declared control is one THIS machine has.
  *
@@ -745,6 +947,32 @@ CE_API const char *ce_session_axis_name(const ce_session *s, int64_t index);
 CE_API int32_t ce_session_drive_count(const ce_session *s);
 CE_API const char *ce_session_drive_name(const ce_session *s, int32_t index);
 CE_API int32_t ce_session_drive_light(const ce_session *s, int32_t index);
+
+/* What is in a drive, for a drive that can be given something else: a machine
+ * with several floppies or discs swaps between them through its own inputs, and
+ * until this existed nothing on screen said which one was selected or whether
+ * it had actually gone in.
+ *
+ * SELECTED and INSERTED are two facts and a core may keep them apart. DOSBox-X's
+ * changer is a selector that Previous/Next move and a Swap input that puts the
+ * selected image in: between the two, the image selected is not the image the
+ * machine is reading. A Sega CD's tray can be EMPTY, which is inserted = -1. A
+ * core whose swap is one step reports the same index for both.
+ *
+ * The guest's optional exports GetDriveMediaCount/Name/Selected/Inserted, all
+ * four or none, indexed like the drive lights. _count is 0 for a drive that
+ * holds one fixed thing (a hard disk) and for every core that exports none, and
+ * the frontend then shows nothing - an indicator that never changes is noise.
+ * _name is the image's name in the project, as the guest was given it; it is
+ * copied out at load, because the list is settled then, while _selected and
+ * _inserted are asked of the running machine. They are whole-machine state:
+ * loading a state, a rewind included, answers with what was true at that
+ * frame. */
+CE_API int32_t ce_session_drive_media_count(const ce_session *s, int32_t index);
+CE_API const char *ce_session_drive_media_name(const ce_session *s, int32_t index, int32_t media);
+CE_API int32_t ce_session_drive_media_selected(const ce_session *s, int32_t index);
+/* -1 when the drive is empty */
+CE_API int32_t ce_session_drive_media_inserted(const ce_session *s, int32_t index);
 
 CE_API int32_t ce_session_button_active(const ce_session *s, int64_t index);
 CE_API int32_t ce_session_axis_active(const ce_session *s, int64_t index);
@@ -781,6 +1009,22 @@ CE_API int32_t ce_session_frame_advance(ce_session *s, uint64_t buttons, int32_t
  * Invalidated by the next rendered frame_advance. */
 CE_API const uint32_t *ce_session_video(const ce_session *s);
 
+/* Keep the core DRAWING even on frames with render 0, so that only the readback
+ * is skipped.
+ *
+ * Turbo assumes a skipped frame is work deferred: nobody looks at it, and the
+ * next frame someone does look at is drawn from scratch. That holds for a
+ * renderer that composes its picture out of the machine's own memory every
+ * frame. It does not hold for one whose picture lives on the far side of the
+ * GPU bridge, because what it draws PERSISTS there: a screen a game paints once
+ * and then leaves alone is painted by exactly one frame, and if that frame was
+ * skipped no later frame repaints it. The picture then shows an older screen
+ * and no amount of warm-up brings it back - only replaying from before the
+ * paint does. Cores that need this say so in their package (video.drawEveryFrame)
+ * and pay the drawing, which on a real GPU is a fraction of the frame; the
+ * readback, which is most of what turbo was saving, is still skipped. */
+CE_API void ce_session_draw_every_frame(ce_session *s, int32_t on);
+
 /* The LIVE frame size: a machine that changes video modes (DOS) reports it
  * per frame through optional GetVideoWidth/GetVideoHeight exports, clamped
  * to the config's declared buffer. Without the exports these equal
@@ -797,6 +1041,36 @@ CE_API const int16_t *ce_session_audio(const ce_session *s, int32_t *sample_coun
 CE_API const uint8_t *ce_session_save_state(ce_session *s, uint64_t *len_out);
 CE_API int32_t ce_session_load_state(ce_session *s, const uint8_t *data, uint64_t len);
 
+/* A state kept in a file. _save_state hands the whole machine over as one
+ * buffer, and a frontend array cannot be more than 2 GiB; a PS3's state is
+ * (issue #84: creating a branch threw an overflow). Here the state goes from the
+ * machine through zstd to the file and back without ever existing whole, so it
+ * has no size it cannot be. This is what a TAStudio branch keeps: its state is a
+ * file beside the project, not bytes in the frontend.
+ *
+ * tag is the caller's own few bytes, stored with the state and handed back on a
+ * load - the frontend's frame and lag counters, which are not the machine's. The
+ * file is written beside its name and moved into place, so a failed save leaves
+ * whatever was there.
+ *
+ * The file says which savestate format it is (ce_state_format) and which build
+ * wrote it (ce_state_writer_id), and a load checks the format before a byte
+ * reaches the machine: a state of another format is refused by name rather than
+ * loaded into nonsense (issue #115).
+ *
+ * _save: 0 done, 1 not (see _last_error). _load: 0 loaded; 1 the machine refused
+ * the state or the file is damaged, and the machine is where a refused load
+ * leaves it; 2 the state was never offered to the machine, which is untouched -
+ * not a state file, cut short, or written in another savestate format, and
+ * _last_error says which. */
+CE_API int32_t ce_session_state_save_file(ce_session *s, const char *utf8_path, const uint8_t *tag, uint32_t tag_len);
+CE_API int32_t ce_session_state_load_file(ce_session *s, const char *utf8_path, uint8_t *tag_out, uint32_t tag_cap, uint32_t *tag_len_out);
+/* What the last state saved to or loaded from a file weighed: as the machine gave
+ * it, and as the file holds it. Both saves and loads report through ce_progress_set
+ * as they go - a load against the file's length, a save against what the last
+ * state weighed (the end of a save is not known until it is reached). */
+CE_API void ce_session_state_file_bytes(const ce_session *s, uint64_t *raw_out, uint64_t *stored_out);
+
 /* The guest's self-described memory domains. */
 CE_API int32_t ce_session_domain_count(const ce_session *s);
 CE_API const char *ce_session_domain_name(const ce_session *s, int32_t index);
@@ -807,6 +1081,12 @@ CE_API int64_t ce_session_domain_read(const ce_session *s, int32_t index, int64_
 
 /* "" when no error. Invalidated by the next call on the same session. */
 CE_API const char *ce_session_last_error(ce_session *s);
+
+/* Whether the machine's guest has died (aborted, halted, faulted, exited), and
+ * why, as one line; null while it lives. A frame advance, movie advance or seek
+ * on a dead machine fails and runs nothing. Loading a state - a greenzone
+ * restore, a branch - brings it back. Borrowed until the next call. */
+CE_API const char *ce_session_guest_death(ce_session *s);
 
 /* What built the waterbox host this engine loads (its wbx_build_info JSON):
  * the frontend shows it and movies record it. NULL when the host is not
@@ -974,6 +1254,133 @@ CE_API int32_t ce_session_movie_advance(ce_session *s, uint64_t buttons, const i
  * anchor), or disables and drops everything with budget 0. */
 CE_API void ce_session_greenzone_enable(ce_session *s, uint64_t budget_bytes);
 CE_API int64_t ce_session_greenzone_count(const ce_session *s);
+
+/* Anchor spacing, and the density of what is SPILLED to disk, all in FRAMES
+ * because the engine does not know a core's frame rate and the caller does.
+ * Any argument left at 0 keeps the current value.
+ *
+ * near_frames, mid_frames, mid_stride and far_stride once decided how dense the
+ * history was at each distance from the newest frame, whatever the budget. Since
+ * 2026-09-15 a greenzone keeps every frame in memory until its budget is full and
+ * is then thinned toward ce_session_greenzone_band_goal's shape; these four now
+ * only decide how a stretch already spilled to disk is settled once the far
+ * boundary (near_frames + mid_frames behind the newest frame) passes it, to one
+ * in far_stride.
+ *
+ * anchor_spacing is the one that decides what a seek costs: a restore walks the
+ * links of one anchor's stretch and no further, so it trades memory for
+ * latency directly. A far_stride wider than it collapses old stretches to their
+ * anchors, which is usually what is wanted. Positive, it is the spacing
+ * exactly. Negative, its magnitude is the widest a stretch may be, and a
+ * stretch closes sooner once its links weigh as much as its anchor - which
+ * picks the spacing per core by what a seek would cost. That is the default,
+ * capped at 600 frames.
+ *
+ * The defaults suit 60 frames a second on a core nobody has measured. What they
+ * cost on a heavy one, and how to pick better, is docs/state-manager.md. */
+CE_API void ce_session_greenzone_bands(ce_session *s, int64_t near_frames, int64_t mid_frames,
+	int64_t mid_stride, int64_t far_stride, int64_t anchor_spacing);
+
+/* Driving the history yourself, for a caller that owns its own movie and its
+ * own frame advance - which the frontend does, and which the hooks inside
+ * ce_session_movie_advance therefore never see.
+ *
+ * _before_advance marks the epoch and MUST be called before the machine moves,
+ * since a delta is what changed since a moment and the moment has to be marked
+ * first; a capture with no epoch open is simply a whole state, which is correct
+ * and merely dearer. _capture stores the frame just reached - the caller says
+ * which, because it is the caller counting. A frame the history already
+ * reaches past is a replay: nothing is stored and nothing is dropped, so going
+ * back and playing the same input forward keeps what is ahead. A caller that
+ * CHANGES the timeline - an edit, recording over an entry, input that is not
+ * the movie's - says so with ce_session_greenzone_invalidate before the frame
+ * is played (user-decided, 2026-09-13). _restore puts the machine on a
+ * stored frame, one ce_session_greenzone_nearest offered, and replaying from
+ * there is then the caller's business.
+ *
+ * ce_session_movie_advance and ce_session_seek are these same three, for a
+ * caller that lets the engine hold the movie. 0 on success. */
+CE_API void ce_session_greenzone_before_advance(ce_session *s);
+CE_API int32_t ce_session_greenzone_capture(
+	ce_session *s, int64_t frame, const uint8_t *note, uint32_t note_len);
+CE_API int32_t ce_session_greenzone_restore(ce_session *s, int64_t frame);
+
+/* What _capture was given for `frame`, copied into `out` (which may be NULL to
+ * ask only the size). Returns the note's length, or 0 when there is none.
+ *
+ * The note is for the caller's own bookkeeping beside the machine: a frontend
+ * has a lag flag, a lag count and a frame number that a savestate does not
+ * carry, and keeping those in a table of its own would mean mirroring every
+ * invalidation, eviction, coarsening and spill the history does. Riding along
+ * is the only way it stays true. The engine never looks inside it. */
+CE_API uint32_t ce_session_greenzone_note(
+	const ce_session *s, int64_t frame, uint8_t *out, uint32_t out_len);
+
+/* Frames to keep reachable whatever the bands would otherwise do: a pinned
+ * frame is never coarsened away, and a stretch holding one is spilled rather
+ * than dropped. What deserves pinning is the caller's business - a marker
+ * somebody wants to jump to instantly is the case this exists for, and nothing
+ * the engine could work out for itself. Pinning a frame the history does not
+ * hold is not an error; it takes effect if that frame is ever stored.
+ * _unpin_all forgets the lot, for a caller rebuilding its set. */
+CE_API void ce_session_greenzone_pin(ce_session *s, int64_t frame, int32_t pinned);
+CE_API void ce_session_greenzone_unpin_all(ce_session *s);
+
+/* Where the far band goes once the budget is full; NULL or "" for nowhere.
+ *
+ * The oldest stretches are the right thing to put on disk - large, rarely
+ * touched, and regenerable if the file is lost - so with a directory the budget
+ * costs reading them back, and without one it costs replaying to them. The
+ * caller owns the directory and the file in it is the engine's, named and
+ * removed by it; changing the directory throws away what was already out there.
+ * A project's cache directory is what this is for. */
+CE_API void ce_session_greenzone_spill(ce_session *s, const char *dir);
+/* Whether putting the far band on disk has failed since the directory was set;
+ * a full disk, near enough always. Setting a new directory clears it.
+ *
+ * The history carries on when it happens - it thins in memory instead, which
+ * is the right fallback and completely silent. From a piano roll that looks
+ * like the greenzone mysteriously going sparse, so somebody has to be told.
+ * The engine knows; saying it is the frontend's job, which is why this is a
+ * question to ask rather than a message to print. */
+/* What the spill file may weigh, or 0 for no limit.
+ *
+ * ce_session_greenzone_enable bounds MEMORY, and the history meets that budget
+ * by moving the oldest stretches to the spill directory - so on its own it
+ * bounds half of what a history costs. This bounds the other half, by the same
+ * rule: oldest first, and the room they held is given back. What it costs is
+ * replaying to reach a frame that used to be stored, which is what every cache
+ * here costs - time, never work.
+ *
+ * A pinned frame's stretch is never dropped, and neither is the newest.
+ */
+CE_API void ce_session_greenzone_disk_budget(ce_session *s, uint64_t budget_bytes);
+
+/* The widest the near band's stride may grow: at most one frame in this many
+ * is kept right behind the playhead, 1 to 32, 4 by default.
+ *
+ * The history thins the near band when storing every frame costs too much of
+ * the run, and on a heavy core it used to climb to one in 32 - the frames a
+ * person rewinds to were then the sparsest ones it held. A rewind near the
+ * playhead replays at most max_stride - 1 frames; each step down costs speed
+ * (docs/state-manager.md, "How close the near band stays"). */
+CE_API void ce_session_greenzone_max_near_stride(ce_session *s, int64_t max_stride);
+
+/* How many snapshots each band of a full greenzone aims to hold, 32 by default.
+ *
+ * A greenzone keeps every frame it captures until its memory budget is full;
+ * then it gives frames up toward bands measured back from the newest stored
+ * frame that double in length - with the defaults the last 128 frames, then to
+ * 384, 896, 1920 ... - each aiming for this many snapshots, so 4 apart, then 8,
+ * 16, 32 ... A goal, not a quota: the band holding the most gives one up first,
+ * so a budget too small for the goal is spread across the bands, and a band's
+ * last snapshot is never given up (docs/state-manager.md). */
+CE_API void ce_session_greenzone_band_goal(ce_session *s, int64_t goal);
+
+/* What the stretches now in the spill file weigh. */
+CE_API uint64_t ce_session_greenzone_disk_bytes(const ce_session *s);
+
+CE_API int32_t ce_session_greenzone_spill_failed(const ce_session *s);
 /* The nearest stored frame at or before frame; -1 when none is. */
 CE_API int64_t ce_session_greenzone_nearest(const ce_session *s, int64_t frame);
 /* Drops stored states AFTER frame - an input edit at frame N makes every
@@ -982,6 +1389,101 @@ CE_API void ce_session_greenzone_invalidate(ce_session *s, int64_t after_frame);
 /* Restores the nearest stored state at or before frame, then replays the
  * movie to frame. Needs the movie's entries up to frame. 0 on success. */
 CE_API int32_t ce_session_seek(ce_session *s, int64_t frame);
+
+/* The history, kept between sessions. It is written to one file, streamed a
+ * segment at a time - nothing about it is ever assembled in memory, which is
+ * the whole point: the greenzone this replaces serialized itself through a
+ * managed array that stops near 2GB, so a long run's history silently failed
+ * to save and took the work with it.
+ *
+ * machine_id says which machine these states belong to. The caller owns that
+ * question, knowing about cores, settings and files as it does; the engine
+ * only carries the string and refuses a history that names a different one,
+ * because a state is the memory of one exact machine and the sandbox checks
+ * only the core binary. Loading an absent, unreadable or foreign history is
+ * not an error - it leaves the history empty and costs recomputation, never
+ * work, which is what a cold greenzone has always meant. 0 on success, and
+ * see _last_error otherwise. */
+CE_API int32_t ce_session_history_save(ce_session *s, const char *path, const char *machine_id);
+CE_API int32_t ce_session_history_load(ce_session *s, const char *path, const char *machine_id);
+
+/* The same save, queued rather than waited for.
+ *
+ * Writing a history is the longest thing a project save does - up to fourteen
+ * gigabytes under the default budgets, which measured ten seconds to a Linux
+ * disk and over a minute to NTFS - and it has nothing to do with the machine:
+ * it is bytes going to a file. So it goes to the history's writer, and the run
+ * carries on. The file describes the history as it stands at THIS call, not as
+ * it ends up; frames captured while it is written belong to the next save.
+ *
+ * _later returns 0 when it was queued (and does it in line, returning the same,
+ * when helpers are off). _pending says whether it is still being written.
+ * _wait blocks until it is done and returns 0 when it worked - including when
+ * there was nothing queued, which is not a failure. Closing a project is where
+ * the wait belongs: the files must be whole before they are let go. */
+CE_API int32_t ce_session_history_save_later(ce_session *s, const char *path, const char *machine_id);
+CE_API int32_t ce_session_history_save_pending(ce_session *s);
+CE_API int32_t ce_session_history_save_wait(ce_session *s);
+
+/* ---------------------------------------------------------------------------
+ * RAM Search. The candidate set, its previous values, its change counts and
+ * its undo history live here, so that a search costs what the memory searched
+ * costs and no more: a domain of any size can be searched, and the only limit
+ * is the host's memory (issue #89; the frontend used to hold one object per
+ * address and refused a domain over 64 MiB).
+ *
+ * A search is independent of any session: it is given the domain's memory as a
+ * pointer, or - for a domain with no linear backing, such as a bus - as a
+ * function that copies a range out. The pointer must outlive the search.
+ *
+ * Numbering. size: 1, 2, 4 bytes. compare: 0 previous value, 1 specific value,
+ * 2 specific address, 3 number of changes, 4 difference. op: 0 ==, 1 >, 2 >=,
+ * 3 <, 4 <=, 5 !=, 6 different by. display: 0 unsigned (and anything shown
+ * from the raw bits), 1 signed, 2 float. previous_type: 0 original, 1 last
+ * search, 2 last frame, 3 last change. column: 0 address, 1 value, 2 previous,
+ * 3 changes, 4 difference.
+ *
+ * Calls that can need memory return 0 when they worked and -1 when the host
+ * had none to give (_search returns the number removed, or -1).
+ */
+typedef struct ce_ramsearch ce_ramsearch;
+/* Copies [offset, offset+len) into buf; returns the bytes copied. */
+typedef int64_t (*ce_ramsearch_read_fn)(void *user, int64_t offset, uint8_t *buf, int64_t len);
+
+CE_API ce_ramsearch *ce_ramsearch_create(const uint8_t *base, ce_ramsearch_read_fn fn, void *user, int64_t domain_size);
+CE_API void ce_ramsearch_destroy(ce_ramsearch *rs);
+/* Every address becomes a candidate. detailed keeps a current value and a
+ * change count per candidate, fed by _update once a frame. */
+CE_API int32_t ce_ramsearch_start(ce_ramsearch *rs, int32_t size, int32_t misaligned, int32_t big_endian, int32_t detailed);
+CE_API int64_t ce_ramsearch_count(const ce_ramsearch *rs);
+/* The index-th candidate as listed; 0 when there is no such row. */
+CE_API int32_t ce_ramsearch_row(const ce_ramsearch *rs, int64_t index, uint64_t *address, uint32_t *current, uint32_t *previous, uint32_t *changes);
+/* Where an address is listed, or -1. */
+CE_API int64_t ce_ramsearch_index_of(const ce_ramsearch *rs, uint64_t address);
+CE_API int64_t ce_ramsearch_search(ce_ramsearch *rs, int32_t compare, int32_t op, int32_t display, uint32_t value, uint32_t different_by, int32_t previous_type);
+/* Whether that search would remove this row (the preview colouring). */
+CE_API int32_t ce_ramsearch_would_remove(const ce_ramsearch *rs, int64_t index, int32_t compare, int32_t op, int32_t display, uint32_t value, uint32_t different_by);
+CE_API int32_t ce_ramsearch_update(ce_ramsearch *rs, int32_t previous_type);
+CE_API int32_t ce_ramsearch_set_previous_to_current(ce_ramsearch *rs);
+CE_API void ce_ramsearch_clear_change_counts(ce_ramsearch *rs);
+CE_API void ce_ramsearch_set_big_endian(ce_ramsearch *rs, int32_t big_endian);
+CE_API int32_t ce_ramsearch_set_previous_type(ce_ramsearch *rs, int32_t previous_type);
+CE_API int32_t ce_ramsearch_remove_indices(ce_ramsearch *rs, const int64_t *indices, int64_t n);
+CE_API int32_t ce_ramsearch_remove_addresses(ce_ramsearch *rs, const uint64_t *addresses, int64_t n, int32_t record_undo);
+CE_API int32_t ce_ramsearch_add_addresses(ce_ramsearch *rs, const uint64_t *addresses, int64_t n, int32_t append);
+/* Re-reads the candidates at another size; forgets the history. */
+CE_API int32_t ce_ramsearch_convert_to(ce_ramsearch *rs, int32_t size);
+CE_API int32_t ce_ramsearch_sort(ce_ramsearch *rs, int32_t column, int32_t reverse, int32_t display);
+CE_API int64_t ce_ramsearch_out_of_range_count(const ce_ramsearch *rs);
+CE_API int32_t ce_ramsearch_remove_out_of_range(ce_ramsearch *rs);
+/* Undo: a search and a removal can each be taken back, five deep. */
+CE_API void ce_ramsearch_set_undo_enabled(ce_ramsearch *rs, int32_t on);
+CE_API int32_t ce_ramsearch_can_undo(const ce_ramsearch *rs);
+CE_API int32_t ce_ramsearch_can_redo(const ce_ramsearch *rs);
+CE_API void ce_ramsearch_clear_history(ce_ramsearch *rs);
+/* Each returns the change in the candidate count. */
+CE_API int64_t ce_ramsearch_undo(ce_ramsearch *rs);
+CE_API int64_t ce_ramsearch_redo(ce_ramsearch *rs);
 
 #ifdef __cplusplus
 }

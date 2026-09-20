@@ -1,4 +1,4 @@
-using System.Collections.Generic;
+﻿using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -28,8 +28,8 @@ namespace Chimera.Emulation.Common.Waterbox
 		author: "miniBox",
 		portedVersion: "1.0.0",
 		portedUrl: "https://github.com/SergioMartin86/miniBox")]
-	public sealed partial class WaterboxCore : IEmulator, IVideoProvider, ISoundProvider, IStatable, IInputPollable, IGpuRendered,
-		ICoreIdentity, ISettable<WaterboxCoreSettings>, IDriveLights
+	public sealed partial class WaterboxCore : IEmulator, IVideoProvider, ISoundProvider, IStatable, IStateHistory, IInputPollable, IGpuRendered, ICorePrecompile, ICoreStops,
+		ICoreIdentity, ISettable<WaterboxCoreSettings>, IDriveLights, IStateFiles
 	{
 		/// <summary>
 		/// The identity of the PACKAGE this instance is running - what the status bar,
@@ -41,7 +41,7 @@ namespace Chimera.Emulation.Common.Waterbox
 		/// <summary>Builds a core's identity from its package declaration.</summary>
 		internal static CoreAttribute IdentityOf(WaterboxConfig cfg)
 			=> new PortedCoreAttribute(
-				name: string.IsNullOrWhiteSpace(cfg.CoreName) ? "Waterbox" : cfg.CoreName,
+				name: cfg.CoreName is { } named && !string.IsNullOrWhiteSpace(named) ? named : "Waterbox",
 				author: cfg.Author ?? "",
 				portedVersion: cfg.Version ?? "",
 				portedUrl: cfg.Url ?? "");
@@ -49,8 +49,9 @@ namespace Chimera.Emulation.Common.Waterbox
 		private readonly WaterboxConfig _cfg;
 
 		/// <summary>the machine this session is, for a package that can be several</summary>
-		private readonly WaterboxConfig.MachineConfig _machine;
+		private readonly WaterboxConfig.MachineConfig? _machine;
 
+		private readonly WaterboxConfig.VideoConfig _video;
 		private readonly EngineSession _session;
 		private WaterboxCoreSettings _settings;
 
@@ -58,6 +59,14 @@ namespace Chimera.Emulation.Common.Waterbox
 		private int _nsamp; // what the last frame actually produced
 		private readonly int[] _videoBuff;
 		private readonly short[] _stereoBuff;
+
+		// A core that mixes at a rate other than the 44100 the sound path assumes is
+		// resampled here, once per frame, on its way to whoever asks for samples -
+		// the sound output and the encoder alike. Presentation only: the guest's
+		// bytes, which the gates hash, are untouched.
+		private readonly SDLResampler? _resampler;
+		private short[] _resampled = [ ];
+		private int _resampledCount;
 		private readonly string[] _buttons;
 		private readonly WaterboxConfig.AxisConfig[] _axes;
 		// parallel to the two above: which of the declared controls this machine
@@ -72,13 +81,53 @@ namespace Chimera.Emulation.Common.Waterbox
 		/// </summary>
 		public static string HostBuildInfo => EngineSession.HostBuildInfo;
 
+		/// <summary>
+		/// The root under which every core keeps the code it compiled for a game
+		/// (the frontend sets it from its paths); empty means none. A core's own
+		/// directory is named by core and package version below it.
+		/// </summary>
+		public static string CoreCacheRoot { get; set; } = "";
+
+		/// <summary>The precompile session the next core opens as (null: a normal run).</summary>
+		public static PrecompileRequest? PrecompileRequest { get; set; }
+
+		/// <summary>
+		/// One directory per GAME, named by the game's own SHA1 (user-decided,
+		/// 2026-09-17). The core and the package version are recorded inside the
+		/// manifest instead of in the path, so a game keeps one directory however
+		/// often the core is rebuilt, and objects an older build compiled are
+		/// refused by <c>CoreCacheManifest.CompiledBy</c> rather than by
+		/// being filed somewhere else.
+		/// </summary>
+		public static string? CoreCacheDirectoryFor(string? cacheRoot, string? gameSha1)
+		{
+			if (cacheRoot is not { Length: > 0 } root || gameSha1 is not { Length: > 0 } sha1) return null;
+			static string Safe(string s) => string.Concat(s.Select(c => char.IsLetterOrDigit(c) || c is '-' or '_' or '.' ? c : '_'));
+			return Path.Combine(root, Safe(sha1.ToUpperInvariant()));
+		}
+
+		/// <summary>
+		/// Where this boot's core keeps its compiled code: the game's directory,
+		/// or null when the core compiles nothing or the game has no identity to
+		/// file it under.
+		///
+		/// The hash is taken through the engine, which answers from a memo keyed
+		/// by path, size and mtime - the wizard hashed this same file when it was
+		/// picked, so this costs a lookup rather than a read of a disc image.
+		/// </summary>
+		public static string? CoreCacheDirectoryFor(WaterboxConfig cfg, string? romPath)
+			=> cfg.Precompile && romPath is { Length: > 0 } && File.Exists(romPath)
+				&& ChimeraEngine.Sha1OfFile(romPath) is { } hashed
+					? CoreCacheDirectoryFor(CoreCacheRoot, hashed.Sha1)
+					: null;
+
 		/// <param name="rom">the game's bytes, or null when <paramref name="romPath"/> is given</param>
 		/// <param name="romPath">
 		/// Where the game lies, for the usual case of a file on disk: the engine
 		/// mounts it and the machine reads it from there, so nothing is loaded.
 		/// A disc image is routinely bigger than a byte[] can be.
 		/// </param>
-		public WaterboxCore(byte[] rom, string romPath, WaterboxConfig cfg, string packageDir, WaterboxCoreSettings settings = null, IReadOnlyDictionary<string, byte[]> firmware = null, IReadOnlyList<CoreFile> extraFiles = null)
+		public WaterboxCore(byte[]? rom, string? romPath, WaterboxConfig cfg, string packageDir, WaterboxCoreSettings? settings = null, IReadOnlyDictionary<string, byte[]>? firmware = null, IReadOnlyList<CoreFile>? extraFiles = null)
 		{
 			_cfg = cfg;
 			_settings = settings?.Clone() ?? new WaterboxCoreSettings();
@@ -86,13 +135,31 @@ namespace Chimera.Emulation.Common.Waterbox
 			// controller, the picture and the system id all come from it, and a
 			// package that is only ever one machine has none and uses the top level.
 			_machine = cfg.MachineFor(EffectiveSettingsFor(cfg, _settings));
-			var input = _machine?.Input ?? cfg.Input;
-			_width = cfg.Video.Width;
-			_height = cfg.Video.Height;
-			_samplesPerFrame = cfg.Audio.SamplesPerFrame;
+			// The three blocks the adapter cannot build a session without. A
+			// package that omits one is malformed, and it used to fail as a null
+			// dereference here; saying which block is missing names the package
+			// instead. Nothing about a package that HAS them changes.
+			_video = cfg.Video ?? throw new InvalidOperationException(
+				$"{WaterboxCoreFactory.ConfigFileName}: no \"video\" block, so the picture has no size");
+			var audio = cfg.Audio ?? throw new InvalidOperationException(
+				$"{WaterboxCoreFactory.ConfigFileName}: no \"audio\" block, so the sound has no rate");
+			var input = _machine?.Input ?? cfg.Input ?? throw new InvalidOperationException(
+				$"{WaterboxCoreFactory.ConfigFileName}: no \"input\" block, so the machine has no controller");
+			_width = _video.Width;
+			_height = _video.Height;
+			_samplesPerFrame = audio.SamplesPerFrame;
 			_videoBuff = new int[_width * _height];
 			_stereoBuff = new short[_samplesPerFrame * 2];
-			_buttons = input.Buttons.ToArray();
+			if (audio.Rate is > 0 and not 44100)
+			{
+				_resampler = new SDLResampler(audio.Rate, 44100, (buf, n) =>
+				{
+					if (_resampled.Length < n * 2) _resampled = new short[n * 2];
+					Buffer.BlockCopy(buf, 0, _resampled, 0, n * 2 * sizeof(short));
+					_resampledCount = n;
+				});
+			}
+			_buttons = input.Buttons?.ToArray() ?? [ ];
 			_axes = input.Axes?.ToArray() ?? [ ];
 
 			ServiceProvider = new BasicServiceProvider(this);
@@ -104,7 +171,9 @@ namespace Chimera.Emulation.Common.Waterbox
 				var effective = EffectiveSettings();
 				_session = EngineSession.Open(
 					packageDir, rom, romPath, SerializeSettings(effective), firmware, extraFiles,
-					wantGpu: WantsGpu(effective));
+					wantGpu: WantsGpu(effective),
+					cacheDir: CoreCacheDirectoryFor(cfg, romPath),
+					precompile: PrecompileRequest);
 			}
 			catch (InvalidOperationException ex)
 			{
@@ -169,7 +238,7 @@ namespace Chimera.Emulation.Common.Waterbox
 		private Dictionary<string, object> EffectiveSettings()
 		{
 			var effective = new Dictionary<string, object>();
-			foreach (var decl in Decls) effective[decl.Name] = decl.DefaultValue;
+			foreach (var decl in Decls) effective[decl.Key] = decl.DefaultValue;
 			foreach (var kv in _settings.Values ?? new()) effective[kv.Key] = kv.Value;
 			return effective;
 		}
@@ -180,7 +249,7 @@ namespace Chimera.Emulation.Common.Waterbox
 		/// wizard) need them without booting anything.
 		/// </summary>
 		public static Dictionary<string, object> EffectiveSettingsFor(
-			WaterboxConfig cfg, WaterboxCoreSettings settings)
+			WaterboxConfig cfg, WaterboxCoreSettings? settings)
 		{
 			// Two passes, because a package of machines has settings whose defaults
 			// and legal values depend on WHICH machine - and which machine is itself
@@ -192,10 +261,10 @@ namespace Chimera.Emulation.Common.Waterbox
 		}
 
 		private static Dictionary<string, object> Defaults(
-			IReadOnlyList<WaterboxConfig.SettingDecl> decls, WaterboxCoreSettings settings)
+			IReadOnlyList<WaterboxConfig.SettingDecl>? decls, WaterboxCoreSettings? settings)
 		{
 			var effective = new Dictionary<string, object>();
-			foreach (var decl in decls ?? (IReadOnlyList<WaterboxConfig.SettingDecl>) [ ]) effective[decl.Name] = decl.DefaultValue;
+			foreach (var decl in decls ?? (IReadOnlyList<WaterboxConfig.SettingDecl>) [ ]) effective[decl.Key] = decl.DefaultValue;
 			foreach (var kv in settings?.Values ?? new()) effective[kv.Key] = kv.Value;
 			return effective;
 		}
@@ -213,11 +282,11 @@ namespace Chimera.Emulation.Common.Waterbox
 		public IEmulatorServiceProvider ServiceProvider { get; }
 
 		public ControllerDefinition ControllerDefinition => _controllerDefinition ??= MakeControllerDefinition();
-		private ControllerDefinition _controllerDefinition;
+		private ControllerDefinition? _controllerDefinition;
 
 		private ControllerDefinition MakeControllerDefinition()
 		{
-			var def = new ControllerDefinition((_machine?.Input ?? _cfg.Input).Name ?? "Waterbox Controller");
+			var def = new ControllerDefinition((_machine?.Input ?? _cfg.Input)?.Name ?? "Waterbox Controller");
 			// only the controls this machine HAS: a Four Score's players 3 and 4,
 			// or an Arkanoid's paddle, are declared by every NES package and exist
 			// only when a project plugged one in
@@ -229,10 +298,13 @@ namespace Chimera.Emulation.Common.Waterbox
 			{
 				if (!_axisActive[i]) continue;
 				var axis = _axes[i];
-				def.Axes.Add(axis.Name, new AxisSpec(axis.Min.RangeTo(axis.Max), axis.Neutral));
+				def.Axes.Add(axis.Name ?? $"Axis {i}", new AxisSpec(axis.Min.RangeTo(axis.Max), axis.Neutral));
 			}
 			return def.MakeImmutable();
 		}
+
+		/// <inheritdoc/>
+		public string? CoreStopped { get; private set; }
 
 		public bool FrameAdvance(IController controller, bool render, bool renderSound = true)
 		{
@@ -269,6 +341,13 @@ namespace Chimera.Emulation.Common.Waterbox
 			}
 
 			IsLagFrame = _session.FrameAdvance(input, render);
+			CoreStopped = _session.Stopped;
+			if (CoreStopped is not null)
+			{
+				// the frame never ran: no frame counted, no picture or sound from a machine that is gone
+				IsLagFrame = false;
+				return false;
+			}
 			DrainTrace();
 			Frame++;
 			if (IsLagFrame) LagCount++;
@@ -276,6 +355,12 @@ namespace Chimera.Emulation.Common.Waterbox
 			if (render) Marshal.Copy(_session.VideoBuffer, _videoBuff, 0, _session.VideoWidth * _session.VideoHeight);
 			var audio = _session.AudioBuffer(out _nsamp);
 			Marshal.Copy(audio, _stereoBuff, 0, _nsamp * 2);
+			if (_resampler is not null)
+			{
+				_resampledCount = 0;
+				if (_nsamp > 0) _resampler.EnqueueSamples(_stereoBuff, _nsamp);
+				_resampler.Flush();
+			}
 			return true;
 		}
 
@@ -289,9 +374,27 @@ namespace Chimera.Emulation.Common.Waterbox
 
 		public bool DriveLightOn(int index) => _session.DriveLight(index);
 
+		// the names are settled at load and do not change; only the two indices are the machine's
+		private IReadOnlyList<string>[]? _driveMediaNames;
+
+		public DriveMedia? DriveMediaOf(int index)
+		{
+			_driveMediaNames ??= new IReadOnlyList<string>[_session.DriveCount];
+			if (index < 0 || index >= _driveMediaNames.Length) return null;
+			var names = _driveMediaNames[index];
+			if (names is null)
+			{
+				var held = _session.DriveMediaCount(index);
+				var read = new string[held];
+				for (int i = 0; i < held; i++) read[i] = _session.DriveMediaName(index, i);
+				names = _driveMediaNames[index] = read;
+			}
+			return names.Count is 0 ? null : new DriveMedia(names, _session.DriveMediaSelected(index), _session.DriveMediaInserted(index));
+		}
+
 		public int Frame { get; private set; }
 
-		public string SystemId => _machine?.Id ?? _cfg.SystemId;
+		public string SystemId => _machine?.Id ?? _cfg.SystemId ?? "";
 
 		/// <summary>
 		/// A machine a GPU drew is not deterministic whatever its config says, so
@@ -306,6 +409,19 @@ namespace Chimera.Emulation.Common.Waterbox
 		/// </summary>
 		public string GpuRenderer => _session.GpuDescription;
 
+		/// <summary>
+		/// Whether this core's renderer rebuilds after the context it drew on
+		/// is gone - declared in waterbox.config, and false unless it says so.
+		/// </summary>
+		public bool GpuStatesSurviveTheContext => _cfg.Video?.GpuStatesSurviveTheContext is true;
+
+
+		// ICorePrecompile: only meaningful when the core was opened as a precompile session
+		public bool PrecompileDone => _session.PrecompileDone;
+		public (uint Done, uint Total) PrecompileProgress => _session.PrecompileProgress;
+		public ulong CacheStored => _session.CacheStored;
+		public ulong CacheFetched => _session.CacheFetched;
+
 		public void ResetCounters()
 		{
 			Frame = 0;
@@ -313,7 +429,18 @@ namespace Chimera.Emulation.Common.Waterbox
 			IsLagFrame = false;
 		}
 
-		public void Dispose() => _session.Dispose();
+		public void Dispose()
+		{
+			// A history save may still be being written (IStateHistory.SaveLater),
+			// and the file has to be whole before the session that is writing it
+			// goes. Here rather than in the movie's Dispose: the movie may outlive
+			// or predecease the emulator, and only the session knows it is alive.
+			// The engine's own teardown drains the writer as well - this is the
+			// one that can still report a failure.
+			if (!_session.Disposed) _session.HistorySaveWait();
+			_resampler?.Dispose();
+			_session.Dispose();
+		}
 
 		private void CheckDisposed()
 		{
@@ -326,8 +453,16 @@ namespace Chimera.Emulation.Common.Waterbox
 		// clamped by the engine to the config's buffer; others equal the config.
 		public int BufferWidth => _session.Disposed ? _width : _session.VideoWidth;
 		public int BufferHeight => _session.Disposed ? _height : _session.VideoHeight;
-		public int VirtualWidth => _machine?.VirtualWidth ?? (_cfg.Video.VirtualWidth != 0 ? _cfg.Video.VirtualWidth : BufferWidth);
-		public int VirtualHeight => _machine?.VirtualHeight ?? (_cfg.Video.VirtualHeight != 0 ? _cfg.Video.VirtualHeight : BufferHeight);
+		// The display aspect. A core that declares none is saying its pixels are
+		// square, so the live picture IS its own aspect - which is the only
+		// honest answer for a machine whose picture changes size (a Flash movie
+		// declares its own stage). Declaring it, as a machine with non-square
+		// pixels must, still wins.
+		public int VirtualWidth => _machine?.VirtualWidth
+			?? (_video.VirtualWidth > 0 ? _video.VirtualWidth : BufferWidth);
+
+		public int VirtualHeight => _machine?.VirtualHeight
+			?? (_video.VirtualHeight > 0 ? _video.VirtualHeight : BufferHeight);
 		public int BackgroundColor => unchecked((int)0xFF000000);
 		public int VsyncNumerator => _session.VsyncNumerator;
 		public int VsyncDenominator => _session.VsyncDenominator;
@@ -340,6 +475,12 @@ namespace Chimera.Emulation.Common.Waterbox
 
 		public void GetSamplesSync(out short[] samples, out int nsamp)
 		{
+			if (_resampler is not null)
+			{
+				samples = _resampled;
+				nsamp = _resampledCount;
+				return;
+			}
 			samples = _stereoBuff;
 			nsamp = _nsamp;
 		}
@@ -352,6 +493,100 @@ namespace Chimera.Emulation.Common.Waterbox
 		}
 
 		public void GetSamplesAsync(short[] samples) => throw new InvalidOperationException("Async mode is not supported.");
+
+		// ---------------- IStateHistory ----------------
+		//
+		// Every one of these is a line: the history is the engine's, and the only
+		// thing this layer adds is the side-band a savestate does not carry.
+		// Which frame it is, whether that frame lagged, and how many have - the
+		// engine has no opinion on any of it, so it rides along as the note it
+		// keeps with the frame and hands back on the way in.
+
+		public void Enable(long budgetBytes) => _session.GreenzoneEnable((ulong)Math.Max(budgetBytes, 0));
+
+		public void MaxNearStride(int stride) => _session.GreenzoneMaxNearStride(stride);
+
+		public long Count => _session.GreenzoneCount;
+
+		public int Nearest(int frame) => checked((int)_session.GreenzoneNearest(frame));
+
+		public bool Has(int frame) => _session.GreenzoneNearest(frame) == frame;
+
+		public void BeforeAdvance() => _session.GreenzoneBeforeAdvance();
+
+		public void Capture(int frame)
+		{
+			CheckDisposed();
+			var note = new byte[5];
+			note[0] = IsLagFrame ? (byte)1 : (byte)0;
+			BitConverter.GetBytes(LagCount).CopyTo(note, 1);
+			_session.GreenzoneCapture(frame, note);
+		}
+
+		public bool RestoreTo(int frame)
+		{
+			CheckDisposed();
+			if (!_session.GreenzoneRestore(frame))
+			{
+				// A restore that could not be walked does not leave the machine
+				// where it was: the engine puts it back on a frame that did exist
+				// - the anchor it was walking from - rather than leave it half way
+				// along a chain. Following that here is what keeps this object's
+				// idea of the frame and the machine the same thing; believing the
+				// old number would record the next input against the wrong row.
+				Frame = checked((int)_session.Frame);
+				return false;
+			}
+			Frame = frame;
+			var note = _session.GreenzoneNote(frame);
+			// A frame with no note is one stored before this machine had a lag
+			// count worth carrying - frame zero's anchor. Leaving the counters
+			// alone is right there: nothing has lagged yet.
+			if (note is { Length: >= 5 })
+			{
+				IsLagFrame = note[0] is not 0;
+				LagCount = BitConverter.ToInt32(note, 1);
+			}
+			return true;
+		}
+
+
+		public void InvalidateAfter(int afterFrame) => _session.GreenzoneInvalidate(afterFrame);
+
+		public bool Save(string path, string machineId) => _session.HistorySave(path, machineId);
+
+		/// <summary>
+		/// The same save, queued on the engine's writer.
+		///
+		/// The history is the longest part of a project save - up to fourteen
+		/// gigabytes under the default budgets - and waiting for it stops the
+		/// machine. What is written describes the history as it stands at this
+		/// call; the run carries on. <see cref="SaveWait"/> is the barrier, and
+		/// it belongs where the project is let go of.
+		/// </summary>
+		public bool SaveLater(string path, string machineId) => _session.HistorySaveLater(path, machineId);
+
+		/// <summary>Whether a queued save is still being written.</summary>
+		public bool SavePending => _session.HistorySavePending;
+
+		/// <summary>Waits for a queued save; true when it worked or there was none.</summary>
+		public bool SaveWait() => _session.HistorySaveWait();
+
+		public bool Load(string path, string machineId)
+		{
+			CheckDisposed();
+			var ok = _session.HistoryLoad(path, machineId);
+			// A history with no anchor can produce no frame at all, and loading
+			// one that was absent, damaged or of another machine leaves exactly
+			// that. The machine as it stands becomes the anchor again, which is
+			// what a cold greenzone has always meant.
+			if (_session.GreenzoneCount is 0) Capture(Frame);
+			return ok;
+		}
+
+		public void Pin(int frame, bool pinned) => _session.GreenzonePin(frame, pinned);
+
+		public void UnpinAll() => _session.GreenzoneUnpinAll();
 
 		// ---------------- IStatable ----------------
 
@@ -368,6 +603,33 @@ namespace Chimera.Emulation.Common.Waterbox
 			writer.Write(IsLagFrame);
 			writer.Write(LagCount);
 			writer.Write(Frame);
+		}
+
+		// ---------------- IStateFiles ----------------
+		// The same state as SaveStateBinary - the machine, then the three counters that are the
+		// frontend's and not the machine's - with the machine streamed by the engine and the
+		// counters riding as the file's tag.
+
+		public void SaveStateToFile(string path)
+		{
+			CheckDisposed();
+			using MemoryStream tag = new();
+			using (BinaryWriter writer = new(tag, System.Text.Encoding.UTF8, leaveOpen: true))
+			{
+				writer.Write(IsLagFrame);
+				writer.Write(LagCount);
+				writer.Write(Frame);
+			}
+			_session.SaveStateToFile(path, tag.ToArray());
+		}
+
+		public void LoadStateFromFile(string path)
+		{
+			CheckDisposed();
+			using BinaryReader reader = new(new MemoryStream(_session.LoadStateFromFile(path)));
+			IsLagFrame = reader.ReadBoolean();
+			LagCount = reader.ReadInt32();
+			Frame = reader.ReadInt32();
 		}
 
 		public void LoadStateBinary(BinaryReader reader)

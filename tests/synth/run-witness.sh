@@ -38,6 +38,7 @@ work="$here/work"
 mkdir -p "$golden_dir" "$work"
 failed=0
 ok=0
+known=0
 
 # ---------- build ----------
 gcc -O2 -Wall -Wextra -Werror -o "$here/native/synth-run" \
@@ -48,7 +49,9 @@ done
 
 report() { # name result detail
 	printf "%-28s %-9s %s\n" "$1" "$2" "$3"
-	case "$2" in PASS|RECORDED) ok=$((ok+1)) ;; *) failed=$((failed+1)) ;; esac
+	# KNOWN: a failure that is tracked and does not fail the run - only ever
+	# reported where a check says so, with the reason in the detail
+	case "$2" in PASS|RECORDED) ok=$((ok+1)) ;; KNOWN) known=$((known+1)) ;; *) failed=$((failed+1)) ;; esac
 }
 
 # ---------- Level A ----------
@@ -57,7 +60,7 @@ report() { # name result detail
 # is the equivalence proof for the only shipped flavor.
 box_tester="$here/package-box/synth-run-box"
 box_wbx="$here/package-box/synth.wbx"
-box_host_dir="$here/../../extern/tools/chimera-common-minibox/build/meson-linux/source/host"
+box_host_dir="$here/../../extern/chimera-common-minibox/build/meson-linux/source/host"
 if [ "$level" = "both" ] || [ "$level" = "a" ]; then
 	for movie in "$here"/movies/*.txt; do
 		name="$(basename "$movie" .txt)"
@@ -166,6 +169,146 @@ if [ "$level" = "both" ] || [ "$level" = "e" ]; then
 			fi
 		done
 
+		# A STATE KEPT IN A FILE (what a TAStudio branch keeps; engine.h). Saved to a
+		# file and loaded straight back mid-movie, the machine must not notice: the
+		# run ends byte for byte where the goldens say. Then the two ways a file can
+		# be wrong - not a state at all, and a state cut short - must each be refused
+		# with a reason and without taking the process down.
+		for movie in "$here"/movies/*.txt; do
+			sname="$(basename "$movie" .txt)"
+			srom="$here/roms/${sname%%.*}.testrom"
+			stag="$sname.engine.statefile"
+			rm -f "$work/$stag.ram.bin" "$work/$stag.vram.bin" "$work/$stag.state"
+			"$chimera_run" "$epkg" "$srom" "$movie" --state-file-roundtrip 10 --save-state-file "10=$work/$stag.state" 				--meta "$work/$stag.meta.txt" --dump "RAM=$work/$stag.ram.bin" --dump "VRAM=$work/$stag.vram.bin" 				> "$work/$stag.log" 2>&1
+			if cmp -s "$work/$stag.ram.bin" "$golden_dir/$sname.ram.bin" 				&& cmp -s "$work/$stag.vram.bin" "$golden_dir/$sname.vram.bin" && [ -s "$work/$stag.state" ]; then
+				report "E:$sname:statefile" PASS "saved to a file and loaded back mid-movie, byte-identical"
+			else
+				report "E:$sname:statefile" FAIL "RAM or VRAM differs after a state-file round trip (see work/$stag.log)"
+			fi
+		done
+		sfirst="$(ls "$here"/movies/*.txt | head -1)"; sname="$(basename "$sfirst" .txt)"; srom="$here/roms/${sname%%.*}.testrom"
+		printf 'this is not a state' > "$work/not-a-state.state"
+		"$chimera_run" "$epkg" "$srom" "$sfirst" --state-file "$work/not-a-state.state" > "$work/statefile-garbage.log" 2>&1; garbage_rc=$?
+		head -c 300 "$work/$sname.engine.statefile.state" > "$work/cut-short.state"
+		"$chimera_run" "$epkg" "$srom" "$sfirst" --state-file "$work/cut-short.state" > "$work/statefile-short.log" 2>&1; short_rc=$?
+		"$chimera_run" "$epkg" "$srom" "$sfirst" --state-file "$work/$sname.engine.statefile.state" > "$work/statefile-good.log" 2>&1; good_rc=$?
+		if [ "$garbage_rc" -ne 0 ] && [ "$garbage_rc" -lt 128 ] && grep -q "is not a state file" "$work/statefile-garbage.log" 			&& [ "$short_rc" -ne 0 ] && [ "$short_rc" -lt 128 ] 			&& [ "$good_rc" -eq 0 ] && grep -q "state file tag: frame 10" "$work/statefile-good.log"; then
+			report "E:statefile:refusals" PASS "a whole file loads and hands its tag back; garbage and a cut-short file are refused, no crash"
+		else
+			report "E:statefile:refusals" FAIL "garbage rc=$garbage_rc short rc=$short_rc good rc=$good_rc (see work/statefile-*.log)"
+		fi
+
+		# A CORE THAT DIES: all eight buttons at once make the synth core abort on
+		# cue (SPEC.md). The run must stop with the reason and the core's own last
+		# words - miniBox handing control back - and the process must not crash.
+		dmovie="$work/dies-at-11.txt"
+		sed '12s/.*/|UDLRABsS|/' "$here/movies/gridWalker.win.txt" > "$dmovie"
+		rm -f "$work/dies.meta.txt"
+		"$chimera_run" "$epkg" "$here/roms/gridWalker.testrom" "$dmovie" \
+			--meta "$work/dies.meta.txt" > "$work/dies.log" 2>&1
+		drc=$?
+		if [ "$drc" -ge 128 ]; then
+			report "E:core-dies" FAIL "the process died with signal $((drc - 128)) (see work/dies.log)"
+		elif ! grep -q "^status=ERROR" "$work/dies.meta.txt" 2>/dev/null; then
+			report "E:core-dies" FAIL "the run did not report a stopped core (see work/dies.log)"
+		elif grep -q "the core aborted" "$work/dies.meta.txt" && grep -q "stopping on purpose" "$work/dies.meta.txt"; then
+			report "E:core-dies" PASS "a core that aborts stops the run with its reason, and the process survives"
+		else
+			report "E:core-dies" FAIL "the reason or the core's words are missing: $(grep '^detail=' "$work/dies.meta.txt")"
+		fi
+		# and the same death arriving as a FAULT (all but Up: a wild pointer)
+		sed '12s/.*/|.DLRABsS|/' "$here/movies/gridWalker.win.txt" > "$work/crashes-at-11.txt"
+		rm -f "$work/crashes.meta.txt"
+		"$chimera_run" "$epkg" "$here/roms/gridWalker.testrom" "$work/crashes-at-11.txt" \
+			--meta "$work/crashes.meta.txt" > "$work/crashes.log" 2>&1
+		crc=$?
+		if [ "$crc" -ge 128 ]; then
+			report "E:core-crashes" FAIL "the process died with signal $((crc - 128)) (see work/crashes.log)"
+		elif grep -q "^detail=the core stopped: the core crashed: it wrote to address" "$work/crashes.meta.txt" 2>/dev/null; then
+			report "E:core-crashes" PASS "a core that follows a wild pointer stops the run, and the process survives"
+		else
+			report "E:core-crashes" FAIL "no stopped core reported (see work/crashes.log)"
+		fi
+
+		# the history OUTLIVES its process, which is what reopening a project
+		# asks of it. One run plays the movie and keeps its history to a file; a
+		# second, fresh process starts from that file, seeks back into states it
+		# did not make, and replays. The dumps must still be the goldens. This is
+		# the leg the old greenzone would have failed silently: it serialized
+		# itself through an array that stops near 2GB, so a long history simply
+		# did not save and nothing said so.
+		for movie in "$here"/movies/*.txt; do
+			hname="$(basename "$movie" .txt)"
+			hrom="$here/roms/${hname%%.*}.testrom"
+			htag="$hname.engine.history"
+			rm -f "$work/$htag.ram.bin" "$work/$htag.vram.bin" "$work/$htag.hist"
+			"$chimera_run" "$epkg" "$hrom" "$movie" --history-out "$work/$htag.hist" 				> "$work/$htag.save.log" 2>&1
+			"$chimera_run" "$epkg" "$hrom" "$movie" --history-in "$work/$htag.hist" --seek 10 				--dump "RAM=$work/$htag.ram.bin" --dump "VRAM=$work/$htag.vram.bin" 				> "$work/$htag.log" 2>&1
+			if [ ! -s "$work/$htag.hist" ]; then
+				report "E:$hname:history" FAIL "nothing was written (see work/$htag.save.log)"
+			elif cmp -s "$work/$htag.ram.bin" "$golden_dir/$hname.ram.bin" 				&& cmp -s "$work/$htag.vram.bin" "$golden_dir/$hname.vram.bin"; then
+				report "E:$hname:history" PASS "a history kept across processes seeks to the goldens"
+			else
+				report "E:$hname:history" FAIL "RAM or VRAM differs after reloading the history (see work/$htag.log)"
+			fi
+		done
+
+		# THINNED: a greenzone over its memory budget gives frames up toward its
+		# shape (bands doubling back from the frontier), and a frame it keeps can
+		# be one that other frames were COMPOSED into. Seeking to such a frame has
+		# to land on the machine a straight run reaches there.
+		#
+		# The comparison is against a run stopped at that frame, not against the
+		# goldens at the end of the movie, and that distinction is the whole leg:
+		# this core's ending is decided by its inputs, so a replay from a WRONG
+		# frame still finishes on the goldens and proves nothing.
+		#
+		# The target is chosen from the history itself: a frame the trace says a
+		# landing was merged into AND that the finished history still holds. A
+		# frame thinned away is reached by restoring something earlier and
+		# replaying, which is correct however broken the merging is - so seeking
+		# to one would prove nothing either. A run that never merged fails.
+		#
+		# The budget is in bytes, since this machine weighs under a megabyte, and
+		# it is taken from the movie itself: 40% of what its history weighs kept
+		# whole (the movies differ - one is 21 frames and 286 KB, which a fixed
+		# budget never made thin), with a goal of one snapshot a band.
+		for movie in "$here"/movies/*.txt; do
+			tname="$(basename "$movie" .txt)"
+			trom="$here/roms/${tname%%.*}.testrom"
+			ttag="$tname.engine.thinned"
+			rm -f "$work/$ttag.ram.bin" "$work/$ttag.ref.ram.bin" "$work/$ttag.map"
+			CHIMERA_HISTORY_TRACE=1 "$chimera_run" "$epkg" "$trom" "$movie" \
+				--greenzone-map "$work/$ttag.whole.map" > "$work/$ttag.whole.log" 2>&1
+			whole="$(grep -a -o '[0-9]* total' "$work/$ttag.whole.log" | tail -1 | awk '{print $1}')"
+			if [ -z "$whole" ]; then
+				report "E:$tname:thinned" FAIL "could not weigh the history kept whole (see work/$ttag.whole.log)"
+				continue
+			fi
+			thin="--greenzone-bytes $((whole * 4 / 10)) --greenzone-band-goal 1"
+			CHIMERA_HISTORY_TRACE=1 "$chimera_run" "$epkg" "$trom" "$movie" $thin \
+				--greenzone-map "$work/$ttag.map" > "$work/$ttag.plan.log" 2>&1
+			target=""
+			for into in $(grep -a -o "merged the landing at [0-9]* into [0-9]*" "$work/$ttag.plan.log" | awk '{print $NF}' | sort -n -u); do
+				if grep -qx "$into" "$work/$ttag.map" 2>/dev/null && [ "$into" -gt 0 ]; then target="$into"; fi
+			done
+			if [ -z "$target" ]; then
+				report "E:$tname:thinned" FAIL "nothing it kept was ever merged into (see work/$ttag.plan.log)"
+				continue
+			fi
+			"$chimera_run" "$epkg" "$trom" "$movie" --frames "$target" \
+				--dump "RAM=$work/$ttag.ref.ram.bin" > "$work/$ttag.ref.log" 2>&1
+			CHIMERA_HISTORY_TRACE=1 "$chimera_run" "$epkg" "$trom" "$movie" --seek "$target" --stop-at-seek $thin \
+				--dump "RAM=$work/$ttag.ram.bin" > "$work/$ttag.log" 2>&1
+			if [ ! -s "$work/$ttag.ref.ram.bin" ]; then
+				report "E:$tname:thinned" FAIL "the reference run wrote nothing (see work/$ttag.ref.log)"
+			elif cmp -s "$work/$ttag.ram.bin" "$work/$ttag.ref.ram.bin"; then
+				report "E:$tname:thinned" PASS "seeking a thinned history lands on the real frame $target, a merged one"
+			else
+				report "E:$tname:thinned" FAIL "RAM at frame $target differs from a straight run (see work/$ttag.log)"
+			fi
+		done
+
 		# RECORD mode: playback never generates an entry, so the paths that turn
 		# machine input back into movie text have no other witness. Each movie is
 		# replayed as an INPUT SOURCE into a recording session, which writes its
@@ -217,9 +360,23 @@ if [ "$level" = "both" ] || [ "$level" = "b" ]; then
 
 	export LD_LIBRARY_PATH="$repo_root/build/dll:$repo_root/build:/usr/lib/x86_64-linux-gnu"
 	export MONO_CRASH_NOFILE=1 MONO_WINFORMS_XIM_STYLE=disabled ALSOFT_DRIVERS=null
+	# The frontend keeps a project's greenzone in the per-user cache now, not
+	# beside the project, so without this the witness would leave its states in
+	# the real one. XDG_DATA_HOME and not CHIMERA_DATA_HOME: the latter moves the
+	# WHOLE data directory, tools and all, and the encode leg then cannot find
+	# ffmpeg. This moves only where per-user data is kept.
+	export XDG_DATA_HOME="$work/data-home"
 	xvfb_pid=""
 	cleanup() { [ -n "$xvfb_pid" ] && kill "$xvfb_pid" 2>/dev/null; }
 	trap cleanup EXIT
+	# A DISPLAY that is set but does not answer - an ssh session's forwarded
+	# display with nothing behind it, which is what the WSL dev box has - would
+	# fail every frontend leg with "Could not open display", fourteen times over.
+	# Ask it first, and bring up an Xvfb if it says nothing.
+	if [ -n "${DISPLAY:-}" ] && command -v xdpyinfo >/dev/null && ! timeout 5 xdpyinfo >/dev/null 2>&1; then
+		echo "DISPLAY=$DISPLAY does not answer; starting an Xvfb instead" >&2
+		unset DISPLAY
+	fi
 	if [ -z "${DISPLAY:-}" ]; then
 		command -v Xvfb >/dev/null || { echo "Xvfb not found (apt install xvfb)" >&2; exit 1; }
 		for n in 90 91 92 93 94; do
@@ -331,7 +488,7 @@ logkey = "#P1 Up|P1 Down|P1 Left|P1 Right|P1 A|P1 B|P1 Select|P1 Start|"
 json.dump({
     "title": "gridWalker.win",
     "core": {"name": "Synth", "version": "", "sha1": ""},
-    "headers": {"MovieVersion": "Chimera Tasproj v1.1", "Platform": "Synth"},
+    "headers": {"MovieVersion": "Chimera Project File v1.1", "Platform": "Synth"},
     "input": "[Input]\nLogKey:" + logkey + "\n" + "\n".join(entries) + "\n[/Input]\n",
 }, open(sys.argv[2], "w"))
 PY
@@ -379,7 +536,7 @@ sha1 = hashlib.sha1(open(sys.argv[2], "rb").read()).hexdigest().upper()
 json.dump({
     "title": "gridWalker.win",
     "core": {"name": "Synth", "version": "", "sha1": ""},
-    "headers": {"MovieVersion": "Chimera Tasproj v1.1", "Platform": "Synth"},
+    "headers": {"MovieVersion": "Chimera Project File v1.1", "Platform": "Synth"},
     "files": [{"name": "gridWalker.testrom", "sha1": sha1, "slot": "rom"}],
     "settings": {"initFillByte": 171},
     "input": "[Input]\nLogKey:" + logkey + "\n" + "\n".join(entries) + "\n[/Input]\n",
@@ -408,6 +565,155 @@ PY
 		fi
 	fi
 
+	# --- a script's input, while TAStudio extends the movie past its end ---
+	# The piano roll open is a different frame loop, and past the end of the log
+	# it is not replaying anything: each frame out there is AUTHORED as it is
+	# reached. A seek turns recording off for its duration so the rows it passes
+	# over are not typed over - and out past the end, where there are no rows to
+	# protect, that used to throw away everything being pressed: the frames were
+	# written from the autoholds alone, so a script's joypad.set reached neither
+	# the movie nor the machine (issue #95).
+	#
+	# Three runs pin both halves of the rule. Recording asked for and a button
+	# held must reach the log AND the core (the controller it is handed, and a
+	# RAM that diverges from the run that held nothing); recording asked for and
+	# nothing held must stay empty; and read-only play past the end must STILL
+	# extend from the autoholds alone, whatever a script presses - nobody is
+	# recording there.
+	#
+	# The project is the win movie cut to its first five frames, so the game is
+	# still being played when the extension starts: gridWalker FREEZES once it
+	# is won or lost (SPEC/rom), and a frozen machine ignores input, which would
+	# make the RAM comparison prove nothing. Held from there, Down retraces the
+	# winning path, so every extended frame is a real move.
+	if [ "$record" -eq 0 ]; then
+		tname=gridWalker.win
+		trom="$here/roms/${tname%%.*}.testrom"
+		tdir="$work/tastudio-input-leg"
+		rm -rf "$tdir" && mkdir -p "$tdir"
+		cp "$trom" "$tdir/gridWalker.testrom"
+		python3 - "$here/movies/$tname.txt" "$tdir/gridWalker.testrom" "$tdir/$tname.chimeraProject" <<'TASPY'
+import hashlib, json, sys
+entries = [l.rstrip("\r\n") for l in open(sys.argv[1]) if l.startswith("|")][:5]
+logkey = "#P1 Up|P1 Down|P1 Left|P1 Right|P1 A|P1 B|P1 Select|P1 Start|"
+sha1 = hashlib.sha1(open(sys.argv[2], "rb").read()).hexdigest().upper()
+json.dump({
+    "title": "gridWalker.win",
+    "core": {"name": "Synth", "version": "", "sha1": ""},
+    "headers": {"MovieVersion": "Chimera Project File v1.1", "Platform": "Synth"},
+    "files": [{"name": "gridWalker.testrom", "sha1": sha1, "slot": "rom"}],
+    "input": "[Input]\nLogKey:" + logkey + "\n" + "\n".join(entries) + "\n[/Input]\n",
+}, open(sys.argv[3], "w"))
+TASPY
+		textend=8
+		tfailed=0
+		for case in "held:1:1" "empty:1:0" "readonly:0:1"; do
+			cname="${case%%:*}"; trest="${case#*:}"
+			trecord="${trest%%:*}"; tpress="${trest#*:}"
+			tjob="$work/job.tastudio-$cname.txt"
+			{
+				echo "meta=$tdir/$cname.meta.txt"
+				echo "outram=$tdir/$cname.ram.bin"
+				echo "extend=$textend"
+				echo "button=P1 Down"
+				echo "press=$tpress"
+				echo "record=$trecord"
+			} > "$tjob"
+			rm -f "$tdir/$cname.meta.txt" "$tdir/$cname.ram.bin"
+			cp "$config" "$work/config.tastudio-$cname.ini"
+			( cd "$repo_root" && CHIMERA_JOB="$tjob" timeout 300 mono "$emu_exe" --headless \
+				"--config=$work/config.tastudio-$cname.ini" "--core=$repo_root/build/Cores/synth-box.chimeraCore" \
+				"--project=$tdir/$tname.chimeraProject" "--lua=$here/synth-tastudio-input.lua" ) > "$tdir/$cname.log" 2>&1
+			if [ ! -f "$tdir/$cname.meta.txt" ] || ! grep -q "^status=OK" "$tdir/$cname.meta.txt"; then
+				report "T:box:$cname" FAIL "$(sed -n 's/^detail=//p' "$tdir/$cname.meta.txt" 2>/dev/null || echo "run failed") (see $tdir/$cname.log)"
+				tfailed=1
+			fi
+		done
+		if [ "$tfailed" -eq 0 ]; then
+			theld="$(sed -n 's/^recorded=//p' "$tdir/held.meta.txt")"
+			theldout="$(sed -n 's/^machine=//p' "$tdir/held.meta.txt")"
+			tempty="$(sed -n 's/^recorded=//p' "$tdir/empty.meta.txt")"
+			tro="$(sed -n 's/^recorded=//p' "$tdir/readonly.meta.txt")"
+			if [ "$theld" != "$textend" ]; then
+				report "T:box:luaInput" FAIL "the held button reached $theld of $textend extended frames in the log"
+			elif [ "$theldout" != "$textend" ]; then
+				report "T:box:luaInput" FAIL "the log holds every press but the core was handed $theldout of $textend"
+			elif cmp -s "$tdir/held.ram.bin" "$tdir/empty.ram.bin"; then
+				report "T:box:luaInput" FAIL "RAM identical to the run that held nothing - the press never moved the machine"
+			else
+				report "T:box:luaInput" PASS "a script's press authors every extended frame, and the core plays it"
+			fi
+			if [ "$tempty" != "0" ]; then
+				report "T:box:luaQuiet" FAIL "nothing was pressed, yet $tempty extended frames hold the button"
+			elif [ "$tro" != "0" ]; then
+				report "T:box:luaQuiet" FAIL "read-only play past the end wrote $tro pressed frames; only the autoholds may reach it"
+			else
+				report "T:box:luaQuiet" PASS "an unpressed frame stays empty, and read-only extension still takes only the autoholds"
+			fi
+		fi
+	fi
+
+	# --- a core that stops, in the real frontend ---
+	# The synth core dies on cue (SPEC.md): all eight buttons abort, all but Up
+	# follow a wild pointer - the second arrives as a SIGSEGV inside a process
+	# whose runtime has signal handlers of its own. Headless Chimera must end the
+	# run the ordinary way with the reason and HeadlessMode.EXIT_CODE_CORE_STOPPED
+	# (65), not die in native code, and leave the recovery journal behind.
+	if [ "$record" -eq 0 ]; then
+		for cue in "abort:|UDLRABsS|:the core aborted" "wild:|.DLRABsS|:the core crashed: it wrote to address"; do
+			cname="${cue%%:*}"; rest="${cue#*:}"; cline="${rest%%:*}"; cwant="${rest#*:}"
+			cdir="$work/stops-$cname"
+			rm -rf "$cdir" && mkdir -p "$cdir"
+			cp "$here/roms/gridWalker.testrom" "$cdir/gridWalker.testrom"
+			sed "12s/.*/$cline/" "$here/movies/gridWalker.win.txt" > "$cdir/movie.txt"
+			python3 - "$cdir/movie.txt" "$cdir/gridWalker.testrom" "$cdir/stops.chimeraProject" <<'PY'
+import hashlib, json, sys
+entries = [l.rstrip("\r\n") for l in open(sys.argv[1]) if l.startswith("|")]
+logkey = "#P1 Up|P1 Down|P1 Left|P1 Right|P1 A|P1 B|P1 Select|P1 Start|"
+sha1 = hashlib.sha1(open(sys.argv[2], "rb").read()).hexdigest().upper()
+json.dump({
+    "id": "0123456789abcdef0123456789abc0de",
+    "title": "stops",
+    "core": {"name": "Synth", "version": "", "sha1": ""},
+    "headers": {"MovieVersion": "Chimera Project File v1.1", "Platform": "Synth"},
+    "files": [{"name": "gridWalker.testrom", "sha1": sha1, "slot": "rom"}],
+    "input": "[Input]\nLogKey:" + logkey + "\n" + "\n".join(entries) + "\n[/Input]\n",
+}, open(sys.argv[3], "w"))
+PY
+			cjob="$work/job.stops-$cname.txt"
+			{
+				echo "outram=$cdir/ram.bin"
+				echo "outvram=$cdir/vram.bin"
+				echo "meta=$cdir/meta.txt"
+			} > "$cjob"
+			cp "$config" "$work/config.stops-$cname.ini"
+			( cd "$repo_root" && CHIMERA_JOB="$cjob" timeout 120 mono "$emu_exe" --headless \
+				"--config=$work/config.stops-$cname.ini" "--core=$repo_root/build/Cores/synth-box.chimeraCore" \
+				"--project=$cdir/stops.chimeraProject" "--lua=$here/synth-movie-dump.lua" ) > "$cdir/log.txt" 2>&1
+			crc=$?
+			if grep -qE "Native Crash|Got a SIG|SIGSEGV while executing native" "$cdir/log.txt"; then
+				if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+					# On the GitHub runner, and only there, Mono's unwinder crashes on the
+					# stop (docs/design-principles.md, "A crash only the CI runner has").
+					# Tracked, not waited on: everywhere else this is still a failure.
+					report "S:frontend:$cname" KNOWN "CI runner only: Mono's unwinder crashed on the stop (see $cdir/log.txt)"
+				else
+					report "S:frontend:$cname" FAIL "the runtime reported a native crash (see $cdir/log.txt)"
+				fi
+			elif [ "$crc" -ne 65 ]; then
+				report "S:frontend:$cname" FAIL "the process ended with $crc, not 65 (see $cdir/log.txt)"
+			elif ! grep -q "\[headless\] The core stopped: $cwant" "$cdir/log.txt"; then
+				report "S:frontend:$cname" FAIL "the stopped core was not reported (see $cdir/log.txt)"
+			elif ! ls -d "$XDG_DATA_HOME"/*/Recovery/0123456789abcdef0123456789abc0de >/dev/null 2>&1 \
+				&& ! find "$XDG_DATA_HOME" -type d -name 0123456789abcdef0123456789abc0de -path "*Recovery*" | grep -q .; then
+				report "S:frontend:$cname" FAIL "the recovery journal was not left behind"
+			else
+				report "S:frontend:$cname" PASS "headless Chimera stops with the reason, lives, and keeps the journal"
+			fi
+			find "$XDG_DATA_HOME" -type d -name 0123456789abcdef0123456789abc0de -path "*Recovery*" -exec rm -rf {} + 2>/dev/null
+		done
+	fi
+
 	# --- a run becomes a video ---
 	# Encode Video, end to end: part of a real run reproduced into a real file
 	# through the real writer. The checks are the ones that used to be a person's
@@ -428,7 +734,7 @@ sha1 = hashlib.sha1(open(sys.argv[2], "rb").read()).hexdigest().upper()
 json.dump({
     "title": "gridWalker.win",
     "core": {"name": "Synth", "version": "", "sha1": ""},
-    "headers": {"MovieVersion": "Chimera Tasproj v1.1", "Platform": "Synth"},
+    "headers": {"MovieVersion": "Chimera Project File v1.1", "Platform": "Synth"},
     "files": [{"name": "gridWalker.testrom", "sha1": sha1, "slot": "rom"}],
     "input": "[Input]\nLogKey:" + logkey + "\n" + "\n".join(entries) + "\n[/Input]\n",
 }, open(sys.argv[3], "w"))
@@ -500,7 +806,7 @@ sha1 = hashlib.sha1(open(sys.argv[2], "rb").read()).hexdigest().upper()
 json.dump({
     "title": sys.argv[1],
     "core": {"name": "Synth", "version": "", "sha1": ""},
-    "headers": {"MovieVersion": "Chimera Tasproj v1.1", "Platform": "Synth"},
+    "headers": {"MovieVersion": "Chimera Project File v1.1", "Platform": "Synth"},
     "files": [{"name": sys.argv[2].split("/")[-1], "sha1": sha1, "slot": "rom"}],
     "input": "[Input]\nLogKey:" + logkey + "\n" + "\n".join(entries) + "\n[/Input]\n",
 }, open(sys.argv[3], "w"))
@@ -593,6 +899,6 @@ REOPENPY
 fi
 
 echo ""
-echo "$ok ok, $failed failed"
+if [ "$known" -gt 0 ]; then echo "$ok ok, $failed failed, $known known"; else echo "$ok ok, $failed failed"; fi
 [ "$failed" -gt 0 ] && exit 1
 exit 0

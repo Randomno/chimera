@@ -1,7 +1,12 @@
-﻿using System.IO;
+﻿using System;
+using System.Globalization;
+using System.IO;
 using System.Linq;
 
 using Chimera.Client.Common;
+using Chimera.Display;
+using Chimera.Emulation.Common;
+using Chimera.Emulation.Common.Engine;
 
 namespace Chimera.Tests.Client.Common.Movie
 {
@@ -11,23 +16,62 @@ namespace Chimera.Tests.Client.Common.Movie
 	/// and the cache sibling carries only what may be lost (docs/project.md).
 	/// </summary>
 	[TestClass]
+	// Every test here points CHIMERA_DATA_HOME - one variable for the whole process - at its own folder,
+	// and the assembly runs tests side by side, so two of them wrote into one another's cache
+	// ("Sharing violation on ... history.bin", a greenzone found missing) about once in six runs.
+	[DoNotParallelize]
 	public class TasMovieProjectFormatTests
 	{
+		private const string PalSettings = "{\"region\":\"pal\"}";
+
 		private static string _dir = "";
+		private static string _dataHomeWas = "";
 
 		[ClassInitialize]
 		public static void MakePlayground(TestContext _)
 		{
 			_dir = Path.Combine(Path.GetTempPath(), $"chimera-tasmovie-project-{System.Diagnostics.Process.GetCurrentProcess().Id}");
 			Directory.CreateDirectory(_dir);
+			// the greenzone lives in the per-user cache now, and a test has no
+			// business writing into the user's
+			_dataHomeWas = Environment.GetEnvironmentVariable("CHIMERA_DATA_HOME") ?? "";
+			Environment.SetEnvironmentVariable("CHIMERA_DATA_HOME", Path.Combine(_dir, "data-home"));
 		}
 
-		[ClassCleanup]
-		public static void RemovePlayground() => Directory.Delete(_dir, recursive: true);
+		/// <summary>
+		/// Per test, not once per class. ClassCleanup DEFAULTS to running at the
+		/// end of the assembly, so another class restoring this variable could
+		/// land in the middle of this one's tests and send a greenzone to the
+		/// real user cache; the cleanup below now says EndOfClass, and this stays
+		/// as the belt to that pair of braces.
+		/// </summary>
+		[TestInitialize]
+		public void UseThePlaygroundDataHome()
+			=> Environment.SetEnvironmentVariable("CHIMERA_DATA_HOME", Path.Combine(_dir, "data-home"));
 
-		private static TasMovie MakeWorkedMovie(string path)
+		[ClassCleanup(ClassCleanupBehavior.EndOfClass)]
+		public static void RemovePlayground()
 		{
-			FakeEmulator emu = new();
+			Environment.SetEnvironmentVariable("CHIMERA_DATA_HOME", _dataHomeWas.Length is 0 ? null : _dataHomeWas);
+			Directory.Delete(_dir, recursive: true);
+		}
+
+		/// <summary>
+		/// Everything in a project's folder that belongs to THAT project, by
+		/// name. The playground is shared by every test here, so what matters is
+		/// not that the folder is empty but that this project left nothing in it.
+		/// </summary>
+		private static string[] SiblingsOf(string projectPath)
+			=> Directory.GetFiles(Path.GetDirectoryName(projectPath)!,
+					Path.GetFileNameWithoutExtension(projectPath) + ".*")
+				.Select(Path.GetFileName)
+				.OrderBy(static n => n, StringComparer.Ordinal)
+				.ToArray();
+
+		private static TasMovie MakeWorkedMovie(string path, string gpuRenderer = "", bool statesSurvive = false,
+			string coreName = "quickernes")
+		{
+			FakeEmulator emu = new() { GpuRenderer = gpuRenderer, GpuStatesSurviveTheContext = statesSurvive };
 			FakeMovieSession session = new(emu);
 			TasMovie movie = new(session, path);
 			session.Movie = movie;
@@ -36,7 +80,7 @@ namespace Chimera.Tests.Client.Common.Movie
 			movie.SetBoolState(3, "A", true);
 
 			movie.HeaderEntries[HeaderKeys.Author] = "sergio";
-			movie.HeaderEntries[HeaderKeys.Core] = "quickernes";
+			movie.HeaderEntries[HeaderKeys.Core] = coreName;
 			movie.HeaderEntries[HeaderKeys.CoreVersion] = "abc123+local";
 			movie.HeaderEntries[HeaderKeys.CorePackageSha1] = new string('B', 40);
 			movie.HeaderEntries[HeaderKeys.GameName] = "sprilo";
@@ -53,17 +97,51 @@ namespace Chimera.Tests.Client.Common.Movie
 				Frame = 4,
 				UserText = "risky route",
 				TimeStamp = new DateTime(2026, 8, 26, 21, 0, 0, DateTimeKind.Utc),
-				CoreData = [1, 2, 3, 4],
 				InputLog = StringLogUtil.MakeStringLog(),
 				Markers = new TasMovieMarkerList(movie),
 			};
 			branch.InputLog.Add(movie.GetInputLogEntry(0));
 			branch.InputLog.Add(movie.GetInputLogEntry(3));
 			branch.Markers.Add(new TasMovieMarker(1, "setup"), skipHistory: true);
+			// the branch's machine is a FILE beside the project's cache, which the engine writes
+			// for a real core; four bytes stand in for it here
+			File.WriteAllBytes(movie.NewBranchStatePath(out var stateFile), [1, 2, 3, 4]);
+			branch.StateFile = stateFile;
 			movie.Branches.Add(branch);
 
 			return movie;
 		}
+
+		/// <summary>
+		/// A branch's state is a file, and on a PS3 a file of gigabytes (issue #84): one that no
+		/// branch names is never read again and has to go - but not the one TAStudio's undo may
+		/// still bring back, and never anything outside the branch-state directory.
+		/// </summary>
+		[TestMethod]
+		public void StateFilesNoBranchNamesAreRemovedAndTheUndosIsKept()
+		{
+			var movie = MakeWorkedMovie(Path.Combine(_dir, "tidy.chimeraProject"));
+			var named = movie.Branches[0].StateFile;
+			File.WriteAllBytes(movie.NewBranchStatePath(out var orphan), [9]);
+			File.WriteAllBytes(movie.NewBranchStatePath(out var undo), [8]);
+			var outside = Path.Combine(Path.GetDirectoryName(movie.BranchStateDirectory)!, "not-a-branch-state.bin");
+			File.WriteAllBytes(outside, [7]);
+
+			movie.RemoveUnusedBranchStates(undo);
+
+			Assert.IsTrue(File.Exists(movie.BranchStatePath(named)), "a branch's own state stays");
+			Assert.IsTrue(File.Exists(movie.BranchStatePath(undo)), "and so does the one the undo would bring back");
+			Assert.IsFalse(File.Exists(movie.BranchStatePath(orphan)), "the one nothing names goes");
+			Assert.IsTrue(File.Exists(outside), "nothing beside the directory is touched");
+
+			movie.Branches.Clear();
+			movie.RemoveUnusedBranchStates();
+			Assert.AreEqual(0, Directory.GetFiles(movie.BranchStateDirectory).Length);
+		}
+
+		/// <summary>What a branch's state file holds, or null for a branch that has none.</summary>
+		private static byte[]? StateOf(TasMovie movie, TasBranch branch)
+			=> branch.StateFile is null ? null : File.ReadAllBytes(movie.BranchStatePath(branch.StateFile));
 
 		private static TasMovie LoadFresh(string path)
 		{
@@ -159,13 +237,17 @@ namespace Chimera.Tests.Client.Common.Movie
 			var movie = MakeWorkedMovie(path);
 			Assert.IsFalse(movie.Save().IsError);
 
-			// it IS the JSON project format, with the cache beside it
+			// it IS the JSON project format, and the cache is NOT beside it
 			using (var fs = File.OpenRead(path))
 			{
 				Assert.AreEqual('{', (char)fs.ReadByte());
 			}
-			Assert.IsTrue(File.Exists(Path.ChangeExtension(path, "chimeraGreenZone")),
-				$"greenzone missing; dir has: {string.Join(",", Directory.GetFiles(_dir).Select(Path.GetFileName))}");
+			Assert.IsTrue(File.Exists(movie.GreenZoneFilename),
+				$"greenzone missing; cache has: {string.Join(",", Directory.GetFiles(Path.GetDirectoryName(movie.GreenZoneFilename)!).Select(Path.GetFileName))}");
+			CollectionAssert.AreEqual(
+				new[] { "roundtrip.chimeraProject" },
+				SiblingsOf(path),
+				"the project's folder holds the project and nothing else - it is the folder people sync");
 
 			var loaded = LoadFresh(path);
 			Assert.AreEqual(6, loaded.InputLogLength);
@@ -191,7 +273,209 @@ namespace Chimera.Tests.Client.Common.Movie
 			Assert.AreEqual(new DateTime(2026, 8, 26, 21, 0, 0, DateTimeKind.Utc), branch.TimeStamp.ToUniversalTime());
 			Assert.AreEqual(2, branch.InputLog.Count);
 			Assert.AreEqual("setup", branch.Markers.Single().Message);
-			CollectionAssert.AreEqual(new byte[] { 1, 2, 3, 4 }, branch.CoreData, "the state came from the cache");
+			CollectionAssert.AreEqual(new byte[] { 1, 2, 3, 4 }, StateOf(loaded, branch), "the state came from the cache");
+		}
+
+		/// <summary>
+		/// A state a GPU drew does not TRAVEL: a branch's machine rides inside the
+		/// project file, which people hand to each other and open on other PCs, and
+		/// the renderer holds its OpenGL objects by names a particular driver handed
+		/// out. So a branch keeps its input and loses its machine.
+		///
+		/// The greenzone is the other case and is decided by the SHUTDOWN, not the
+		/// renderer (2026-09-16): it is a per-machine cache beside the project, and a
+		/// cleanly closed session's history reloads correctly - measured on the real
+		/// 8916-frame nss102 project, where a 626 MB greenzone written by one process
+		/// and reloaded by another drew frame 8915 pixel for pixel.
+		/// </summary>
+		[TestMethod]
+		public void AGpuDrawnBranchLosesItsMachineButTheGreenzoneSurvivesACleanClose()
+		{
+			var path = Path.Combine(_dir, "gpudrawn.chimeraProject");
+			var movie = MakeWorkedMovie(path, gpuRenderer: "4.5 (Core Profile) Mesa on llvmpipe", coreName: "Ruffle");
+			Assert.IsFalse(movie.Save().IsError);
+
+			var loaded = LoadFresh(path);
+			Assert.AreEqual(6, loaded.InputLogLength, "the work itself is untouched");
+			Assert.AreEqual(1, loaded.Branches.Count);
+			Assert.AreEqual("risky route", loaded.Branches[0].UserText, "and so is what a branch IS");
+			Assert.IsNull(loaded.Branches[0].StateFile, "the branch keeps its input and loses its state");
+			// ...but nothing is said about the greenzone, because nothing was taken
+			// away: this project closed cleanly, so its history is trusted
+			Assert.IsNull(loaded.DroppedCacheNote, "a clean close keeps the greenzone, whoever drew it");
+
+			// the same project on a machine no GPU drew keeps its states, which is
+			// what every deterministic core does and must go on doing
+			var plain = Path.Combine(_dir, "cpudrawn.chimeraProject");
+			Assert.IsFalse(MakeWorkedMovie(plain).Save().IsError);
+			var plainLoaded = LoadFresh(plain);
+			Assert.IsNull(plainLoaded.DroppedCacheNote);
+			CollectionAssert.AreEqual(new byte[] { 1, 2, 3, 4 }, StateOf(plainLoaded, plainLoaded.Branches[0]),
+				"the state came from the cache, as it always has");
+		}
+
+		/// <summary>
+		/// A session whose machine DIED keeps nothing, however tidily it then shut down.
+		///
+		/// The core-stopped dialog offers four ways on, and only one of them ("save inputs and close")
+		/// went through the no-greenzone save. Going back to a safe point or restarting from frame zero
+		/// leaves the session running, and its ordinary save would write the greenzone as though the
+		/// death had not happened. That is not hypothetical: on 2026-09-16 a Ruffle machine died in
+		/// naga's shader namer and the session went on to write a 430 MB history, which the next open
+		/// would have loaded and trusted.
+		///
+		/// The death is sticky because a machine that faults may have been wrong for some time first,
+		/// so every state captured in that session is suspect - not merely the last one.
+		/// </summary>
+		[TestMethod]
+		public void ASessionWhoseMachineDiedLeavesNoGreenzoneBehind()
+		{
+			var path = Path.Combine(_dir, "died.chimeraProject");
+			var movie = MakeWorkedMovie(path, gpuRenderer: "4.5 (Core Profile) Mesa on llvmpipe", coreName: "Ruffle");
+			Assert.IsFalse(movie.Save().IsError);
+			Assert.IsTrue(File.Exists(movie.StateHistoryFilename),
+				"a clean Ruffle session writes one - that is the behaviour this guards");
+
+			movie.NoteCoreDied();
+			Assert.IsTrue(movie.CoreDiedThisSession, "and it stays said");
+			Assert.IsFalse(movie.Save().IsError);
+			Assert.IsFalse(File.Exists(movie.StateHistoryFilename),
+				"the history of a session that lost its machine is removed, not left for the next open");
+
+			// and a core that never had a greenzone to lose is unaffected
+			var plain = Path.Combine(_dir, "diedplain.chimeraProject");
+			var cpu = MakeWorkedMovie(plain);
+			cpu.NoteCoreDied();
+			Assert.IsFalse(cpu.Save().IsError, "a death is not a save failure");
+		}
+
+		/// <summary>
+		/// A GPU-drawn core with no evidence behind it keeps the old behaviour: its greenzone is not
+		/// kept between sessions at all, however cleanly the last one closed.
+		///
+		/// The list is evidence, not a promise a core makes about itself: Ruffle DECLARED that its
+		/// states survive a new context while being the core that bricked a project (2026-09-14). A core
+		/// joins the list when a history written by one process has been reloaded by another and shown
+		/// to draw the same frame.
+		/// </summary>
+		[TestMethod]
+		public void AGpuCoreWithNoEvidenceStillStartsCold()
+		{
+			var path = Path.Combine(_dir, "unproven.chimeraProject");
+			var movie = MakeWorkedMovie(path, gpuRenderer: "4.5 (Core Profile) Mesa on llvmpipe",
+				statesSurvive: true, coreName: "some-unproven-core");
+			Assert.IsFalse(movie.Save().IsError);
+
+			var loaded = LoadFresh(path);
+			Assert.AreEqual(6, loaded.InputLogLength, "the work itself is untouched");
+			Assert.IsNotNull(loaded.DroppedCacheNote, "and the person is told the states were not kept");
+			StringAssert.Contains(loaded.DroppedCacheNote, "not yet known to reload");
+		}
+
+		/// <summary>
+		/// A history written by a session that did not finish is not trusted - the case that decided the
+		/// policy (docs/design-principles.md, 2026-09-14/2026-09-16).
+		///
+		/// nss102's greenzone came from a session that went on to die of guest heap corruption. Opening
+		/// the project restored a state from it and the first draw killed the process inside the NVIDIA
+		/// driver, every time: nothing in Chimera could catch it, because the process was gone. So the
+		/// gate is the shutdown, and it refuses on doubt: a recovery folder still holding work means the
+		/// last session never got to say it had finished.
+		/// </summary>
+		[TestMethod]
+		public void AHistoryFromASessionThatDidNotFinishIsNotTrusted()
+		{
+			var path = Path.Combine(_dir, "crashed.chimeraProject");
+			var movie = MakeWorkedMovie(path, gpuRenderer: "4.5 (Core Profile) Mesa on llvmpipe", coreName: "Ruffle");
+			Assert.IsFalse(movie.Save().IsError);
+			var dir = ProjectRecovery.DirectoryFor(movie.Project.Id);
+			try
+			{
+				// the session that never closed: work on disk, and an owner whose process is gone
+				var recovery = ProjectRecovery.Begin(movie, movie.Project.Id, path);
+				Assert.IsNotNull(recovery);
+				recovery.Tick();
+				ProjectRecovery.WriteSession(dir, new ProjectRecovery.SessionRecord
+				{
+					ProcessId = int.MaxValue, ProcessStartedUtcTicks = 1, ProjectPath = path,
+				});
+				Assert.IsFalse(ProjectRecovery.LastSessionEndedCleanly(movie.Project.Id),
+					"a folder still holding work is a session that did not finish");
+
+				var loaded = LoadFresh(path);
+				Assert.AreEqual(6, loaded.InputLogLength, "the work itself is never in doubt");
+				Assert.IsNotNull(loaded.DroppedCacheNote, "and the person is told the greenzone was not used");
+				StringAssert.Contains(loaded.DroppedCacheNote, "did not close normally");
+			}
+			finally
+			{
+				// Discard takes the Leftover, and the folder lives in the real
+				// per-user cache root - so it is taken away by hand either way,
+				// and a test never leaves work behind in somebody's cache.
+				if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true);
+			}
+
+			// ...and with the folder gone, the very same project keeps its history:
+			// the refusal is the unfinished session's doing and nothing else's
+			Assert.IsTrue(ProjectRecovery.LastSessionEndedCleanly(movie.Project.Id));
+			Assert.IsNull(LoadFresh(path).DroppedCacheNote, "a clean close is trusted again");
+		}
+
+		/// <summary>
+		/// ...and a core that SAYS its renderer builds its objects again when the context it drew on is
+		/// gone is still not taken at its word for a state that TRAVELS. The claim is written down - it
+		/// is what the core said - and the branch's machine is left out all the same, because the
+		/// project file goes to other people and other PCs.
+		/// </summary>
+		[TestMethod]
+		public void ARendererThatSaysItRebuildsStillDoesNotTravel()
+		{
+			var path = Path.Combine(_dir, "rebuilds.chimeraProject");
+			var movie = MakeWorkedMovie(path, gpuRenderer: "4.5 Mesa on llvmpipe", statesSurvive: true, coreName: "Ruffle");
+			Assert.IsFalse(movie.Save().IsError);
+
+			var loaded = LoadFresh(path);
+			Assert.AreEqual(6, loaded.InputLogLength, "the work itself is untouched");
+			Assert.IsNull(loaded.Branches[0].StateFile, "the branch keeps its input and loses its state");
+			Assert.IsNull(loaded.DroppedCacheNote, "the greenzone is untouched: this project closed cleanly");
+			Assert.AreEqual("1", loaded.HeaderEntries[HeaderKeys.GpuStatesSurvive],
+				"what the core declared is still on record");
+		}
+
+		/// <summary>
+		/// An open session journals its markers and branches as they change, not when it saves: a marker
+		/// renamed, a marker added and a branch renamed after the last save all come back from the journal
+		/// alone - the snapshot is thrown away before the rebuild, so nothing else could have carried them.
+		/// </summary>
+		[TestMethod]
+		public void TheOpenSessionJournalsMarkersAndBranchesAsTheyChange()
+		{
+			var path = Path.Combine(_dir, "journaled.chimeraProject");
+			var movie = MakeWorkedMovie(path);
+			Assert.IsFalse(movie.Save().IsError);
+			var recovery = ProjectRecovery.Begin(movie, movie.Project.Id, path);
+			Assert.IsNotNull(recovery);
+
+			movie.Markers.Single(static m => m.Message == "the jump").Message = "the long jump";
+			movie.Markers.Add(new TasMovieMarker(5, "the landing"), skipHistory: true);
+			movie.Branches[0].UserText = "safer route";
+			recovery.Tick();
+
+			// the crash: nothing closes, the session's process is gone, and the snapshot is not trusted here
+			var dir = ProjectRecovery.DirectoryFor(movie.Project.Id);
+			ProjectRecovery.WriteSession(dir, new ProjectRecovery.SessionRecord { ProcessId = int.MaxValue, ProcessStartedUtcTicks = 1, ProjectPath = path });
+			File.Delete(Path.Combine(dir, "snapshot.chimeraProject"));
+
+			var leftover = ProjectRecovery.FindUnfinished(movie.Project.Id);
+			Assert.IsNotNull(leftover);
+			var copy = ProjectRecovery.BuildRecoveredCopy(leftover, path, Path.Combine(_dir, "Backups"));
+			using var recovered = Chimera.Emulation.Common.Engine.EngineProject.Open(copy);
+			var messages = Enumerable.Range(0, recovered.MarkerCount).Select(recovered.MarkerText).ToArray();
+			CollectionAssert.Contains(messages, "the long jump");
+			CollectionAssert.Contains(messages, "the landing");
+			Assert.AreEqual("safer route", recovered.BranchName(0));
+			recovery.End(clean: true);
+			Assert.IsFalse(Directory.Exists(dir), "and a clean end leaves nothing behind");
 		}
 
 		/// <summary>
@@ -210,7 +494,7 @@ namespace Chimera.Tests.Client.Common.Movie
 
 			var same = LoadFresh(path);
 			Assert.IsNull(same.DroppedCacheNote, "the same machine uses its cache");
-			CollectionAssert.AreEqual(new byte[] { 1, 2, 3, 4 }, same.Branches[0].CoreData);
+			CollectionAssert.AreEqual(new byte[] { 1, 2, 3, 4 }, StateOf(same, same.Branches[0]));
 
 			// the project's settings change underneath the cache
 			using (var p = Chimera.Emulation.Common.Engine.EngineProject.Open(path))
@@ -223,14 +507,79 @@ namespace Chimera.Tests.Client.Common.Movie
 			StringAssert.Contains(other.DroppedCacheNote, "other settings");
 			Assert.AreEqual(6, other.InputLogLength, "the work is untouched");
 			Assert.AreEqual(1, other.Branches.Count);
-			Assert.IsNull(other.Branches[0].CoreData, "the branch keeps its input and loses its state");
-			Assert.IsNotNull(other.TasStateManager, "and there is a greenzone to start filling");
+			Assert.IsNull(other.Branches[0].StateFile, "the branch keeps its input and loses its state");
 
 			// saving from the new machine writes a cache that is its own
 			other.InsertEmptyFrame(0, 1);
 			Assert.IsFalse(other.Save().IsError);
 			var again = LoadFresh(path);
 			Assert.IsNull(again.DroppedCacheNote, "the cache the new machine wrote is used");
+		}
+
+		/// <summary>
+		/// Issue #115. A project records the savestate format its cached states were
+		/// written in. When this build reads another number, the person is told once, at
+		/// open, what happened and why - instead of finding out one refused branch at a
+		/// time, or not at all. The engine still refuses each state for itself; this is
+		/// the same news about the whole cache, said earlier.
+		/// </summary>
+		[TestMethod]
+		public void AProjectSaysWhichSavestateFormatItsStatesAreIn()
+		{
+			var path = Path.Combine(_dir, "stateformat.chimeraProject");
+			var movie = MakeWorkedMovie(path);
+			Assert.IsFalse(movie.Save().IsError);
+
+			var current = ChimeraEngine.StateFormat.ToString(CultureInfo.InvariantCulture);
+			var saved = LoadFresh(path);
+			Assert.AreEqual(current, saved.HeaderEntries[HeaderKeys.StateFormat], "a save records the format it wrote in");
+			Assert.AreEqual(ChimeraEngine.StateWriterId, saved.HeaderEntries[HeaderKeys.StateWrittenBy]);
+			Assert.IsNull(saved.DroppedCacheNote, "the same build says nothing at all");
+
+			// the same project, as a build on another format would find it
+			using (var p = Chimera.Emulation.Common.Engine.EngineProject.Open(path))
+			{
+				p.HeaderSet(HeaderKeys.StateFormat, (ChimeraEngine.StateFormat + 1).ToString(CultureInfo.InvariantCulture));
+				p.HeaderSet(HeaderKeys.StateWrittenBy, "Chimera commit deadbeef1234");
+				p.Save(path);
+			}
+			var other = LoadFresh(path);
+			Assert.IsNotNull(other.DroppedCacheNote, "another format is explained");
+			StringAssert.Contains(other.DroppedCacheNote, (ChimeraEngine.StateFormat + 1).ToString(CultureInfo.InvariantCulture));
+			StringAssert.Contains(other.DroppedCacheNote, current);
+			StringAssert.Contains(other.DroppedCacheNote, "Chimera commit deadbeef1234");
+			StringAssert.Contains(other.DroppedCacheNote, ChimeraEngine.StateWriterId);
+			Assert.AreEqual(6, other.InputLogLength, "and the work is untouched");
+
+			// a project written before the record says nothing, and silence is not a disagreement
+			using (var p = Chimera.Emulation.Common.Engine.EngineProject.Open(path))
+			{
+				p.HeaderSet(HeaderKeys.StateFormat, null);
+				p.HeaderSet(HeaderKeys.StateWrittenBy, null);
+				p.Save(path);
+			}
+			Assert.IsNull(LoadFresh(path).DroppedCacheNote, "a project from before this existed is not nagged about");
+		}
+
+		/// <summary>
+		/// Issue #115, the date heuristic: the engine owns the threshold and the wording,
+		/// and this side only asks. A pairing that works must keep working, so it is
+		/// silent unless the two builds are far apart, and silent whenever either side
+		/// does not date itself.
+		/// </summary>
+		[TestMethod]
+		public void BuildsFarApartAreMentionedAndCloseOnesAreNot()
+		{
+			Assert.IsNull(ChimeraEngine.VersionSkew("2026-09-20", "a", "2026-09-13", "b", "quickerNES"));
+			Assert.IsNull(ChimeraEngine.VersionSkew("2026-09-20", "a", "", "b", "quickerNES"), "no date, no guess");
+
+			var far = ChimeraEngine.VersionSkew("2026-09-20", "Commit 229fc29c3", "2026-08-01", "4713 0d81", "quickerNES");
+			Assert.IsNotNull(far);
+			StringAssert.Contains(far, "2026-09-20");
+			StringAssert.Contains(far, "2026-08-01");
+			StringAssert.Contains(far, "Commit 229fc29c3");
+			StringAssert.Contains(far, "quickerNES");
+			StringAssert.Contains(far, "Core Manager");
 		}
 
 		[TestMethod]
@@ -270,19 +619,169 @@ namespace Chimera.Tests.Client.Common.Movie
 			Assert.AreEqual(0, Directory.GetFiles(backups, "*.chimeraGreenZone").Length, "a backup carries no cache");
 		}
 
+		/// <summary>
+		/// A greenzone left beside a project by an older Chimera is taken over
+		/// rather than ignored: it is moved into the cache and used. Ignoring it
+		/// would be safe - it is only a cache - but it would also silently throw
+		/// away hours of somebody's greenzone on the release that moved it, and
+		/// leave the gigabyte behind in the folder that was the whole problem.
+		/// </summary>
+		[TestMethod]
+		public void AGreenZoneLeftBesideAProjectIsTakenOver()
+		{
+			var path = Path.Combine(_dir, "legacy.chimeraProject");
+			var movie = MakeWorkedMovie(path);
+			Assert.IsFalse(movie.Save().IsError);
+
+			// put it back where an older Chimera would have left it
+			var legacy = TasMovie.LegacyGreenZonePathFor(path);
+			File.Move(movie.GreenZoneFilename, legacy);
+			Assert.IsFalse(File.Exists(movie.GreenZoneFilename));
+
+			var loaded = LoadFresh(path);
+			Assert.IsFalse(File.Exists(legacy), "the sibling is gone from the project's folder");
+			Assert.IsTrue(File.Exists(loaded.GreenZoneFilename), "and is in the cache instead");
+			Assert.IsNull(loaded.DroppedCacheNote, "it was used, not discarded");
+			CollectionAssert.AreEqual(new[] { "legacy.chimeraProject" }, SiblingsOf(path));
+		}
+
+		/// <summary>
+		/// A project saved without its greenzone - what the core-stopped dialog offers when the
+		/// history comes from a run whose machine died - keeps every input, marker and branch, and
+		/// leaves no history behind for the next open to load, not even the one an earlier save wrote.
+		/// </summary>
+		[TestMethod]
+		public void AProjectCanBeSavedWithoutItsGreenzone()
+		{
+			var path = Path.Combine(_dir, "nogreenzone.chimeraProject");
+			var movie = MakeWorkedMovie(path);
+			foreach (var f in new[] { 1, 2, 3, 4 }) movie.States.Capture(f);
+			Assert.IsFalse(movie.Save().IsError);
+			Assert.IsTrue(File.Exists(movie.StateHistoryFilename), "an ordinary save writes the history");
+
+			Assert.IsFalse(movie.SaveWithoutGreenzone().IsError);
+			Assert.IsFalse(File.Exists(movie.StateHistoryFilename), "this one takes it away");
+
+			var loaded = LoadFresh(path);
+			foreach (var f in new[] { 1, 2, 3, 4 })
+			{
+				Assert.IsFalse(loaded.States.Has(f), $"frame {f} does not come back");
+			}
+			Assert.AreEqual(movie.InputLogLength, loaded.InputLogLength, "every input does");
+			Assert.AreEqual(movie.Markers.Count, loaded.Markers.Count, "and every marker");
+			Assert.AreEqual(movie.Branches.Count, loaded.Branches.Count, "and every branch");
+		}
+
+		/// <summary>
+		/// The states survive closing and reopening, which is the entire point of
+		/// keeping them. The engine owns the history and proves its own file
+		/// round trips; what is checked here is the wiring above it - that the
+		/// movie writes one where it says it does, and reads it back when the
+		/// emulator arrives rather than when the project is parsed, since until
+		/// then there is nowhere to put it.
+		/// </summary>
+		[TestMethod]
+		public void TheStatesComeBackWhenTheProjectIsReopened()
+		{
+			var path = Path.Combine(_dir, "states.chimeraProject");
+			var movie = MakeWorkedMovie(path);
+			foreach (var f in new[] { 1, 2, 3, 4 }) movie.States.Capture(f);
+			Assert.IsFalse(movie.Save().IsError);
+			Assert.IsTrue(File.Exists(movie.StateHistoryFilename), "the history is a file of its own");
+			CollectionAssert.AreEqual(new[] { "states.chimeraProject" }, SiblingsOf(path),
+				"and it is not beside the project either");
+
+			var loaded = LoadFresh(path);
+			foreach (var f in new[] { 1, 2, 3, 4 })
+			{
+				Assert.IsTrue(loaded.States.Has(f), $"frame {f} came back");
+			}
+
+			// and the states go when the machine under them changes - the project's
+			// settings edited on disk, so the history file is left as it was
+			using (var p = Chimera.Emulation.Common.Engine.EngineProject.Open(path))
+			{
+				p.SetSettingsJson(PalSettings);
+				p.Save(path);
+			}
+			var other = LoadFresh(path);
+			Assert.IsFalse(other.States.Has(3), "another machine's states are not loaded");
+			Assert.AreEqual(1, other.States.Count, "and it starts from the anchor alone");
+		}
+
+		/// <summary>
+		/// TAStudio's layout travels in the project (issue #83): it survives the cache being set aside by a
+		/// machine change - which is what a new core or Chimera build is - and the cache being lost, and a
+		/// project with no layout stays without the key, which is what an older build can still open.
+		/// </summary>
+		[TestMethod]
+		public void TheTAStudioLayoutIsInTheProjectAndOutlivesTheCache()
+		{
+			const string LAYOUT = """{"$type":"test","Columns":[[{"Name":"A","Width":23,"Visible":true}]],"HorizontalOrientation":false}""";
+			var path = Path.Combine(_dir, "layout.chimeraProject");
+			var movie = MakeWorkedMovie(path);
+			movie.ClientSettingsForSave = () => LAYOUT;
+			Assert.IsFalse(movie.Save().IsError);
+			StringAssert.Contains(File.ReadAllText(path), "\"tastudio\"", "the layout is written into the project file");
+
+			// a new core: the machine the cache belongs to is not this one any more
+			using (var p = Chimera.Emulation.Common.Engine.EngineProject.Open(path))
+			{
+				p.SetSettingsJson(PalSettings);
+				p.Save(path);
+			}
+			var afterMachineChange = LoadFresh(path);
+			Assert.IsNotNull(afterMachineChange.DroppedCacheNote, "the cache really was set aside");
+			StringAssert.Contains(afterMachineChange.LoadedClientSettings, "\"Width\":23", "and the layout came back anyway");
+
+			File.Delete(afterMachineChange.GreenZoneFilename);
+			var afterLostCache = LoadFresh(path);
+			StringAssert.Contains(afterLostCache.LoadedClientSettings, "\"Width\":23", "with no cache at all, too");
+
+			var plainPath = Path.Combine(_dir, "nolayout.chimeraProject");
+			Assert.IsFalse(MakeWorkedMovie(plainPath).Save().IsError);
+			Assert.IsFalse(File.ReadAllText(plainPath).Contains("\"tastudio\""), "no layout, no key");
+		}
+
 		[TestMethod]
 		public void ALostCacheCostsRecomputationNeverWork()
 		{
 			var path = Path.Combine(_dir, "nocache.chimeraProject");
 			var movie = MakeWorkedMovie(path);
 			Assert.IsFalse(movie.Save().IsError);
-			File.Delete(Path.ChangeExtension(path, "chimeraGreenZone"));
+			File.Delete(movie.GreenZoneFilename);
 
 			var loaded = LoadFresh(path);
 			Assert.AreEqual(6, loaded.InputLogLength, "the input log is work, not cache");
 			Assert.AreEqual(1, loaded.Branches.Count, "the branch itself is work");
 			Assert.AreEqual("risky route", loaded.Branches[0].UserText);
-			Assert.IsNull(loaded.Branches[0].CoreData, "only its state was cache");
+			Assert.IsNull(loaded.Branches[0].StateFile, "only its state was cache");
+		}
+
+		/// <summary>
+		/// A branch's pictures are cache: they come back with the project's cache and are simply absent
+		/// without it. TAStudio treated them as always there, so hovering a branch that was opened without
+		/// its cache - on another machine, after a clear, or set aside for another build of the core - threw
+		/// a NullReferenceException (issue #79). This pins both halves of what the UI now has to expect.
+		/// </summary>
+		[TestMethod]
+		public void ABranchsPicturesAreCacheAndMayBeAbsent()
+		{
+			var path = Path.Combine(_dir, "pictures.chimeraProject");
+			var movie = MakeWorkedMovie(path);
+			movie.Branches[0].OSDFrameBuffer = new BitmapBuffer(2, 2, new[] { 1, 2, 3, 4 });
+			movie.Branches[0].CoreFrameBuffer = new BitmapBuffer(2, 2, new[] { 5, 6, 7, 8 });
+			Assert.IsFalse(movie.Save().IsError);
+
+			var withCache = LoadFresh(path);
+			Assert.IsNotNull(withCache.Branches[0].OSDFrameBuffer, "the cache brings the screenshot back");
+			Assert.IsNotNull(withCache.Branches[0].CoreFrameBuffer, "and the machine's own picture");
+
+			File.Delete(movie.GreenZoneFilename);
+			var withoutCache = LoadFresh(path);
+			Assert.AreEqual(1, withoutCache.Branches.Count, "the branch itself is work");
+			Assert.IsNull(withoutCache.Branches[0].OSDFrameBuffer, "without the cache there is no screenshot to show");
+			Assert.IsNull(withoutCache.Branches[0].CoreFrameBuffer, "nor a picture to put back on the screen");
 		}
 
 		[TestMethod]
@@ -352,6 +851,36 @@ namespace Chimera.Tests.Client.Common.Movie
 		}
 
 		/// <summary>
+		/// A save records the core that RAN, not the one the project was created
+		/// with: a project opened on another build warns, drops its cached states
+		/// and carries on, and used to be written back out still pinned to the old
+		/// build - so every later open asked about a core nobody was using
+		/// (user-reported, 2026-09-16).
+		///
+		/// The pin is a package, so only a loaded package may replace it, and the
+		/// three parts travel together: a name from one build beside a hash from
+		/// another would describe a machine that never existed.
+		/// </summary>
+		[TestMethod]
+		public void ASaveRecordsTheCoreThatRan()
+		{
+			FakeEmulator emu = new();
+
+			// nothing identifies the running core: the project keeps its pin, which
+			// is what ThePinSurvivesAMovieThatSaysNothing checks end to end
+			Assert.IsNull(TasMovie.RunningCoreIdentity(emu, ""), "a core from no package cannot replace a pin");
+			Assert.IsNull(TasMovie.RunningCoreIdentity(emu, "   "));
+			Assert.IsNull(TasMovie.RunningCoreIdentity(null, new string('A', 40)), "and neither can no core at all");
+
+			// a loaded package: name, version and hash together
+			var ran = TasMovie.RunningCoreIdentity(emu, new string('C', 40));
+			Assert.IsNotNull(ran);
+			Assert.AreEqual("Fake", ran.Value.Name);
+			Assert.AreEqual(new string('C', 40), ran.Value.Sha1);
+			Assert.AreEqual("", ran.Value.Version, "a core that states no version claims none");
+		}
+
+		/// <summary>
 		/// The wizard records every exposed setting at its chosen value, and the
 		/// movie that starts from that project has no settings text of its own -
 		/// the project boot fills headers, never settings. Saving must keep the
@@ -391,6 +920,92 @@ namespace Chimera.Tests.Client.Common.Movie
 			Assert.IsFalse(loaded.Save().IsError);
 			using var overwritten = Chimera.Emulation.Common.Engine.EngineProject.Open(path);
 			StringAssert.Contains(overwritten.SettingsJson, "\"fast_boot\":true");
+		}
+		/// <summary>
+		/// The controller the frontend holds before any core has booted: the null
+		/// emulator's, which names no controls at all. It carries a mnemonics
+		/// cache because InputManager builds one for every emulator it syncs, the
+		/// null one included - so an entry CAN be generated from it rather than
+		/// the attempt being refused, which is what lets the fault below through.
+		/// </summary>
+		private static ControllerDefinition NullEmulatorControls()
+		{
+			var definition = new ControllerDefinition("Null Controller").MakeImmutable();
+			definition.BuildMnemonicsCache("NULL");
+			return definition;
+		}
+
+		/// <summary>
+		/// Opens a saved project in the order the frontend really does it: the
+		/// file is read FIRST, because it is the file that says which core to boot
+		/// and with what, and only afterwards does the session get the machine's
+		/// own controller.
+		/// </summary>
+		private static TasMovie OpenTheWayAProjectOpens(string path)
+		{
+			FakeEmulator emu = new();
+			FakeMovieSession session = new(emu)
+			{
+				MovieController = new MovieController(NullEmulatorControls()),
+			};
+			TasMovie movie = new(session, path);
+			session.Movie = movie;
+			Assert.IsTrue(movie.Load(), "the project should load");
+
+			// the boot: the machine is up, and the session speaks its controller
+			session.MovieController = new MovieController(emu.ControllerDefinition, movie.LogKey);
+			movie.Attach(emu);
+			return movie;
+		}
+
+		/// <summary>
+		/// Clearing frames writes a neutral entry over each one, and the piano
+		/// roll reads those entries back on its very next paint. Both halves have
+		/// to agree on the shape of an entry, and the writer's idea of it used to
+		/// be settled the first time anything asked - during the project READ,
+		/// before the core had booted, when the only controller to ask was the
+		/// null emulator's and it knew none of this movie's axes. The entry that
+		/// came out had no axis fields at all, and reading it back threw out of
+		/// the paint: "Failed to draw input roll" (issue #54).
+		/// </summary>
+		[TestMethod]
+		public void AClearedFrameIsStillShapedLikeTheMovie()
+		{
+			var path = Path.Combine(_dir, "clear-after-boot.chimeraProject");
+			var worked = MakeWorkedMovie(path); // presses A on frame 3 of 6
+			Assert.IsFalse(worked.Save().IsError);
+
+			var movie = OpenTheWayAProjectOpens(path);
+			var neutral = movie.GetInputLogEntry(0);
+
+			movie.ClearFrame(3); // the Delete key, one frame of the selection
+
+			// the paint that follows the edit
+			Assert.AreEqual("", movie.DisplayValue(3, "A", true));
+			Assert.AreEqual("", movie.DisplayValue(3, "Stick", true));
+			Assert.AreEqual(neutral, movie.GetInputLogEntry(3),
+				"the cleared entry is not shaped like the rest of the log");
+		}
+
+		/// <summary>
+		/// Where a run's input stops is found by comparing entries against an
+		/// empty one, and only the machine can say what empty looks like. Answered
+		/// before the boot it matches nothing, so the answer falls through to the
+		/// last frame of the movie and the run's "Last input" marker sits at the
+		/// end of a run whose input stopped long before.
+		/// </summary>
+		[TestMethod]
+		public void WhereTheInputStopsIsAnsweredByTheMachine()
+		{
+			var path = Path.Combine(_dir, "last-input-after-boot.chimeraProject");
+			var worked = MakeWorkedMovie(path); // presses A on frame 3 of 6
+			Assert.IsFalse(worked.Save().IsError);
+
+			var movie = OpenTheWayAProjectOpens(path);
+
+			Assert.AreEqual(3, movie.LastNonEmptyInputFrame);
+			Assert.AreEqual(3, movie.Markers.Find(static m => m.Permanence == MarkerPermanence.LastInput)!.Frame,
+				"the run's own marker followed the wrong answer");
 		}
 	}
 }

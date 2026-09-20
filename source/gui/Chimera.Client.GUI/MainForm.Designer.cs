@@ -35,6 +35,9 @@ namespace Chimera.Client.GUI
 			this.toolStripSeparator21 = new Chimera.WinForms.Controls.ToolStripSeparatorEx();
 			this.toolStripSeparator5 = new Chimera.WinForms.Controls.ToolStripSeparatorEx();
 			this.EncodeVideoMenuItem = new Chimera.WinForms.Controls.ToolStripMenuItemEx();
+			this.CoreManagerMenuItem = new Chimera.WinForms.Controls.ToolStripMenuItemEx();
+			this.CacheManagerMenuItem = new Chimera.WinForms.Controls.ToolStripMenuItemEx();
+			this.toolStripSeparatorManagers = new Chimera.WinForms.Controls.ToolStripSeparatorEx();
 			this.ScreenshotSubMenu = new Chimera.WinForms.Controls.ToolStripMenuItemEx();
 			this.ScreenshotMenuItem = new Chimera.WinForms.Controls.ToolStripMenuItemEx();
 			this.ScreenshotAsMenuItem = new Chimera.WinForms.Controls.ToolStripMenuItemEx();
@@ -73,6 +76,9 @@ namespace Chimera.Client.GUI
 			this.DisplayConfigMenuItem = new Chimera.WinForms.Controls.ToolStripMenuItemEx();
 			this.SoundMenuItem = new Chimera.WinForms.Controls.ToolStripMenuItemEx();
 			this.PathsMenuItem = new Chimera.WinForms.Controls.ToolStripMenuItemEx();
+			this.FirmwareMenuItem = new Chimera.WinForms.Controls.ToolStripMenuItemEx();
+			this.PrecompiledModulesMenuItem = new Chimera.WinForms.Controls.ToolStripMenuItemEx();
+			this.DataDirectoryMenuItem = new Chimera.WinForms.Controls.ToolStripMenuItemEx();
 			this.MessagesMenuItem = new Chimera.WinForms.Controls.ToolStripMenuItemEx();
 			this.AutofireMenuItem = new Chimera.WinForms.Controls.ToolStripMenuItemEx();
 			this.ClientOptionsMenuItem = new Chimera.WinForms.Controls.ToolStripMenuItemEx();
@@ -119,8 +125,8 @@ namespace Chimera.Client.GUI
 			this.LuaConsoleMenuItem = new Chimera.WinForms.Controls.ToolStripMenuItemEx();
 			this.HexEditorMenuItem = new Chimera.WinForms.Controls.ToolStripMenuItemEx();
 			this.MacroToolMenuItem = new Chimera.WinForms.Controls.ToolStripMenuItemEx();
-			this.toolStripSeparator29 = new Chimera.WinForms.Controls.ToolStripSeparatorEx();
 			this.BatchRunnerMenuItem = new Chimera.WinForms.Controls.ToolStripMenuItemEx();
+			this.MediaMakerMenuItem = new Chimera.WinForms.Controls.ToolStripMenuItemEx();
 			this.toolStripSeparator22 = new Chimera.WinForms.Controls.ToolStripSeparatorEx();
 			this.GenericCoreSubMenu = new Chimera.WinForms.Controls.ToolStripMenuItemEx();
 			this.HelpSubMenu = new Chimera.WinForms.Controls.ToolStripMenuItemEx();
@@ -364,6 +370,16 @@ namespace Chimera.Client.GUI
 			// 
 			this.EncodeVideoMenuItem.Text = "&Encode Video...";
 			this.EncodeVideoMenuItem.Click += new System.EventHandler(this.EncodeVideoMenuItem_Click);
+			//
+			// CoreManagerMenuItem
+			//
+			this.CoreManagerMenuItem.Text = "&Core Manager...";
+			this.CoreManagerMenuItem.Click += new System.EventHandler(this.CoreManagerMenuItem_Click);
+			// 
+			// CacheManagerMenuItem
+			// 
+			this.CacheManagerMenuItem.Text = "Cac&he Manager...";
+			this.CacheManagerMenuItem.Click += new System.EventHandler(this.CacheManagerMenuItem_Click);
 			// 
 			// ScreenshotSubMenu
 			// 
@@ -526,6 +542,8 @@ namespace Chimera.Client.GUI
             this.DisplayConfigMenuItem,
             this.SoundMenuItem,
             this.PathsMenuItem,
+            this.FirmwareMenuItem,
+            this.DataDirectoryMenuItem,
             this.MessagesMenuItem,
             this.AutofireMenuItem,
             this.ClientOptionsMenuItem,
@@ -564,6 +582,21 @@ namespace Chimera.Client.GUI
 			// 
 			this.PathsMenuItem.Text = "Paths...";
 			this.PathsMenuItem.Click += new System.EventHandler(this.PathsMenuItem_Click);
+			// 
+			// FirmwareMenuItem
+			// 
+			this.FirmwareMenuItem.Text = "Firmware...";
+			this.FirmwareMenuItem.Click += new System.EventHandler(this.FirmwareMenuItem_Click);
+			// 
+			// PrecompiledModulesMenuItem
+			// 
+			this.PrecompiledModulesMenuItem.Text = "Pre-Compiled Modules...";
+			this.PrecompiledModulesMenuItem.Click += new System.EventHandler(this.PrecompiledModulesMenuItem_Click);
+			// 
+			// DataDirectoryMenuItem
+			// 
+			this.DataDirectoryMenuItem.Text = "Data Directory...";
+			this.DataDirectoryMenuItem.Click += new System.EventHandler(this.DataDirectoryMenuItem_Click);
 			// 
 			// MessagesMenuItem
 			// 
@@ -775,12 +808,16 @@ namespace Chimera.Client.GUI
 			// ToolsSubMenu
 			// 
 			this.ToolsSubMenu.DropDownItems.AddRange(new System.Windows.Forms.ToolStripItem[] {
+            this.CoreManagerMenuItem,
+            this.CacheManagerMenuItem,
+            this.MediaMakerMenuItem,
+            this.PrecompiledModulesMenuItem,
+            this.toolStripSeparatorManagers,
             this.RamWatchMenuItem,
             this.RamSearchMenuItem,
             this.LuaConsoleMenuItem,
             this.HexEditorMenuItem,
             this.MacroToolMenuItem,
-            this.toolStripSeparator29,
             this.BatchRunnerMenuItem});
 			this.ToolsSubMenu.Text = "&Tools";
 			this.ToolsSubMenu.DropDownOpened += new System.EventHandler(this.ToolsSubMenu_DropDownOpened);
@@ -809,6 +846,11 @@ namespace Chimera.Client.GUI
 			// 
 			this.MacroToolMenuItem.Text = "&Macro Tool";
 			this.MacroToolMenuItem.Click += new System.EventHandler(this.MacroToolMenuItem_Click);
+			// 
+			// MediaMakerMenuItem
+			// 
+			this.MediaMakerMenuItem.Text = "Reproducible Media Maker...";
+			this.MediaMakerMenuItem.Click += new System.EventHandler(this.MediaMakerMenuItem_Click);
 			// 
 			// BatchRunnerMenuItem
 			// 
@@ -1182,6 +1224,9 @@ namespace Chimera.Client.GUI
 		private Chimera.WinForms.Controls.StatusLabelEx EmuStatus;
 		private Chimera.WinForms.Controls.ToolStripMenuItemEx MessagesMenuItem;
 		private Chimera.WinForms.Controls.ToolStripMenuItemEx PathsMenuItem;
+		private Chimera.WinForms.Controls.ToolStripMenuItemEx FirmwareMenuItem;
+		private Chimera.WinForms.Controls.ToolStripMenuItemEx PrecompiledModulesMenuItem;
+		private Chimera.WinForms.Controls.ToolStripMenuItemEx DataDirectoryMenuItem;
 		private Chimera.WinForms.Controls.ToolStripMenuItemEx DisplayRerecordCountMenuItem;
 		private Chimera.WinForms.Controls.ToolStripMenuItemEx ScreenshotSubMenu;
 		private Chimera.WinForms.Controls.ToolStripMenuItemEx ScreenshotMenuItem;
@@ -1204,6 +1249,11 @@ namespace Chimera.Client.GUI
 		private Chimera.WinForms.Controls.ToolStripMenuItemEx DisplayLogWindowMenuItem;
 		private Chimera.WinForms.Controls.ToolStripMenuItemEx DisplaySubtitlesMenuItem;
 		private Chimera.WinForms.Controls.ToolStripMenuItemEx EncodeVideoMenuItem;
+
+		private Chimera.WinForms.Controls.ToolStripMenuItemEx CoreManagerMenuItem;
+		private Chimera.WinForms.Controls.ToolStripMenuItemEx CacheManagerMenuItem;
+		private Chimera.WinForms.Controls.ToolStripSeparatorEx toolStripSeparatorManagers;
+
 		private Chimera.WinForms.Controls.StatusLabelEx AVStatusLabel;
 		private Chimera.WinForms.Controls.ToolStripMenuItemEx RestartMovieContextMenuItem;
 		private Chimera.WinForms.Controls.StatusLabelEx CheatStatusButton;
@@ -1228,11 +1278,11 @@ namespace Chimera.Client.GUI
 		private Chimera.WinForms.Controls.ToolStripMenuItemEx HkOverInputMenuItem;
 		private Chimera.WinForms.Controls.StatusLabelEx KeyPriorityStatusLabel;
 		private Chimera.WinForms.Controls.ToolStripMenuItemEx StopNoSaveContextMenuItem;
-		private Chimera.WinForms.Controls.ToolStripSeparatorEx toolStripSeparator29;
 		private Chimera.WinForms.Controls.ToolStripMenuItemEx ConfigContextMenuItem;
 		private Chimera.WinForms.Controls.ToolStripSeparatorEx ShowMenuContextMenuSeparator;
 		private Chimera.WinForms.Controls.ToolStripMenuItemEx GenericCoreSubMenu;
 		private Chimera.WinForms.Controls.ToolStripMenuItemEx BatchRunnerMenuItem;
+		private Chimera.WinForms.Controls.ToolStripMenuItemEx MediaMakerMenuItem;
 		private Chimera.WinForms.Controls.ToolStripMenuItemEx DisplayConfigMenuItem;
 		private Chimera.WinForms.Controls.StatusLabelEx CoreNameStatusBarButton;
 		private Chimera.WinForms.Controls.ToolStripMenuItemEx toolStripMenuItem6;

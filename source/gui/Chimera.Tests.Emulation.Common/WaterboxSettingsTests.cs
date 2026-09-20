@@ -19,6 +19,100 @@ namespace Chimera.Tests.Emulation.Common
 		private static WaterboxConfig.SettingDecl Int(string name, int dflt, int? min = null, int? max = null)
 			=> new() { Name = name, Type = "int", Default = dflt, Min = min, Max = max };
 
+		/// <summary>
+		/// A multi-machine core's settings mostly belong to one machine each. A Game
+		/// Boy's DMG revision means nothing on a Mega Drive, and a Neo Geo's coin
+		/// slots mean nothing anywhere else - so a declaration says which machine it
+		/// is for, and the machine only ever sees its own.
+		/// </summary>
+		[TestMethod]
+		public void AMachineOnlySeesTheSettingsThatBelongToIt()
+		{
+			WaterboxConfig cfg = new()
+			{
+				MachineSetting = "machine",
+				Machines =
+				[
+					new() { Id = "GB", Label = "Game Boy", When = [ "gb" ] },
+					new() { Id = "NG", Label = "Neo Geo", When = [ "ng" ] },
+				],
+				Settings =
+				[
+					new() { Name = "machine", Type = "enum", Default = "gb", Options = [ "gb", "ng" ] },
+					new() { Name = "gb.fastBoot", Default = false, When = [ "gb" ] },
+					new() { Name = "ng.settingsMode", Default = false, When = [ "ng" ] },
+					new() { Name = "region", Type = "enum", Default = "ntsc", Options = [ "ntsc", "pal" ] },
+				],
+			};
+
+			var gb = cfg.SettingsFor(cfg.Machines[0]).Select(static d => d.Name).ToList();
+			CollectionAssert.Contains(gb, "gb.fastBoot");
+			CollectionAssert.DoesNotContain(gb, "ng.settingsMode", "a Game Boy has no coin slot");
+			CollectionAssert.Contains(gb, "region", "a setting that names no machine belongs to all of them");
+			CollectionAssert.Contains(gb, "machine");
+
+			var ng = cfg.SettingsFor(cfg.Machines[1]).Select(static d => d.Name).ToList();
+			CollectionAssert.Contains(ng, "ng.settingsMode");
+			CollectionAssert.DoesNotContain(ng, "gb.fastBoot");
+		}
+
+		/// <summary>
+		/// The engine says which settings are exposed by INDEX into the list it
+		/// was handed, which is the package's own. A machine's narrowed list is
+		/// shorter and renumbered, so the two must not be confused: they were,
+		/// and the effect was that every setting belonging to a machine
+		/// disappeared from the wizard - a Neo Geo showed none of its DIP
+		/// switches, a Game Boy no Fast Boot.
+		/// </summary>
+		[TestMethod]
+		public void AMachineSettingIsFoundAtItsPackageIndex()
+		{
+			WaterboxConfig cfg = new()
+			{
+				MachineSetting = "machine",
+				Machines =
+				[
+					new() { Id = "GB", Label = "Game Boy", When = [ "gb" ] },
+					new() { Id = "NG", Label = "Neo Geo", When = [ "ng" ] },
+				],
+				Settings =
+				[
+					new() { Name = "machine", Type = "enum", Default = "gb", Options = [ "gb", "ng" ] },
+					new() { Name = "gb.fastBoot", Default = false, When = [ "gb" ] },
+					new() { Name = "ng.settingsMode", Default = false, When = [ "ng" ] },
+					new() { Name = "ng.freePlay", Default = true, When = [ "ng" ] },
+					new() { Name = "region", Type = "enum", Default = "ntsc", Options = [ "ntsc", "pal" ] },
+				],
+			};
+
+			var ng = cfg.SettingsByDeclarationIndexFor(cfg.Machines[1])
+				.Select(static d => d?.Name).ToList();
+			Assert.AreEqual(cfg.Settings.Count, ng.Count,
+				"one slot per package setting, whether or not this machine has it");
+			CollectionAssert.AreEqual(
+				new[] { "machine", null, "ng.settingsMode", "ng.freePlay", "region" },
+				ng, "a Neo Geo keeps its own settings at the package's own indices");
+
+			var gb = cfg.SettingsByDeclarationIndexFor(cfg.Machines[0])
+				.Select(static d => d?.Name).ToList();
+			CollectionAssert.AreEqual(
+				new[] { "machine", "gb.fastBoot", null, null, "region" }, gb);
+		}
+
+		[TestMethod]
+		public void ASettingThatNamesNoMachineAppliesToAnyOfThem()
+		{
+			WaterboxConfig.SettingDecl shared = new() { Name = "region" };
+			Assert.IsTrue(shared.AppliesTo("gb"));
+			Assert.IsTrue(shared.AppliesTo(null));
+
+			WaterboxConfig.SettingDecl scoped = new() { Name = "gb.fastBoot", When = [ "gb", "gbc" ] };
+			Assert.IsTrue(scoped.AppliesTo("gb"));
+			Assert.IsTrue(scoped.AppliesTo("GBC"), "the machine setting's value is not case sensitive");
+			Assert.IsFalse(scoped.AppliesTo("ng"));
+			Assert.IsFalse(scoped.AppliesTo(null));
+		}
+
 		[TestMethod]
 		public void TypeIsInferredWhenNotDeclared()
 		{
@@ -67,7 +161,9 @@ namespace Chimera.Tests.Emulation.Common
 		{
 			// values come from a JSON file a user can edit
 			Assert.AreEqual(0, Int("n", 0).Coerce("not a number"));
-			Assert.AreEqual(false, new WaterboxConfig.SettingDecl { Type = "bool", Default = false }.Coerce("banana"));
+			var coerced = new WaterboxConfig.SettingDecl { Type = "bool", Default = false }.Coerce("banana");
+			Assert.IsInstanceOfType<bool>(coerced, "a bool setting stays a bool whatever the file said");
+			Assert.IsFalse((bool)coerced);
 		}
 
 		[TestMethod]

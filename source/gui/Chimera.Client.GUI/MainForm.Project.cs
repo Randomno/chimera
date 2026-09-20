@@ -1,8 +1,11 @@
 ﻿using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Windows.Forms;
 
+using Chimera.Common;
+using Chimera.Common.PathExtensions;
 using Chimera.Client.Common;
 using Chimera.Emulation.Common;
 using Chimera.Emulation.Common.Engine;
@@ -47,10 +50,18 @@ namespace Chimera.Client.GUI
 		{
 			if (_closingProject) return;
 			_closingProject = true;
+			// before the close, which is what takes it away: the auto-clean below
+			// must know which run this session was working on
+			var wasOpen = _openProject?.Id;
 			try
 			{
 				if (Tools.IsLoaded<TAStudio>()) Tools.Close<TAStudio>();
 				LoadNullRom();
+				// The close is done and whatever was to be saved was saved (or knowingly
+				// thrown away), so there is nothing left to recover.
+				_recovery?.End(clean: true);
+				_recovery = null;
+				CrashCapture.DescribeSession("no project open");
 			}
 			finally
 			{
@@ -59,6 +70,17 @@ namespace Chimera.Client.GUI
 				// belongs to the session that has just ended rather than to this one
 				_projectSession++;
 			}
+
+			// The cache has just grown by whatever the session added, and the
+			// greenzone that was untouchable a moment ago is now an ordinary row.
+			// Both of those are only true once the close has finished, so this is
+			// outside the finally rather than in it.
+			//
+			// An ordinary row, but not one this pass may take: a greenzone big
+			// enough to break the limit on its own is also, once everything older
+			// has gone, the oldest thing left - and closing a run should not be
+			// how it gets deleted.
+			AutoCleanCaches(spareProjectId: wasOpen);
 		}
 
 		/// <summary>
@@ -126,6 +148,14 @@ namespace Chimera.Client.GUI
 		private EngineProject RunNewProjectWizard(string startFrom = null)
 		{
 			ScanForCorePackages();
+			// Where each of the wizard's pickers opens. Config > Paths is an
+			// answer the person has already given, so a picker that ignores it
+			// and reopens wherever the process last happened to be sends them
+			// browsing for a folder they have already named (chimera#114). A
+			// configured folder that does not exist is no use as a starting
+			// point, so in that case the dialog is left to its own default.
+			string OpensIn(string configured)
+				=> !string.IsNullOrWhiteSpace(configured) && Directory.Exists(configured) ? configured : "";
 			using NewProjectWizard wizard = new(
 				_discoveredCorePackages,
 				pickFiles: slot =>
@@ -134,30 +164,55 @@ namespace Chimera.Client.GUI
 					{
 						Multiselect = true,
 						Title = $"Add to {slot.Title}",
+						InitialDirectory = OpensIn(Config.PathEntries.RomAbsolutePath()),
 						Filter = ProjectSlotDeclaration.FilterFor(slot) is { } filter
 							? $"{slot.Title} ({filter})|{filter}|All files (*.*)|*.*"
 							: "All files (*.*)|*.*",
 					};
-					return dialog.ShowDialog(this) is DialogResult.OK ? dialog.FileNames : [ ];
+					return dialog.ShowDialog(this) is DialogResult.OK ? dialog.FileNames.Select(static f => f.WithoutWslgMirror()).ToArray() : [ ];
 				},
 				pickFirmwareFile: title =>
 				{
-					using OpenFileDialog dialog = new() { Title = title };
-					return dialog.ShowDialog(this) is DialogResult.OK ? dialog.FileName : null;
+					using OpenFileDialog dialog = new()
+					{
+						Title = title,
+						InitialDirectory = OpensIn(Config.PathEntries.FirmwareAbsolutePath()),
+					};
+					return dialog.ShowDialog(this) is DialogResult.OK ? dialog.FileName.WithoutWslgMirror() : null;
 				},
 				firmwareSearchDirs: [ Config.PathEntries.FirmwareAbsolutePath() ],
 				pickFirmwareFolder: () =>
 				{
-					using FolderBrowserDialog picker = new()
+					using FolderBrowserEx picker = new()
 					{
 						Description = "Scan a folder for firmware files",
+						SelectedPath = OpensIn(Config.PathEntries.FirmwareAbsolutePath()),
 					};
-					return picker.ShowDialog(this) is DialogResult.OK ? picker.SelectedPath : null;
+					return picker.ShowDialog(this) is DialogResult.OK ? picker.SelectedPath.WithoutWslgMirror() : null;
 				},
+				rememberedFirmwarePaths: coreName => CoreFirmwareStore.RememberedPaths(Config, coreName),
 				rememberedFirmwarePath: (coreName, id) =>
 					Config.CoreFirmware.TryGetValue(CoreFirmwareStore.KeyFor(coreName, id), out var remembered)
 						? remembered
-						: null);
+						: null,
+				// The precompile sessions run BEFORE this wizard returns, and they
+				// are separate processes: they read the config off disk and take
+				// their firmware from what it remembers. Remembering these paths
+				// only afterwards (a few lines below, with the rest of the wizard's
+				// answers) is too late - a core that needs firmware would be
+				// refused at boot and compile nothing.
+				rememberFirmwareNow: (coreName, provided) =>
+				{
+					if (provided.Count is 0) return;
+					foreach (var (id, path) in provided)
+					{
+						Config.CoreFirmware[CoreFirmwareStore.KeyFor(coreName, id)] = path;
+					}
+					SaveConfig();
+				},
+				// a precompile session is this frontend again: it must read the
+				// same config, or it would look for its cache somewhere else
+				configPath: _getConfigPath());
 			// The wizard opens on the last project's answers - the open one, or the
 			// last one there was. This is how a project is reconfigured: changing a
 			// sync setting changes the machine, so there is no editing one in place,
@@ -184,14 +239,24 @@ namespace Chimera.Client.GUI
 			if (wizard.ShowDialog(this) is not DialogResult.OK) return null;
 
 			// remember where the firmware lives, keyed the way the resolver reads
-			// it back at load (Config.CoreFirmware)
+			// it back at load (Config.CoreFirmware) - and WRITE IT DOWN. Held in
+			// memory it lasted until the next clean exit, so a session that ended
+			// any other way left a project whose firmware nothing on the machine
+			// could name, and opening it asked for all of it again (issue #40).
 			var coreName = wizard.ChosenCoreName;
-			if (coreName is not null)
+			if (coreName is not null && wizard.ProvidedFirmwarePaths.Count is not 0)
 			{
 				foreach (var (id, path) in wizard.ProvidedFirmwarePaths)
 				{
 					Config.CoreFirmware[CoreFirmwareStore.KeyFor(coreName, id)] = path;
 				}
+				// and under each dump's own key, so Config > Firmware and the next
+				// project that wants this release find it without asking
+				foreach (var (decl, path) in wizard.ProvidedFirmwareDumps)
+				{
+					CoreFirmwareStore.Remember(Config, coreName, decl, path);
+				}
+				SaveConfig();
 			}
 			return wizard.CreatedProject;
 		}
@@ -203,7 +268,7 @@ namespace Chimera.Client.GUI
 				Filter = new FilesystemFilterSet(FilesystemFilter.TAStudioProjects).ToString(),
 				Title = "Open Chimera Project",
 			};
-			return dialog.ShowDialog(this) is DialogResult.OK ? dialog.FileName : null;
+			return dialog.ShowDialog(this) is DialogResult.OK ? dialog.FileName.WithoutWslgMirror() : null;
 		}
 
 		/// <summary>
@@ -214,6 +279,7 @@ namespace Chimera.Client.GUI
 		public bool LoadProject(string path)
 		{
 			EngineProject project;
+			ProjectLocalPaths local;
 			try
 			{
 				project = EngineProject.Open(path);
@@ -223,27 +289,54 @@ namespace Chimera.Client.GUI
 				ShowMessageBox(owner: null, ex.Message, "Cannot open the project");
 				return false;
 			}
-
-			// resolution: beside the project first, then where this machine last
-			// found them (the .chimeraLocal sidecar - a hint, never authority: it
-			// resolves nothing whose bytes do not match), then the user's say per file
-			project.ResolveDir(Path.GetDirectoryName(Path.GetFullPath(path)));
-			var local = ProjectLocalPaths.Read(path);
-			local.ApplyTo(project);
+			// Work a crash left behind comes back before anything else happens: the
+			// recovered content replaces the file's, so resolution, the boot and every
+			// later save see it - and it stays unsaved until somebody saves it.
+			var recovered = OfferRecovery(ref project, path);
+			// The window says what the wait is for: a project's discs are hashed
+			// on the way in, and a PlayStation 2's is four gigabytes. It closes
+			// before the resolution dialog can ask, and the boot opens its own.
+			using (var progress = ProgressDialog.Begin(this, "Opening project"))
+			{
+				// resolution: beside the project first, then where this machine last
+				// found them (the .chimeraLocal sidecar - a hint, never authority: it
+				// resolves nothing whose bytes do not match), then the user's say per file
+				progress.Step("finding the project's files");
+				project.ResolveDir(Path.GetDirectoryName(Path.GetFullPath(path)));
+				local = ProjectLocalPaths.Read(project, path);
+				ProjectCache.Remember(project.Id, ProjectCache.FactsOf(project, path));
+				local.ApplyTo(project);
+			}
+			if (!project.FilesOk && HeadlessMode.Enabled)
+			{
+				// Nobody can answer the resolution form here. It used to open anyway -
+				// invisibly, holding the process at ~1 s of CPU for as long as anyone
+				// cared to wait - so an unattended run of a project whose game was not
+				// beside it looked exactly like a hang. Say which files, and stop.
+				var missing = new List<string>();
+				for (var i = 0; i < project.FileCount; i++)
+				{
+					if (string.IsNullOrEmpty(project.FileSourcePath(i))) missing.Add(project.FileName(i));
+				}
+				project.Dispose();
+				HeadlessMode.FatalDialog("Cannot open the project",
+					$"these files were not found beside it or where this machine last had them: {string.Join(", ", missing)}");
+				return false;
+			}
 			if (!project.FilesOk)
 			{
 				using ProjectResolutionForm dialog = new(project, locateFile: title =>
 				{
 					using OpenFileDialog picker = new() { Title = title };
-					return picker.ShowDialog(this) is DialogResult.OK ? picker.FileName : null;
+					return picker.ShowDialog(this) is DialogResult.OK ? picker.FileName.WithoutWslgMirror() : null;
 				},
 				locateFolder: () =>
 				{
-					using FolderBrowserDialog picker = new()
+					using FolderBrowserEx picker = new()
 					{
 						Description = "Scan a folder for the project's files",
 					};
-					return picker.ShowDialog(this) is DialogResult.OK ? picker.SelectedPath : null;
+					return picker.ShowDialog(this) is DialogResult.OK ? picker.SelectedPath.WithoutWslgMirror() : null;
 				});
 				if (dialog.ShowDialog(this) is not DialogResult.OK)
 				{
@@ -255,12 +348,233 @@ namespace Chimera.Client.GUI
 				// still refuse for its own reasons). The sidecar is a hint the
 				// next load verifies by hash, so recording it early risks
 				// nothing, and losing it meant answering every row again.
-				local.Save(path, project);
+				local.Save(project);
 			}
 
 			// the firmware the project pins is looked for where this machine last
 			// had it, as well as in the Firmware folder
-			return BootProject(project, path, saved: true, local);
+			if (!BootProject(project, path, saved: true, local)) return false;
+			if (recovered && MovieSession.Movie is ITasMovie recoveredMovie) recoveredMovie.MarkRecovered();
+			return true;
+		}
+
+		/// <summary>The recovery session of the open project (<see cref="ProjectRecovery"/>); null when none is open.</summary>
+		private ProjectRecovery _recovery;
+
+		/// <summary>
+		/// Writes the open project's recovery snapshot now (<see cref="ProjectRecovery.SaveNow"/>). For the crash
+		/// handlers: whatever happens next, the work as it stands at this moment is kept.
+		/// </summary>
+		public void KeepWorkSafe() => _recovery?.SaveNow();
+
+		private bool _coreStoppedAsking;
+
+		/// <summary>
+		/// The core's machine died mid-frame (miniBox handed control back; the process is fine). Emulation
+		/// pauses, the work is kept, and the person chooses where to go from here - and every choice keeps
+		/// the inputs, branches and markers, because the recovery journal holds them whatever happens.
+		/// Loading any state brings the machine back; until then a frame only reports the death again.
+		/// </summary>
+		private void OnCoreStopped(CoreStoppedException stopped)
+		{
+			try
+			{
+				PauseEmulator();
+			}
+			catch (Exception)
+			{
+				// pausing is part of recovering, not a reason to stop
+			}
+			KeepWorkSafe();
+			// Before any choice is offered: whatever is done next, nothing this session
+			// stored may be trusted on a later open. Three of the four choices leave the
+			// session running or closing through the ordinary save, which would otherwise
+			// write the greenzone of a machine that had already died.
+			if (Tools.IsLoaded<TAStudio>()) Tools.TAStudio.CurrentTasMovie?.NoteCoreDied();
+			Console.Error.WriteLine($"The core stopped: {stopped.Reason}");
+			if (_coreStoppedAsking) return;   // the same death, reported again while the question is open
+
+			var tas = Tools.IsLoaded<TAStudio>() ? Tools.TAStudio : null;
+			var history = tas?.CurrentTasMovie?.States;
+			var stoppedAt = Emulator.Frame;
+			var safePoint = history?.Nearest(stoppedAt) ?? -1;
+			var canRestart = history is not null && history.Nearest(0) == 0;
+			CoreStoppedForm.Choice chosen;
+			_coreStoppedAsking = true;
+			try
+			{
+				using CoreStoppedForm form = new(stopped.Reason, stoppedAt, safePoint, canRestart, tas is not null);
+				form.ShowDialog(this);
+				chosen = form.Chosen;
+			}
+			finally
+			{
+				_coreStoppedAsking = false;
+			}
+
+			switch (chosen)
+			{
+				case CoreStoppedForm.Choice.BackToSafePoint:
+					if (!tas!.GoBackToSafePoint(safePoint))
+					{
+						this.ModalMessageBox($"Frame {safePoint} could not be restored. The machine is still stopped;"
+							+ " seek to another frame in the greenzone, or restart it.", "The core stopped");
+					}
+					break;
+				case CoreStoppedForm.Choice.RestartFromFrameZero:
+					if (!tas!.RestartFromFrameZero())
+					{
+						this.ModalMessageBox("Frame 0 could not be restored. The machine is still stopped.", "The core stopped");
+					}
+					break;
+				case CoreStoppedForm.Choice.SaveInputsAndClose:
+					// nothing is left unsaved afterwards, so the ordinary close asks nothing
+					if (tas!.SaveProjectWithoutGreenzone() && Tools.AskSave()) Close();
+					break;
+				case CoreStoppedForm.Choice.CloseWithoutSaving:
+					if (this.ModalMessageBox2(
+						"Close Chimera without saving the project?\n\n"
+							+ "Nothing is lost: every input, marker and branch is in the recovery journal,"
+							+ " and the next time this project is opened Chimera offers to recover them.",
+						"Close without saving",
+						EMsgBoxIcon.Question))
+					{
+						CloseKeepingRecovery();
+					}
+					break;
+			}
+		}
+
+		/// <summary>
+		/// Closes without saving, and without the clean end that would delete the recovery journal - so
+		/// the next open finds the work and offers it back (ProjectRecovery.FindUnfinished).
+		/// </summary>
+		private void CloseKeepingRecovery(int? exitCode = null)
+		{
+			KeepWorkSafe();
+			_recovery?.End(clean: false);
+			_recovery = null;
+			// unattended: the question the project's own "save changes?" would ask has just been answered
+			CloseEmulator(exitCode);
+		}
+
+		private int _errorsShown;
+
+		private DateTime _errorsSince = DateTime.MinValue;
+
+		/// <summary>
+		/// What an error that was caught becomes: emulation pauses, the person is told, and the session goes
+		/// on - they can keep editing, save, or reboot the core. A burst of errors (a frame that throws every
+		/// time it is tried, a control that throws on every paint) is told about a few times and then only
+		/// on the status line, so recovering cannot itself become an endless run of dialogs.
+		/// </summary>
+		public void RecoverFromError(Exception error, string what)
+		{
+			// a machine that died is not an error in Chimera, and has choices of its own
+			if ((error as CoreStoppedException ?? error.GetBaseException() as CoreStoppedException) is { } stopped)
+			{
+				OnCoreStopped(stopped);
+				return;
+			}
+			try
+			{
+				PauseEmulator();
+			}
+			catch (Exception)
+			{
+				// pausing is part of recovering, not a reason to stop
+			}
+			var now = DateTime.UtcNow;
+			if (now - _errorsSince > TimeSpan.FromSeconds(30))
+			{
+				_errorsSince = now;
+				_errorsShown = 0;
+			}
+			var kept = _recovery is null
+				? "No project is open, so there was no unsaved work to keep."
+				: "Your work is safe: every input is on disk as it is entered, and the rest of the project was kept just now.";
+			if (++_errorsShown > 3)
+			{
+				AddOnScreenMessage($"{what}: {error.GetType().Name}: {error.Message} (paused)");
+				return;
+			}
+			Console.Error.WriteLine($"{what}: {error}");
+			using ExceptionBox box = new($"{what}, and emulation is paused. {kept}"
+				+ " You can keep working, save, or reboot the core."
+				+ $"\n\n{error}");
+			box.ShowDialog(this);
+		}
+
+		/// <summary>
+		/// Offers the work a crashed session left for <paramref name="project"/>. The work is always rebuilt
+		/// into its own file in the backups folder first, so whatever is answered nothing is lost; answering
+		/// yes swaps that content in for the project file's. True when it was swapped in.
+		/// </summary>
+		private bool OfferRecovery(ref EngineProject project, string path)
+		{
+			ProjectRecovery.Leftover leftover;
+			try
+			{
+				leftover = ProjectRecovery.FindUnfinished(project.Id);
+			}
+			catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+			{
+				Console.Error.WriteLine($"[recovery] {ex.Message}");
+				return false;
+			}
+			if (leftover is null) return false;
+
+			string copy;
+			try
+			{
+				copy = ProjectRecovery.BuildRecoveredCopy(leftover, path, MovieSession.BackupDirectory);
+			}
+			catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
+			{
+				// kept where they are: nothing is thrown away that could not be rebuilt
+				var why = $"Chimera did not close normally the last time this project was open, but its unsaved work"
+					+ $" could not be rebuilt ({ex.Message}). The recovery files are kept in:\n{leftover.Directory}";
+				if (HeadlessMode.Enabled) Console.Error.WriteLine($"[recovery] {why}");
+				else ShowMessageBox(owner: null, why, "Unsaved work");
+				return false;
+			}
+			// the copy holds the work now, and the next session starts its own
+			ProjectRecovery.Discard(leftover);
+
+			// what ended that session, when Windows let the crash module say (docs/project.md, "Crash notes")
+			var crash = leftover is { ProcessId: not 0, ProcessStartedUtc: { } started }
+				? CrashCapture.NoteFor(leftover.ProcessId, started)
+				: null;
+
+			if (HeadlessMode.Enabled)
+			{
+				Console.Error.WriteLine($"[recovery] unsaved work from {leftover.LastWorkUtc.ToLocalTime():yyyy-MM-dd HH:mm:ss}"
+					+ $" was rebuilt into {copy}; opening the project as it was last saved"
+					+ (crash is null ? "" : $"; that session was ended by {crash.Summary} ({crash.Path})"));
+				return false;
+			}
+			var open = this.ModalMessageBox2(
+				caption: "Recover unsaved work?",
+				icon: EMsgBoxIcon.Question,
+				text: "Chimera did not close normally the last time this project was open."
+					+ (crash is null ? "" : $" It was ended by {crash.Summary}; what Windows recorded is in:\n{crash.Path}")
+					+ $"\n\nThe work in progress up to {leftover.LastWorkUtc.ToLocalTime():HH:mm:ss} - every input entered, and"
+					+ $" the markers and branches as of the last few seconds - has been kept as:\n{copy}"
+					+ "\n\nOpen that work now? It opens unsaved, and saving writes it to this project."
+					+ "\n\nNo opens the project as it was last saved; the recovered copy stays where it is.");
+			if (!open) return false;
+			try
+			{
+				var recoveredProject = EngineProject.Open(copy);
+				project.Dispose();
+				project = recoveredProject;
+				return true;
+			}
+			catch (InvalidOperationException ex)
+			{
+				ShowMessageBox(owner: null, $"The recovered work could not be opened ({ex.Message}); it is kept as:\n{copy}", "Unsaved work");
+				return false;
+			}
 		}
 
 		/// <summary>The same, for a script (client.openproject).</summary>
@@ -283,19 +597,26 @@ namespace Chimera.Client.GUI
 		private bool BootProject(EngineProject project, string path, bool saved, ProjectLocalPaths local = null)
 		{
 			local ??= new ProjectLocalPaths();
+			// where the LAST project's firmware was found is not this one's answer
+			ProjectLocalPaths.ForgetSessionFirmware();
 			if (!EnsureProjectCore(project))
 			{
 				project.Dispose();
 				return false;
 			}
-
 			// The firmware the project pins is looked for by hash - in the Firmware
 			// folder, where this core last had it, and where this project's own
-			// sidecar remembers it - and whatever matches is what the load below
-			// mounts. Without this the load knows only what a wizard once chose,
-			// so a project opened on a machine that never ran the wizard for this
-			// core refused with "firmware not provided" while the dump sat in the
-			// Firmware folder (issue #27).
+			// sidecar remembers it - and whatever matches is what the boot below
+			// mounts (Config.CoreFirmware). Without this the boot knew only what a
+			// wizard once chose, so a project opened on a machine that never ran
+			// the wizard for this core refused with "firmware not provided" while
+			// the dump sat in the Firmware folder (issue #27), and a PS3 project
+			// whose config had not been saved since the wizard booted its disc
+			// with no system software at all: a machine that runs, polls nothing
+			// and draws nothing, with no word about why.
+			//
+			// ONCE. It ran twice, which asked the same severe question twice of
+			// anyone whose firmware it could not find.
 			if (!VerifyFirmwarePins(project, local))
 			{
 				project.Dispose();
@@ -323,6 +644,11 @@ namespace Chimera.Client.GUI
 
 			_openProject?.Dispose();
 			_openProject = project;
+
+			// Everything that can still ask has asked; from here the wait is work,
+			// and the window says which: the movie, the machine, the greenzone.
+			using var progress = ProgressDialog.Begin(this, saved ? "Opening project" : "Creating project");
+			progress.Step("reading the project's movie");
 
 			// THE MACHINE BOOTS EXACTLY ONCE. The movie (which IS the project) is
 			// queued BEFORE the rom load, so the one boot already runs with the
@@ -375,11 +701,13 @@ namespace Chimera.Client.GUI
 					Config.PathEntries,
 					Config.DefaultCores);
 
+				progress.Step("booting the machine");
 				if (!LoadRom(path, new LoadRomArgs(new OpenAdvanced_OpenRom(path))))
 				{
 					return false;
 				}
 
+				progress.Step("starting the movie");
 				MovieSession.RunQueuedMovie(isFresh, Emulator);
 			}
 			finally
@@ -410,24 +738,52 @@ namespace Chimera.Client.GUI
 
 			SetMainformMovieInfo();
 			WarnOnMovieVsLoadedCore();
+			WarnOnFrontendVsCoreBuild();
 
 			// only a project that HAS a file can be recent, and only one that has a
 			// file has somewhere to keep the note of where its files were found
 			if (saved)
 			{
 				Config.RecentProjects.Add(path);
-				local.Save(path, project);
+				local.Save(project);
 			}
 			// a project IS a TAStudio session; from the commandline the window is
 			// not up yet, so the landing waits for it. Headless runs have nobody
 			// to operate TAStudio (which opens PAUSED at the session frame) -
 			// they just play the project (gates, dumps).
+			// From here every input entered is journaled as it happens, and the rest of
+			// the work is snapshotted while it is unsaved: whatever ends this process,
+			// the next open of this project offers it back (docs/project.md, "Recovery").
+			_recovery?.End(clean: false);
+			_recovery = ProjectRecovery.Begin(tasMovie, project.Id, path);
+			// what a crash note says this session was (docs/project.md, "Crash notes")
+			CrashCapture.DescribeSession(DescribeForCrashNote(tasMovie, path));
+			// and where the GPU bridge keeps its last calls, for a crash inside the driver
+			CrashCapture.NoteGlRecorder(Chimera.Emulation.Common.Engine.ChimeraEngine.Instance.ce_gl_flight_recorder(out var glRecorderBytes), glRecorderBytes);
+
+			progress.Step("opening TAStudio");
+			progress.Dispose();
 			if (!HeadlessMode.Enabled)
 			{
 				if (Visible) Tools.Load<TAStudio>();
 				else Shown += (_, _) => Tools.Load<TAStudio>();
 			}
 			return true;
+		}
+
+		/// <summary>
+		/// The lines a crash note carries about the open project: where it is, the
+		/// machine, and the movie header - the core, its build and the GPU driver that
+		/// drew it are all written there, which is what a crash is first asked about.
+		/// </summary>
+		private string DescribeForCrashNote(ITasMovie movie, string path)
+		{
+			var lines = new System.Collections.Generic.List<string> { $"project={path}", $"system={Emulator.SystemId}" };
+			foreach (var entry in movie.HeaderEntries)
+			{
+				if (entry.Value is { Length: > 0 and < 240 } && entry.Value.IndexOf('\n') < 0) lines.Add($"{entry.Key}={entry.Value}");
+			}
+			return string.Join("\n", lines);
 		}
 
 		/// <summary>Writes what the project pins into a movie header that does not carry it.</summary>
@@ -465,15 +821,15 @@ namespace Chimera.Client.GUI
 			if (pins.Count is 0) return true;
 
 			var coreName = project.CoreName;
+			// the Firmware folder, every dump ever remembered for this core (Config >
+			// Firmware, earlier projects), where this project's own sidecar last had
+			// them, and what this run was told on the command line (--firmware, which
+			// goes ahead of anything remembered) - all hashed, none believed on its name
 			var index = FirmwareLocator.BuildIndex(
 				[ Config.PathEntries.FirmwareAbsolutePath() ],
-				pins.SelectMany(pin => new[]
-					{
-						Config.CoreFirmware.TryGetValue(CoreFirmwareStore.KeyFor(coreName, pin.Id), out var remembered)
-							? remembered
-							: null,
-						local.Firmware.TryGetValue(pin.Id, out var beside) ? beside : null,
-					})
+				CoreFirmwareStore.RememberedPaths(Config, coreName)
+					.Concat(pins.Select(pin => local.Firmware.TryGetValue(pin.Id, out var beside) ? beside : null))
+					.Concat(pins.Select(pin => CoreFirmwareStore.CommandLineFirmware.TryGetValue(pin.Id, out var named) ? named : null))
 					.Where(static path => path is not null)!);
 
 			List<string> unsatisfied = new();
@@ -486,6 +842,7 @@ namespace Chimera.Client.GUI
 					// and where it was is worth remembering, for this core and for
 					// this project
 					Config.CoreFirmware[CoreFirmwareStore.KeyFor(coreName, id)] = exact.Path;
+					CoreFirmwareStore.Remember(Config, coreName, new Chimera.Emulation.Common.CoreFirmwareDecl { Id = id, Sha1 = sha1 }, exact.Path);
 					local.RememberFirmware(id, exact.Path);
 				}
 				else
@@ -502,7 +859,8 @@ namespace Chimera.Client.GUI
 					+ $"\n\n{string.Join("\n", unsatisfied)}\n\n"
 					+ "Running with DIFFERENT firmware is a DIFFERENT MACHINE: the movie"
 					+ " will very likely DESYNC, and anything recorded will not reproduce"
-					+ " the original work. Are you sure you want to open it anyway?");
+					+ " the original work. Config > Firmware shows what this core needs and"
+					+ " where to point it. Are you sure you want to open it anyway?");
 		}
 
 		/// <summary>
@@ -519,28 +877,43 @@ namespace Chimera.Client.GUI
 				return false;
 			}
 
-			if (CoreRegistry.Instance.AllFactories.All(f => f.CoreName != coreName))
+			// The build the project pins, whenever it is installed - beside other builds of the same core
+			// if need be, rather than whichever build this session happened to load first (issue #63).
+			var pin = project.CoreSha1;
+			var pinRegistered = pin.Length is not 0 && CoreRegistry.Instance.AllFactories.Any(f => f.CoreName == coreName
+				&& string.Equals(CoreRegistry.Instance.PackageSha1Of(f), pin, StringComparison.OrdinalIgnoreCase));
+			if (!pinRegistered)
 			{
 				ScanForCorePackages();
-				var candidate =
-					_discoveredCorePackages.FirstOrDefault(pkg => pkg.Error is null && pkg.Sha1 is not null
-						&& pkg.Sha1.Equals(project.CoreSha1, StringComparison.OrdinalIgnoreCase))
-					?? _discoveredCorePackages.FirstOrDefault(pkg => pkg.Error is null && pkg.Name == coreName);
-				if (candidate is null)
+				var usable = _discoveredCorePackages.Where(static pkg => pkg.Error is null).ToList();
+				var pinned = pin.Length is 0 ? null
+					: usable.FirstOrDefault(pkg => pkg.Sha1 is not null && pkg.Sha1.Equals(pin, StringComparison.OrdinalIgnoreCase));
+				if (pinned is not null)
 				{
-					ShowMessageBox(
-						owner: null,
-						$"This project runs on \"{coreName}\", and no such core package is installed."
-							+ "\n\nPut its package in the Cores folder, then open the project again.",
-						"The project's core is not installed");
-					return false;
+					// loading a project's core is not choosing it for bare roms
+					if (!LoadCorePackage(pinned.Path, chooseBuild: false)) return false;
 				}
-				if (!LoadCorePackage(candidate.Path)) return false;
+				else if (CoreRegistry.Instance.AllFactories.All(f => f.CoreName != coreName))
+				{
+					_ = Config.DefaultCoreBuilds.TryGetValue(coreName, out var chosen);
+					var candidate = CoreChoices.PickBuild(usable.Where(pkg => pkg.Name == coreName),
+						static pkg => pkg.Sha1, InstalledAt, pinnedSha1: null, chosen);
+					if (candidate is null)
+					{
+						ShowMessageBox(
+							owner: null,
+							$"This project runs on \"{coreName}\", and no such core package is installed."
+								+ "\n\nPut its package in the Cores folder, then open the project again.",
+							"The project's core is not installed");
+						return false;
+					}
+					if (!LoadCorePackage(candidate.Path, chooseBuild: false)) return false;
+				}
 			}
 
-			var pin = project.CoreSha1;
-			var actual = CoreRegistry.Instance.LoadedPackages
-				.FirstOrDefault(pkg => pkg.CoreNames.Contains(coreName))?.Sha1;
+			var actual = CoreRegistry.Instance.FactoryFor(coreName, pin) is { } running
+				? CoreRegistry.Instance.PackageSha1Of(running)
+				: null;
 			if (pin.Length is not 0 && actual is not null && !pin.Equals(actual, StringComparison.OrdinalIgnoreCase))
 			{
 				return this.ModalMessageBox2(
@@ -551,6 +924,49 @@ namespace Chimera.Client.GUI
 						+ "\n\nRun on the installed build anyway? The project will record what actually ran.");
 			}
 			return true;
+		}
+
+		/// <summary>
+		/// Issue #115, the first of three: this Chimera and the core package it just
+		/// booted, held against each other by the dates they were built on. It is a
+		/// heuristic and it says so - a pairing that works must keep working, so this
+		/// never refuses anything and never asks a question. The exact answer is the
+		/// savestate format number, which the engine checks state by state.
+		///
+		/// The engine owns the threshold and the sentence; this side finds the two
+		/// dates and shows what comes back. Either side may not date itself - a package
+		/// built before "versionDate" existed, or a Chimera built outside a git
+		/// checkout - and then nothing is said at all, because half a comparison is
+		/// worse than none.
+		/// </summary>
+		private void WarnOnFrontendVsCoreBuild()
+		{
+			var running = CoreRegistry.Instance.PackageSha1Of(Emulator);
+			if (string.IsNullOrWhiteSpace(running)) return;
+			var package = _discoveredCorePackages.FirstOrDefault(
+				pkg => running.Equals(pkg.Sha1, StringComparison.OrdinalIgnoreCase));
+			if (package is null || CoreVersionDates.Of(package) is not { } built) return;
+
+			var message = ChimeraEngine.VersionSkew(
+				VersionInfo.GIT_SHORTDATE,
+				VersionInfo.GetEmuVersion(),
+				built.ToUniversalTime().ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
+				package.ShortVersion,
+				package.Name);
+			if (message is not null) AddOnScreenMessage(message, 15);
+		}
+
+		/// <summary>When a package landed on this machine: "newest installed" is the newest file, not the newest version string.</summary>
+		private static DateTime InstalledAt(DiscoveredCorePackage pkg)
+		{
+			try
+			{
+				return File.Exists(pkg.Path) ? File.GetLastWriteTimeUtc(pkg.Path) : Directory.GetLastWriteTimeUtc(pkg.Path);
+			}
+			catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+			{
+				return DateTime.MinValue;
+			}
 		}
 	}
 }

@@ -47,11 +47,65 @@ struct HostApi
 	 * calls that MB_GUEST_ABI); the GPU bridge is the only user. */
 	void (*wbx_get_callback_addr)(void *obj, void *callback, uintptr_t slot, WbxReturn *ret);
 	void (*wbx_seal)(void *obj, WbxReturn *ret);
+	/* the sealed machine's 32-byte identity; optional (older hosts lack it) */
+	void (*wbx_machine_hash)(void *obj, uint8_t *out, WbxReturn *ret);
+	/* page introspection: how many pages, and one page's status with 0x80 for
+	 * dirty and 0x40 for invisible; optional, and only CHIMERA_HISTORY_VERIFY asks */
+	void (*wbx_get_page_len)(void *obj, WbxReturn *ret);
+	void (*wbx_get_page_data)(void *obj, uintptr_t index, WbxReturn *ret);
+	/* Whether the guest has died - aborted, halted, faulted, exited - and why.
+	 * A dead guest returns from the call it died in, runs nothing until a state
+	 * is loaded, and the session reports it as an error. Optional: an older host
+	 * has no such thing, and its guest takes the process down as it always did. */
+	void (*wbx_get_death)(void *obj, char *out, uintptr_t cap, WbxReturn *ret);
 	void (*wbx_mount_file)(void *obj, const char *name, WbxReadCb cb, uintptr_t userdata, uint8_t writable, WbxReturn *ret);
 	/* read-only, read from the host's disk as the guest asks - no copy */
 	void (*wbx_mount_file_path)(void *obj, const char *name, const char *host_path, WbxReturn *ret);
 	void (*wbx_save_state)(void *obj, WbxWriteCb cb, uintptr_t userdata, WbxReturn *ret);
 	void (*wbx_load_state)(void *obj, WbxReadCb cb, uintptr_t userdata, WbxReturn *ret);
+
+	/* Epochs and deltas: what changed since a moment, rather than since the
+	 * seal. OPTIONAL - a host older than these leaves them null, and the state
+	 * history then stores whole states as it always did. The engine loads the
+	 * host from beside itself, so an older one beside a newer libchimera is an
+	 * ordinary situation and must not stop a session opening. */
+	void (*wbx_epoch_begin)(void *obj, WbxReturn *ret);
+	void (*wbx_save_delta)(void *obj, bool forward, WbxWriteCb cb, uintptr_t userdata, WbxReturn *ret);
+	void (*wbx_load_delta)(void *obj, WbxReadCb cb, uintptr_t userdata, WbxReturn *ret);
+	void (*wbx_get_epoch_page_count)(void *obj, WbxReturn *ret);
+
+	/* Two adjacent deltas as one that spans both, which is how the history
+	 * thins itself. Takes no host: a delta is bytes, and this is a transform on
+	 * them, so stored states can be merged with no machine loaded. Bound apart
+	 * from the four above because a host can have epochs without it, in which
+	 * case the history keeps every link it captured and simply costs more. */
+	void (*wbx_compose_delta)(WbxReadCb a, uintptr_t aUserdata, WbxReadCb b, uintptr_t bUserdata,
+		WbxWriteCb out, uintptr_t outUserdata, WbxReturn *ret);
+
+	/* The same, for two deltas the caller already holds contiguously - which
+	 * the history always does, and which it does every frame. The streaming
+	 * one above has to read both into buffers of its own before it can merge
+	 * them, so it copies megabytes to look at megabytes; this walks them where
+	 * they lie. Optional: an older host has only the one above, and the answer
+	 * is the same either way. */
+	void (*wbx_compose_delta_mem)(const uint8_t *a, uintptr_t aLen, const uint8_t *b, uintptr_t bLen,
+		WbxWriteCb out, uintptr_t outUserdata, WbxReturn *ret);
+
+	/* ---- a whole machine, taken while it runs ----
+	 *
+	 * Taking a state is 95 to 98% memcpy, and the copy does not need the
+	 * machine to stand still - only the bytes. These hold the pages a state
+	 * will carry, let anybody fill them, and lift the holds at the end; a guest
+	 * write to a page nobody has copied yet is copied by the fault handler
+	 * before the write lands. `size` first, then a buffer of exactly that, then
+	 * `plan`; `fill` on any thread; `finish` on the thread that runs the
+	 * machine. Optional as a set: a host without them takes states the old way,
+	 * which is correct and slower. */
+	void (*wbx_state_size)(void *obj, WbxReturn *ret);
+	void (*wbx_state_plan)(void *obj, uint8_t *dest, uint64_t size, WbxReturn *ret);
+	void (*wbx_state_pages)(void *obj, WbxReturn *ret);
+	void (*wbx_state_fill)(void *obj, uint64_t from, uint64_t to, WbxReturn *ret);
+	void (*wbx_state_finish)(void *obj, WbxReturn *ret);
 };
 
 /* The loaded host, or nullptr with *error set. Loads once, then cached. */

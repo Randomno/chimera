@@ -45,11 +45,29 @@ namespace Chimera.Client.Common
 		// which desyncs somewhere else can be understood rather than merely
 		// suffered. The value is what the driver called itself.
 		public const string GpuRenderer = "GpuRenderer";
+
+		/// <summary>
+		/// "1" when the core that made this can load its own states into a
+		/// session with another GL context (see IGpuRendered). Written only
+		/// alongside GpuRenderer, and read when a project's cached states are
+		/// opened - by which time there is no core to ask.
+		/// </summary>
+		public const string GpuStatesSurvive = "GpuStatesSurvive";
 		public const string Core = "Core";
 		public const string WaterboxHost = "WaterboxHost"; // the sandbox the core ran inside, by its own build info
 		public const string Firmware = "Firmware"; // "<id>=<sha1>" per file the core was given; a BIOS changes what runs
 		public const string CoreVersion = "CoreVersion"; // the core's authoritative version: the commit its published build was made from
 		public const string CorePackageSha1 = "CorePackageSHA1"; // SHA1 of the package file; the same version can be built twice, this says which build
+
+		/// <summary>
+		/// The savestate format the states this project cached were written in, and the
+		/// build that wrote them (issue #115). The engine owns the number
+		/// (<see cref="Chimera.Emulation.Common.Engine.ChimeraEngine.StateFormat"/>) and
+		/// refuses a state of another one file by file; these are here so that a whole
+		/// cache can be explained at open, before any single state is asked for.
+		/// </summary>
+		public const string StateFormat = "StateFormat";
+		public const string StateWrittenBy = "StateWrittenBy";
 
 		private static FrozenSet<string> field;
 

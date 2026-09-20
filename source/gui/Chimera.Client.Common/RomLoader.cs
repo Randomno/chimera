@@ -289,16 +289,22 @@ namespace Chimera.Client.Common
 			{
 				if (p.FileSlot(i) is not "support") { primary = i; break; }
 			}
-			if (primary < 0) throw new CoreLoadException("the project lists no game file");
+			// A project MAY hold no game at all. Two of the ares core's machines
+			// are worth starting that way - a PlayStation reaches its own BIOS
+			// menu, an MSX its own BASIC - and a core that boots without a
+			// medium says so by declaring its rom slot with no minimum. The
+			// engine mounts the slot either way; what the core sees is a file of
+			// zero length, which is how it tells an empty drive from a full one.
+			var haveGame = primary >= 0;
 			// A project's files are mounted from WHERE THEY LIE. Nothing here reads
 			// one: a PS2 disc is over four gigabytes and a byte[] cannot reach two,
 			// so loading them was both wasteful and, past that size, impossible.
 			string PathOf(int i) => p.FileSourcePath(i) is { Length: > 0 } where
 				? where
 				: throw new CoreLoadException($"'{p.FileName(i)}' has not been resolved");
-			var primaryPath = PathOf(primary);
+			var primaryPath = haveGame ? PathOf(primary) : "";
 
-			var factory = CoreRegistry.Instance.AllFactories.FirstOrDefault(f => f.CoreName == p.CoreName)
+			var factory = CoreRegistry.Instance.FactoryFor(p.CoreName, p.CoreSha1)
 				?? throw new CoreLoadException($"the project's core '{p.CoreName}' is not loaded");
 
 			List<CoreFile> extras = new()
@@ -309,13 +315,16 @@ namespace Chimera.Client.Common
 			{
 				extras.Add(new(p.FileName(i), PathOf(i)));
 			}
-			extras.Add(new("rom.name", System.Text.Encoding.UTF8.GetBytes(p.FileName(primary))));
-			var primarySlot = p.FileSlot(primary);
-			var n = 2;
-			for (var i = primary + 1; i < p.FileCount; i++)
+			if (haveGame)
 			{
-				if (p.FileSlot(i) != primarySlot) continue;
-				extras.Add(new($"rom{n++}", PathOf(i)));
+				extras.Add(new("rom.name", System.Text.Encoding.UTF8.GetBytes(p.FileName(primary))));
+				var primarySlot = p.FileSlot(primary);
+				var n = 2;
+				for (var i = primary + 1; i < p.FileCount; i++)
+				{
+					if (p.FileSlot(i) != primarySlot) continue;
+					extras.Add(new($"rom{n++}", PathOf(i)));
+				}
 			}
 
 			game = new GameInfo
@@ -325,10 +334,10 @@ namespace Chimera.Client.Common
 				// an unwritten project's stand-in path says nothing about the game
 				Name = p.Title.Length is not 0
 					? p.Title
-					: (Path.GetFileNameWithoutExtension(p.FileName(primary)) is { Length: not 0 } fileName
+					: (haveGame && Path.GetFileNameWithoutExtension(p.FileName(primary)) is { Length: not 0 } fileName
 						? fileName
 						: Path.GetFileNameWithoutExtension(path)),
-				Hash = p.FileActualSha1(primary),
+				Hash = haveGame ? p.FileActualSha1(primary) : "",
 				System = factory.SystemIds[0],
 			};
 
@@ -345,7 +354,7 @@ namespace Chimera.Client.Common
 						// path (a project is not a game file)
 						RomData = null,
 						FileData = null,
-						Extension = Path.GetExtension(p.FileName(primary)),
+						Extension = haveGame ? Path.GetExtension(p.FileName(primary)) : "",
 						RomPath = primaryPath,
 						Game = game,
 					},
@@ -359,6 +368,13 @@ namespace Chimera.Client.Common
 				ExtraFiles = extras,
 			};
 			nextEmulator = factory.Create(ctx);
+			CoreRegistry.Instance.NoteCreated(nextEmulator, factory);
+			// The game record was made before the core existed, from the package's
+			// FIRST system - which for a core with many machines is not the one the
+			// project boots: an ares NES project said N64 to anything reading the
+			// game's system (scripts, tools, the movie's platform). The core knows
+			// which machine it became, so that is what the record says.
+			if (!string.IsNullOrEmpty(nextEmulator.SystemId)) game.System = nextEmulator.SystemId;
 		}
 
 		private IEmulator MakeCoreFromRegistry(LoadParameters lp, string forcedCoreName = null)
@@ -366,7 +382,8 @@ namespace Chimera.Client.Common
 			IReadOnlyList<ICoreFactory> factories;
 			if (forcedCoreName != null)
 			{
-				var singleFactory = CoreRegistry.Instance.GetFactories(lp.Game.System).SingleOrDefault(f => f.CoreName == forcedCoreName);
+				// the chosen build of that core, else the newest installed: several builds may be registered
+				var singleFactory = CoreRegistry.Instance.FactoryFor(forcedCoreName, pinnedSha1: null) is { } built && built.SystemIds.Contains(lp.Game.System) ? built : null;
 				factories = singleFactory != null ? [ singleFactory ] : [ ];
 			}
 			else
@@ -374,6 +391,10 @@ namespace Chimera.Client.Common
 				_ = _config.DefaultCores.TryGetValue(lp.Game.System, out var preferredCore);
 				var dbForcedCoreName = lp.Game.ForcedCore;
 				factories = CoreRegistry.Instance.GetFactories(lp.Game.System)
+					// one build per core: the chosen one, else the newest installed
+					.Select(static f => f.CoreName).Distinct()
+					.Select(static name => CoreRegistry.Instance.FactoryFor(name, pinnedSha1: null))
+					.Where(f => f is not null && f.SystemIds.Contains(lp.Game.System))
 					.OrderBy(f =>
 					{
 						if (f.CoreName == preferredCore) return -2;
@@ -400,7 +421,9 @@ namespace Chimera.Client.Common
 						Settings = GetCoreSettings(factory.CoreType, factory.SettingsType),
 						FirmwareProvider = CoreFirmwareStore.ProviderFor(_config, factory.CoreName),
 					};
-					return factory.Create(ctx);
+					var created = factory.Create(ctx);
+					CoreRegistry.Instance.NoteCreated(created, factory);
+					return created;
 				}
 				catch (Exception e) when (!_config.DontTryOtherCores && e is not InternalCoreException)
 				{

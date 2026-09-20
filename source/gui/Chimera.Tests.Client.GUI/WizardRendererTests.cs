@@ -15,7 +15,7 @@ namespace Chimera.Tests.Client.GUI
 	public class WizardRendererTests
 	{
 		private static WaterboxConfig CfgWithRenderers()
-			=> WaterboxConfig.FromJson("""
+			=> TestPackages.Config("""
 				{
 				  "coreName": "two-renderers",
 				  "systemId": "DC",
@@ -30,7 +30,7 @@ namespace Chimera.Tests.Client.GUI
 				""");
 
 		private static WaterboxConfig CfgWithoutRenderers()
-			=> WaterboxConfig.FromJson("""
+			=> TestPackages.Config("""
 				{
 				  "coreName": "one-renderer",
 				  "systemId": "NES",
@@ -79,10 +79,16 @@ namespace Chimera.Tests.Client.GUI
 				"a software renderer has nothing to be careful about");
 
 			form.SetRenderer("opengl-hw");
-			StringAssert.Contains(form.RendererCaveatText, "desync",
-				"the cost is said where the choice is made");
-			StringAssert.Contains(form.RendererCaveatText, "greenzone",
-				"and so is what to do about it");
+			StringAssert.Contains(form.RendererCaveatText, "video can differ",
+				"the cost - a picture that can differ elsewhere - is said where the choice is made");
+			StringAssert.Contains(form.RendererCaveatText, "kept between sessions",
+				"the greenzone does survive a clean close (2026-09-16)");
+			StringAssert.Contains(form.RendererCaveatText, "closed unexpectedly",
+				"and the one case where it does not: a session that did not finish is not trusted");
+			StringAssert.Contains(form.RendererCaveatText, "replays",
+				"so the person is told what that costs them when it happens");
+			Assert.IsTrue(form.RendererCaveatText.Length <= 240,
+				$"and it fits the space the window reserves for it (442x46 px, about three lines): {form.RendererCaveatText.Length} chars");
 
 			form.SetRenderer("software");
 			Assert.AreEqual("", form.RendererCaveatText, "and it goes away again");

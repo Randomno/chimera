@@ -93,11 +93,53 @@ void loadOnce()
 		&& bind(g_api.wbx_get_proc_addr, "wbx_get_proc_addr")
 		&& bind(g_api.wbx_get_callback_addr, "wbx_get_callback_addr")
 		&& bind(g_api.wbx_seal, "wbx_seal")
+		/* not in the && chain: a host without it still works, it just cannot
+		 * tell a cached greenzone that its machine changed underneath it */
+		&& (bind(g_api.wbx_machine_hash, "wbx_machine_hash") || true)
+		&& (bind(g_api.wbx_get_page_len, "wbx_get_page_len") || true)
+		&& (bind(g_api.wbx_get_page_data, "wbx_get_page_data") || true)
+		&& (bind(g_api.wbx_get_death, "wbx_get_death") || true)
 		&& bind(g_api.wbx_mount_file, "wbx_mount_file")
 		&& bind(g_api.wbx_mount_file_path, "wbx_mount_file_path")
 		&& bind(g_api.wbx_save_state, "wbx_save_state")
 		&& bind(g_api.wbx_load_state, "wbx_load_state");
 	if (!g_ok) g_error = "libminiboxhost is missing expected wbx_ symbols";
+
+	/* The optional four, bound on their own: a host without them is not a
+	 * broken host, it is one that predates epochs, and the state history falls
+	 * back to whole states. Only offered as a set - half of it is no use. */
+	if (g_ok
+		&& !(bind(g_api.wbx_epoch_begin, "wbx_epoch_begin")
+			&& bind(g_api.wbx_save_delta, "wbx_save_delta")
+			&& bind(g_api.wbx_load_delta, "wbx_load_delta")
+			&& bind(g_api.wbx_get_epoch_page_count, "wbx_get_epoch_page_count")))
+	{
+		g_api.wbx_epoch_begin = nullptr;
+		g_api.wbx_save_delta = nullptr;
+		g_api.wbx_load_delta = nullptr;
+		g_api.wbx_get_epoch_page_count = nullptr;
+	}
+	/* Composition on its own: epochs without it means a history that keeps
+	 * every link it captured, which is dense and expensive but not wrong. */
+	if (!g_ok || !bind(g_api.wbx_compose_delta, "wbx_compose_delta")) g_api.wbx_compose_delta = nullptr;
+	/* and the in-memory form of it, which an older host does not have */
+	if (!g_ok || !bind(g_api.wbx_compose_delta_mem, "wbx_compose_delta_mem")) g_api.wbx_compose_delta_mem = nullptr;
+
+	/* Taking a state while the machine runs: all five or none. A host with
+	 * half of them could hold pages it has no way to release. */
+	if (!g_ok
+		|| !(bind(g_api.wbx_state_size, "wbx_state_size")
+			&& bind(g_api.wbx_state_plan, "wbx_state_plan")
+			&& bind(g_api.wbx_state_pages, "wbx_state_pages")
+			&& bind(g_api.wbx_state_fill, "wbx_state_fill")
+			&& bind(g_api.wbx_state_finish, "wbx_state_finish")))
+	{
+		g_api.wbx_state_size = nullptr;
+		g_api.wbx_state_plan = nullptr;
+		g_api.wbx_state_pages = nullptr;
+		g_api.wbx_state_fill = nullptr;
+		g_api.wbx_state_finish = nullptr;
+	}
 }
 
 } // namespace

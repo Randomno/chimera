@@ -173,7 +173,12 @@ namespace Chimera.Client.GUI
 			BranchView.RowCount = Branches.Count;
 			Branches.Current = Branches.Count - 1;
 			Movie.TasSession.UpdateValues(Tastudio.Emulator.Frame, Branches.Current);
-			Movie.TasStateManager.Capture(Tastudio.Emulator.Frame, new BufferedStatable(branch.CoreData));
+			// the branch was made from the machine as it stands, so this frame is
+			// worth having in the history too - and pinning it, which RefreshPins
+			// does, keeps it there
+			Movie.States.Capture(Tastudio.Emulator.Frame);
+			Movie.RefreshPins();
+			TidyBranchStates();
 			BranchView.ScrollToIndex(Branches.Current);
 			BranchView.DeselectAll();
 			Select(Branches.Current, true);
@@ -184,12 +189,47 @@ namespace Chimera.Client.GUI
 		public TasBranch SelectedBranch
 			=> BranchView.AnyRowsSelected ? Branches[BranchView.FirstSelectedRowIndex] : null;
 
-		private TasBranch CreateBranch()
+		/// <summary>How big the last branch state written was: what decides whether an undo is worth one.</summary>
+		private long _lastStateBytes;
+
+		/// <summary>From this size on, the branch kept for "Undo Branch Load" has no state of its own.</summary>
+		private const long UndoKeepsStateBelow = 512L * 1024 * 1024;
+
+		/// <summary>
+		/// The machine as it stands, in a file of its own beside the project's cache; null when it
+		/// could not be written, and the branch then has its input alone and replays to its frame.
+		/// The ENGINE writes it: it used to be cloned into a byte array, which cannot be more than
+		/// 2 GiB, and a PS3's state is - creating a branch threw an overflow (issue #84).
+		/// </summary>
+		private string SaveBranchState()
+		{
+			try
+			{
+				var path = Movie.NewBranchStatePath(out var stateFile);
+				// a window only if it lasts: milliseconds on a small machine, half a minute on a PS3
+				using (ProgressDialog.Begin(Tastudio, "Saving the branch", showAfterMs: 400))
+				{
+					Tastudio.Emulator.AsStatable().SaveStateToFile(path);
+				}
+				_lastStateBytes = new FileInfo(path).Length;
+				return stateFile;
+			}
+			catch (Exception ex) when (ex is InvalidOperationException or IOException or UnauthorizedAccessException)
+			{
+				Tastudio.MainForm.AddOnScreenMessage($"This branch has no saved state ({ex.Message}); loading it will replay to its frame.");
+				return null;
+			}
+		}
+
+		/// <summary>State files no branch names any more - and not the undo's either - are removed: they can be gigabytes each.</summary>
+		private void TidyBranchStates() => Movie.RemoveUnusedBranchStates(_backupBranch?.StateFile);
+
+		private TasBranch CreateBranch(bool withState = true)
 		{
 			return new()
 			{
 				Frame = Tastudio.Emulator.Frame,
-				CoreData = Tastudio.Emulator.AsStatable().CloneSavestate(),
+				StateFile = withState ? SaveBranchState() : null,
 				InputLog = Movie.GetLogEntries().Clone(),
 				CoreFrameBuffer = MainForm.MakeScreenshotImage(),
 				OSDFrameBuffer = MainForm.CaptureOSD(),
@@ -238,7 +278,10 @@ namespace Chimera.Client.GUI
 
 		private bool PrepareHistoryAndLoadSelectedBranch()
 		{
-			_backupBranch = CreateBranch();
+			// What "Undo Branch Load" goes back to. For a machine whose state is hundreds of
+			// megabytes that is a second state written on EVERY load, to serve an undo that is
+			// rarely used; such a backup keeps its input alone and the undo replays to it.
+			_backupBranch = CreateBranch(withState: _lastStateBytes < UndoKeepsStateBelow);
 
 			var currentHashes = Branches.Select(b => b.Uuid.GetHashCode()).ToList();
 			do
@@ -281,7 +324,9 @@ namespace Chimera.Client.GUI
 			BranchView.ScrollToIndex(Branches.Current);
 			var branch = CreateBranch();
 			Branches.Replace(SelectedBranch, branch);
-			Movie.TasStateManager.Capture(Tastudio.Emulator.Frame, new BufferedStatable(branch.CoreData));
+			Movie.States.Capture(Tastudio.Emulator.Frame);
+			Movie.RefreshPins();
+			TidyBranchStates();
 			Tastudio.BranchSavedCallback?.Invoke(Branches.Current);
 		}
 
@@ -635,11 +680,13 @@ namespace Chimera.Client.GUI
 		{
 			if (e.NewCell?.RowIndex != null && e.NewCell.Column != null && e.NewCell.RowIndex < Branches.Count)
 			{
+				// A branch's screenshot lives in the project's cache, never in the project file, so a branch
+				// opened without that cache - another machine, a cleared cache, one set aside because another
+				// build of the core made it - has none to show. Hovering it threw (issue #79).
 				if (BranchView.CurrentCell is { RowIndex: int targetRow, Column.Name: BranchNumberColumnName }
-					&& targetRow < Branches.Count)
+					&& targetRow < Branches.Count
+					&& Branches[targetRow] is { OSDFrameBuffer: { } bb } branch)
 				{
-					var branch = Branches[targetRow];
-					var bb = branch.OSDFrameBuffer;
 					var width = bb.Width;
 					Point location = PointToScreen(Location);
 					var bottom = location.Y + bb.Height;

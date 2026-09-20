@@ -11,7 +11,7 @@ namespace Chimera.Client.Common
 	/// <summary>
 	/// The three markers a run always has, whether or not anyone placed them.
 	/// They are derived from the movie rather than authored, so they cannot be
-	/// moved, renamed or removed, and they are never written to the .tasproj -
+	/// moved, renamed or removed, and they are never written to the .chimeraProject -
 	/// on load they are worked out again, which is the only way they can be
 	/// trusted to still be true.
 	/// </summary>
@@ -368,7 +368,7 @@ namespace Chimera.Client.Common
 				return;
 			}
 
-			_movie.TasStateManager.Unreserve(item.Frame - 1);
+			_movie.States?.Pin(item.Frame - 1, false);
 			_movie.ChangeLog.AddMarkerChange(null, item.Frame, item.Message);
 
 			base.Remove(item);
@@ -383,7 +383,7 @@ namespace Chimera.Client.Common
 				if (!m.IsPermanent && match.Invoke(m))
 				{
 					_movie.ChangeLog.AddMarkerChange(null, m.Frame, m.Message);
-					_movie.TasStateManager.Unreserve(m.Frame - 1);
+					_movie.States?.Pin(m.Frame - 1, false);
 				}
 			}
 

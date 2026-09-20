@@ -1,0 +1,3471 @@
+#include "state_history.hpp"
+#include "zstd_dyn.hpp"
+
+#include <algorithm>
+#include <cstdio>
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+#include <chrono>
+#include <functional>
+#include <new>
+#include <string_view>
+
+namespace chimera
+{
+
+namespace
+{
+
+/* a note is a caller's few bytes about a frame; anything claiming more is damage */
+const uint64_t kMaxNote = 4096;
+
+/* the stream shims the host's callbacks want */
+struct ByteSink { StateHistory::Bytes *out; };
+int32_t sinkWrite(uintptr_t ud, const void *data, uintptr_t len)
+{
+	auto *s = reinterpret_cast<ByteSink *>(ud);
+	const auto *p = static_cast<const uint8_t *>(data);
+	s->out->insert(s->out->end(), p, p + len);
+	return 0;
+}
+
+struct ByteSource { const uint8_t *data; uintptr_t len, pos; };
+intptr_t sourceRead(uintptr_t ud, void *out, uintptr_t len)
+{
+	auto *s = reinterpret_cast<ByteSource *>(ud);
+	uintptr_t n = s->len - s->pos;
+	if (n > len) n = len;
+	if (n == 0) return -1;
+	std::memcpy(out, s->data + s->pos, n);
+	s->pos += n;
+	return static_cast<intptr_t>(n);
+}
+
+/* The spill file is named for the process and the instance, not for the
+ * directory alone. Two histories handed the same directory - a project opened
+ * again before the session that had it is gone, or the same project open
+ * twice - used to open the same file, and the second truncated the first's:
+ * every frame the first had on disk came back as garbage. A name of its own is
+ * the whole fix; what a crashed session leaves behind is a cache file like any
+ * other, and the cache manager's bound on the directory takes it in time. */
+static std::string spillFileName()
+{
+	static int seq = 0;
+#ifdef _WIN32
+	const long pid = static_cast<long>(_getpid());
+#else
+	const long pid = static_cast<long>(getpid());
+#endif
+	return "history-spill-" + std::to_string(pid) + "-" + std::to_string(++seq) + ".bin";
+}
+
+/* fseek and ftell take a long, which is 32 bits on Windows - and the spill file
+ * is the one thing here designed to pass two gigabytes. */
+#ifdef _WIN32
+bool seekTo(std::FILE *f, uint64_t at) { return _fseeki64(f, static_cast<__int64>(at), SEEK_SET) == 0; }
+bool seekEnd(std::FILE *f) { return _fseeki64(f, 0, SEEK_END) == 0; }
+bool tellAt(std::FILE *f, uint64_t &at)
+{
+	const __int64 n = _ftelli64(f);
+	if (n < 0) return false;
+	at = static_cast<uint64_t>(n);
+	return true;
+}
+#else
+bool seekTo(std::FILE *f, uint64_t at) { return fseeko(f, static_cast<off_t>(at), SEEK_SET) == 0; }
+bool seekEnd(std::FILE *f) { return fseeko(f, 0, SEEK_END) == 0; }
+bool tellAt(std::FILE *f, uint64_t &at)
+{
+	const off_t n = ftello(f);
+	if (n < 0) return false;
+	at = static_cast<uint64_t>(n);
+	return true;
+}
+#endif
+
+bool writeAll(std::FILE *f, const void *data, size_t n)
+{
+	return n == 0 || std::fwrite(data, 1, n, f) == n;
+}
+
+bool readAll(std::FILE *f, void *data, size_t n)
+{
+	return n == 0 || std::fread(data, 1, n, f) == n;
+}
+
+
+/* CHIMERA_HISTORY_TRACE=1 says what the history stored and what it cost. A
+ * delta silently falling back to a whole state is the failure mode with no
+ * symptom - everything still works, it just costs a hundred times more - so
+ * there has to be a way to look. */
+double nowSeconds()
+{
+	/* steady_clock rather than clock_gettime, which mingw does not have - this
+	 * is only ever read under CHIMERA_HISTORY_TRACE, but a diagnostic that
+	 * fails to link on the platform people run is worse than no diagnostic. */
+	const auto t = std::chrono::steady_clock::now().time_since_epoch();
+	return std::chrono::duration<double>(t).count();
+}
+
+bool historyTrace()
+{
+	static const int on = [] {
+		const char *e = getenv("CHIMERA_HISTORY_TRACE");
+		return e != nullptr && e[0] != '\0' && e[0] != '0' ? 1 : 0;
+	}();
+	return on != 0;
+}
+
+bool historyVerify()
+{
+	static const int on = [] {
+		const char *e = getenv("CHIMERA_HISTORY_VERIFY");
+		return e != nullptr && e[0] != '\0' && e[0] != '0' ? 1 : 0;
+	}();
+	return on != 0;
+}
+
+} // namespace
+
+void StateHistory::configure(const HostApi *host, void *obj, uint64_t budgetBytes)
+{
+	/* Before the host changes, not after: the pages being held belong to the
+	 * OLD machine and only the old host can let them go. */
+	finishPlan();
+	m_host = host;
+	m_obj = obj;
+	m_budget = budgetBytes;
+	/* Everything stored goes, the spill file with it: a history configured
+	 * over one that had spilled kept the file open and its live count, and
+	 * then held the disk budget against stretches that no longer existed. The
+	 * directory is kept - the next spill opens a fresh file there. */
+	clear();
+}
+
+void StateHistory::flushWrites()
+{
+	drainWriter();
+	evictDisk();   /* and what that landed is held to the budget, like a frame's */
+}
+
+void StateHistory::helpers(bool on)
+{
+	m_packer.setThreaded(on);
+	m_writer.setThreaded(on);
+	applyWrites();   /* setThreaded(false) finishes what was queued; take its word now */
+}
+
+void StateHistory::clear()
+{
+	finishPlan();
+	/* a packer job holds bodies of stretches that are about to go; it finishes
+	 * (bounded by one stretch) and its result is thrown away with them */
+	m_packer.drain();
+	m_packJobs.clear();
+	m_segments.clear();
+	m_bytes = 0;
+	m_epochOpen = false;
+	m_newest = -1;
+	m_nearStride = 1;
+	m_tuner.stride = 1;
+	m_captureSeconds = 0;
+	m_wallSeconds = 0;
+	m_lastCaptureEnded = 0;
+	m_capturesSinceTuned = 0;
+	dropSpillFile();
+}
+
+/* CHIMERA_NO_DELTAS=1 keeps whole states, as the greenzone did before epochs.
+ * It is here for the same reason CHIMERA_NO_GPU is: two things that fail
+ * differently should be tellable apart on a machine that is not here, and a
+ * regression in capture cost or in seek latency wants an A against its B on
+ * the same build. */
+static bool deltasRefused()
+{
+	static const int off = [] {
+		const char *e = getenv("CHIMERA_NO_DELTAS");
+		return e != nullptr && e[0] != '\0' && e[0] != '0' ? 1 : 0;
+	}();
+	return off != 0;
+}
+
+/* One layout, used by the spill file and by a saved history alike - which is
+ * what lets a saved history copy a spilled segment through byte for byte
+ * instead of rebuilding it:
+ *
+ *   anchor: length, bytes, note length, note
+ *   links:  count, then per link: the frame it lands on, note length, note,
+ *           length, bytes
+ */
+namespace
+{
+
+/* CHIMERA_HISTORY_PACK=0 keeps every body raw in memory: the A against the B
+ * for what packing costs a restore and buys a budget. */
+bool packRefused()
+{
+	static const int off = [] {
+		const char *e = getenv("CHIMERA_HISTORY_PACK");
+		return e != nullptr && e[0] == '0' ? 1 : 0;
+	}();
+	return off != 0;
+}
+
+/* The raw bytes of a body, in order, whether it is held raw or as a zstd
+ * frame - what a restore streams into the sandbox and a save copies out. It
+ * never holds a packed body decoded whole: a gigabyte anchor comes out a
+ * megabyte at a time. */
+class MemBodyReader
+{
+public:
+	explicit MemBodyReader(const StateHistory::Body &b) : m_body(b)
+	{
+		if (!b.packed) return;
+		const ZstdApi *z = zstdApi(nullptr);
+		if (z == nullptr) { m_failed = true; return; }
+		m_stream = z->createDStream();
+		if (m_stream == nullptr || z->isError(z->initDStream(m_stream))) { m_failed = true; return; }
+		m_out.resize(1u << 20);
+	}
+	~MemBodyReader()
+	{
+		if (m_stream != nullptr)
+		{
+			if (const ZstdApi *z = zstdApi(nullptr)) z->freeDStream(m_stream);
+		}
+	}
+	MemBodyReader(const MemBodyReader &) = delete;
+	MemBodyReader &operator=(const MemBodyReader &) = delete;
+
+	bool read(void *out, size_t n)
+	{
+		if (m_failed) return false;
+		uint8_t *dst = static_cast<uint8_t *>(out);
+		if (!m_body.packed)
+		{
+			if (m_pos + n > m_body.size()) return false;
+			std::memcpy(dst, m_body.data() + m_pos, n);
+			m_pos += n;
+			return true;
+		}
+		while (n != 0)
+		{
+			if (m_outPos == m_outLen && !refill()) return false;
+			const size_t take = m_outLen - m_outPos < n ? m_outLen - m_outPos : n;
+			std::memcpy(dst, m_out.data() + m_outPos, take);
+			m_outPos += take;
+			dst += take;
+			n -= take;
+			m_pos += take;
+		}
+		return true;
+	}
+	/* how far into the raw body the next read begins */
+	uint64_t pos() const { return m_pos; }
+
+private:
+	bool refill()
+	{
+		const ZstdApi *z = zstdApi(nullptr);
+		if (z == nullptr) return false;
+		const Bytes &frame = *m_body.p;
+		for (;;)
+		{
+			ZstdApi::Buffer in{ frame.data() + m_consumed, frame.size() - m_consumed, 0 };
+			ZstdApi::OutBuffer o{ m_out.data(), m_out.size(), 0 };
+			const size_t rc = z->decompressStream(m_stream, &o, &in);
+			if (z->isError(rc)) return false;
+			m_consumed += in.pos;
+			if (o.pos != 0)
+			{
+				m_outPos = 0;
+				m_outLen = o.pos;
+				return true;
+			}
+			if (m_consumed >= frame.size()) return false;   /* the frame is exhausted */
+		}
+	}
+
+	using Bytes = StateHistory::Bytes;
+	const StateHistory::Body &m_body;
+	uint64_t m_pos = 0;
+	bool m_failed = false;
+	void *m_stream = nullptr;
+	size_t m_consumed = 0;
+	std::vector<uint8_t> m_out;
+	size_t m_outPos = 0, m_outLen = 0;
+};
+
+/* A read callback over a body in memory, for handing an anchor or a link
+ * straight to the sandbox - raw or packed alike. */
+struct BodySource
+{
+	MemBodyReader *body;
+	uint64_t left;
+};
+
+intptr_t bodyRead(uintptr_t ud, void *out, uintptr_t len)
+{
+	auto *s = reinterpret_cast<BodySource *>(ud);
+	if (len > s->left) len = static_cast<uintptr_t>(s->left);
+	if (len == 0) return -1;
+	if (!s->body->read(out, len)) return -1;
+	s->left -= len;
+	return static_cast<intptr_t>(len);
+}
+
+/* A packed body decoded whole - for a merge, which reads both of its inputs
+ * at random and is capped at megabytes anyway. */
+bool unpackBody(const StateHistory::Body &b, StateHistory::Bytes &out)
+{
+	out.resize(b.size());
+	if (b.size() == 0) return true;
+	if (!b.packed)
+	{
+		std::memcpy(out.data(), b.data(), b.size());
+		return true;
+	}
+	MemBodyReader r(b);
+	return r.read(out.data(), out.size());
+}
+
+} // namespace
+
+bool StateHistory::writeSegmentBodyTo(const std::function<bool(const void *, size_t)> &put, const Segment &seg)
+{
+	auto u64 = [&](uint64_t v) { return put(&v, sizeof v); };
+	/* a packed body goes out decoded, a megabyte at a time; a raw one goes
+	 * out as it lies */
+	auto body = [&](const Body &b) {
+		if (!b.packed) return put(b.data(), b.size());
+		MemBodyReader in(b);
+		std::vector<uint8_t> chunk(1u << 20);
+		uint64_t n = b.size();
+		while (n != 0)
+		{
+			const size_t take = static_cast<size_t>(n < chunk.size() ? n : chunk.size());
+			if (!in.read(chunk.data(), take) || !put(chunk.data(), take)) return false;
+			n -= take;
+		}
+		return true;
+	};
+	bool ok = u64(seg.anchor.size())
+		&& body(seg.anchor)
+		&& u64(seg.anchorNote.size())
+		&& put(seg.anchorNote.data(), seg.anchorNote.size())
+		&& u64(seg.links.size());
+	for (const Link &l : seg.links)
+	{
+		if (!ok) break;
+		ok = u64(static_cast<uint64_t>(l.endFrame))
+			&& u64(l.note.size())
+			&& put(l.note.data(), l.note.size())
+			&& u64(l.bytes.size())
+			&& body(l.bytes);
+	}
+	return ok;
+}
+
+bool StateHistory::writeSegmentBody(std::FILE *f, const Segment &seg)
+{
+	return writeSegmentBodyTo([f](const void *d, size_t n) { return writeAll(f, d, n); }, seg);
+}
+
+namespace
+{
+
+/* CHIMERA_SPILL_RAW=1 writes spilled bodies uncompressed, for the same reason
+ * CHIMERA_NO_DELTAS exists: an A against a B on one build. */
+bool spillRaw()
+{
+	static const int raw = [] {
+		const char *e = getenv("CHIMERA_SPILL_RAW");
+		return e != nullptr && e[0] != '\0' && e[0] != '0' ? 1 : 0;
+	}();
+	return raw != 0;
+}
+
+/* Compresses as the body is serialised. A body is up to a whole machine, and
+ * holding it a second time just to compress it would be exactly the memory a
+ * spill exists to give back. */
+struct ZstdBodySink
+{
+	std::FILE *f;
+	const ZstdApi *z;
+	void *cs = nullptr;
+	std::vector<uint8_t> out;
+	bool failed = false;
+
+	ZstdBodySink(std::FILE *file, const ZstdApi *api) : f(file), z(api), out(1u << 20)
+	{
+		cs = z->createCStream();
+		/* level 1: 3.2 GB/s on a PlayStation 2 anchor for 23x, against level 3's
+		 * 2.6 GB/s for 25x - the writer has other bodies waiting */
+		if (cs == nullptr || z->isError(z->initCStream(cs, 1))) failed = true;
+	}
+	~ZstdBodySink() { if (cs != nullptr) z->freeCStream(cs); }
+
+	bool pump(ZstdApi::Buffer &in, int endOp)
+	{
+		for (;;)
+		{
+			ZstdApi::OutBuffer o{ out.data(), out.size(), 0 };
+			const size_t rc = z->compressStream2(cs, &o, &in, endOp);
+			if (z->isError(rc)) return false;
+			if (o.pos != 0 && !writeAll(f, out.data(), o.pos)) return false;
+			if (endOp == 0 ? in.pos == in.size : rc == 0) return true;
+		}
+	}
+	bool write(const void *data, size_t n)
+	{
+		if (failed) return false;
+		if (n == 0) return true;
+		ZstdApi::Buffer in{ data, n, 0 };
+		return pump(in, 0);
+	}
+	bool finish()
+	{
+		if (failed) return false;
+		ZstdApi::Buffer in{ nullptr, 0, 0 };
+		return pump(in, 2);
+	}
+};
+
+} // namespace
+
+/* One body as a zstd frame, level 1 - the level the writer uses, for the
+ * same reason: it is the fastest and a machine state gives it nearly all it
+ * gives any level. Streamed into the frame a megabyte at a time, so the
+ * frame is the only new allocation. A body that will not pack - no libzstd,
+ * a failure, or one that did not shrink - stays as it is. */
+StateHistory::Body StateHistory::packBody(const Body &b)
+{
+	if (b.packed || b.empty() || packRefused()) return b;
+	const ZstdApi *z = zstdApi(nullptr);
+	if (z == nullptr || z->createCStream == nullptr || z->initCStream == nullptr
+		|| z->freeCStream == nullptr || z->compressStream2 == nullptr)
+	{
+		return b;
+	}
+	void *cs = z->createCStream();
+	if (cs == nullptr) return b;
+	if (z->isError(z->initCStream(cs, 1))) { z->freeCStream(cs); return b; }
+	Bytes frame;
+	/* a state packs at least seven times; asked for up front so the frame is
+	 * one allocation on the common path, and grown when it is not */
+	frame.resize(static_cast<size_t>(b.size() / 4) + (1u << 16));
+	size_t at = 0;
+	ZstdApi::Buffer in{ b.data(), b.size(), 0 };
+	bool ok = true;
+	for (;;)
+	{
+		if (frame.size() - at < (1u << 16)) frame.resize(frame.size() + frame.size() / 2 + (1u << 16));
+		ZstdApi::OutBuffer o{ frame.data() + at, frame.size() - at, 0 };
+		const size_t rc = z->compressStream2(cs, &o, &in, 2);
+		if (z->isError(rc)) { ok = false; break; }
+		at += o.pos;
+		if (rc == 0) break;
+	}
+	z->freeCStream(cs);
+	if (!ok || at >= b.size()) return b;
+	frame.resize(at);
+	frame.shrink_to_fit();
+	return Body::makePacked(std::move(frame), b.size());
+}
+
+bool StateHistory::packingAvailable() const
+{
+	return !packRefused() && zstdApi(nullptr) != nullptr;
+}
+
+/* Every body of a stretch, in line, and the stretch's cost corrected. */
+void StateHistory::packSegmentNow(Segment &seg)
+{
+	if (seg.spilled || !packingAvailable()) return;
+	const uint64_t was = seg.bytes;
+	seg.anchor = packBody(seg.anchor);
+	for (Link &l : seg.links) l.bytes = packBody(l.bytes);
+	seg.bytes = seg.anchor.held();
+	for (const Link &l : seg.links) seg.bytes += l.bytes.held();
+	if (was > seg.bytes) releaseBytes(was - seg.bytes, "pack");
+	else m_bytes += seg.bytes - was;
+}
+
+void StateHistory::packSegmentLater(size_t index)
+{
+	if (index >= m_segments.size() || !packingAvailable()) return;
+	const Segment &seg = m_segments[index];
+	if (seg.spilled) return;
+	auto job = std::make_unique<PackJob>();
+	job->anchorFrame = seg.anchorFrame;
+	if (!seg.anchor.packed && !seg.anchor.empty()) job->in.push_back(seg.anchor.p);
+	for (const Link &l : seg.links)
+	{
+		if (!l.bytes.packed && !l.bytes.empty()) job->in.push_back(l.bytes.p);
+	}
+	if (job->in.empty()) return;
+	PackJob *const j = job.get();
+	m_packJobs.push_back(std::move(job));
+	m_packer.post([j]() {
+		const double t0 = nowSeconds();
+		j->out.reserve(j->in.size());
+		for (const auto &p : j->in)
+		{
+			j->out.push_back(packBody(Body{ p, p->size(), false }));
+		}
+		j->seconds = nowSeconds() - t0;
+	});
+}
+
+/* Takes what the packer has made. The wait is for a job posted a whole
+ * stretch ago, so it is normally nothing; it is paid at all only so that the
+ * moment the budget changes is the same threaded as in line. */
+void StateHistory::finishPacking()
+{
+	if (m_packJobs.empty()) return;
+	const double tWait = nowSeconds();
+	m_packer.drain();
+	const double waited = nowSeconds() - tWait;
+	if (waited > 0.001)
+	{
+		m_costs.packWaits++;
+		m_costs.packWaitSeconds += waited;
+		if (historyTrace())
+		{
+			fprintf(stderr, "[history] waited %.0f ms for the packer\n", waited * 1000);
+			fflush(stderr);
+		}
+	}
+	for (auto &job : m_packJobs)
+	{
+		Segment *seg = nullptr;
+		for (Segment &s : m_segments)
+		{
+			if (s.anchorFrame == job->anchorFrame) { seg = &s; break; }
+		}
+		if (seg == nullptr || seg->spilled || job->out.size() != job->in.size()) continue;
+		const uint64_t was = seg->bytes;
+		uint64_t rawPacked = 0;
+		auto take = [&](Body &b) {
+			for (size_t i = 0; i < job->in.size(); i++)
+			{
+				if (b.p != job->in[i] || !job->out[i].packed) continue;
+				rawPacked += b.size();
+				b = job->out[i];
+				return;
+			}
+		};
+		take(seg->anchor);
+		for (Link &l : seg->links) take(l.bytes);
+		seg->bytes = seg->anchor.held();
+		for (const Link &l : seg->links) seg->bytes += l.bytes.held();
+		if (was > seg->bytes) releaseBytes(was - seg->bytes, "pack");
+		else m_bytes += seg->bytes - was;
+		m_costs.packedRaw += rawPacked;
+		m_costs.packedHeld += seg->bytes;
+		if (historyTrace())
+		{
+			fprintf(stderr, "[history] packed the stretch at %lld: %llu -> %llu bytes (%.1fx), %.0f ms on the packer (%llu total)\n",
+				(long long)seg->anchorFrame, (unsigned long long)was, (unsigned long long)seg->bytes,
+				seg->bytes != 0 ? static_cast<double>(was) / static_cast<double>(seg->bytes) : 0.0,
+				job->seconds * 1000, (unsigned long long)m_bytes);
+			fflush(stderr);
+		}
+	}
+	m_packJobs.clear();
+}
+
+bool StateHistory::writeSegmentBodyPacked(std::FILE *f, const Segment &seg, bool &packed)
+{
+	packed = false;
+	const ZstdApi *z = spillRaw() ? nullptr : zstdApi(nullptr);
+	if (z == nullptr || z->createCStream == nullptr || z->initCStream == nullptr
+		|| z->freeCStream == nullptr || z->compressStream2 == nullptr)
+	{
+		return writeSegmentBody(f, seg);
+	}
+	ZstdBodySink sink(f, z);
+	if (sink.failed) return writeSegmentBody(f, seg);   /* nothing written yet */
+	if (!writeSegmentBodyTo([&sink](const void *d, size_t n) { return sink.write(d, n); }, seg)) return false;
+	if (!sink.finish()) return false;
+	packed = true;
+	return true;
+}
+
+SpillBodyReader::~SpillBodyReader()
+{
+	if (m_stream != nullptr)
+	{
+		if (const ZstdApi *z = zstdApi(nullptr)) z->freeDStream(m_stream);
+	}
+}
+
+bool SpillBodyReader::open(std::FILE *f, uint64_t at, uint64_t length, bool packed)
+{
+	m_f = f;
+	m_at = at;
+	m_length = length;
+	m_packed = packed;
+	m_pos = 0;
+	if (f == nullptr) return false;
+	if (!packed) return true;
+	const ZstdApi *z = zstdApi(nullptr);
+	if (z == nullptr) return false;
+	m_stream = z->createDStream();
+	if (m_stream == nullptr || z->isError(z->initDStream(m_stream))) return false;
+	m_in.resize(256u << 10);
+	m_out.resize(1u << 20);
+	return true;
+}
+
+bool SpillBodyReader::refill()
+{
+	const ZstdApi *z = zstdApi(nullptr);
+	if (z == nullptr) return false;
+	for (;;)
+	{
+		if (m_inPos == m_inLen)
+		{
+			if (m_consumed >= m_length) return false;   /* the extent is exhausted */
+			const uint64_t left = m_length - m_consumed;
+			const size_t take = static_cast<size_t>(left < m_in.size() ? left : m_in.size());
+			if (!seekTo(m_f, m_at + m_consumed) || !readAll(m_f, m_in.data(), take)) return false;
+			m_consumed += take;
+			m_inPos = 0;
+			m_inLen = take;
+		}
+		ZstdApi::Buffer in{ m_in.data(), m_inLen, m_inPos };
+		ZstdApi::OutBuffer out{ m_out.data(), m_out.size(), 0 };
+		const size_t rc = z->decompressStream(m_stream, &out, &in);
+		if (z->isError(rc)) return false;
+		m_inPos = in.pos;
+		m_outPos = 0;
+		m_outLen = out.pos;
+		if (m_outLen != 0) return true;
+		if (rc == 0 && m_inPos == m_inLen && m_consumed >= m_length) return false;   /* the frame is over */
+	}
+}
+
+bool SpillBodyReader::read(void *out, size_t n)
+{
+	if (n == 0) return true;
+	if (!m_packed)
+	{
+		if (m_pos + n > m_length) return false;
+		if (!seekTo(m_f, m_at + m_pos) || !readAll(m_f, out, n)) return false;
+		m_pos += n;
+		return true;
+	}
+	auto *dst = static_cast<uint8_t *>(out);
+	while (n != 0)
+	{
+		if (m_outPos == m_outLen && !refill()) return false;
+		size_t take = m_outLen - m_outPos;
+		if (take > n) take = n;
+		std::memcpy(dst, m_out.data() + m_outPos, take);
+		m_outPos += take;
+		dst += take;
+		n -= take;
+		m_pos += take;
+	}
+	return true;
+}
+
+bool SpillBodyReader::skip(uint64_t n)
+{
+	if (!m_packed)
+	{
+		if (m_pos + n > m_length) return false;
+		m_pos += n;
+		return true;
+	}
+	while (n != 0)
+	{
+		if (m_outPos == m_outLen && !refill()) return false;
+		uint64_t take = m_outLen - m_outPos;
+		if (take > n) take = n;
+		m_outPos += static_cast<size_t>(take);
+		n -= take;
+		m_pos += take;
+	}
+	return true;
+}
+
+namespace
+{
+
+/* A read callback over a spilled body, for handing an anchor or a link
+ * straight to the sandbox. */
+struct ReaderSource
+{
+	SpillBodyReader *body;
+	uint64_t left;
+};
+
+intptr_t readerRead(uintptr_t ud, void *out, uintptr_t len)
+{
+	auto *s = reinterpret_cast<ReaderSource *>(ud);
+	if (len > s->left) len = static_cast<uintptr_t>(s->left);
+	if (len == 0) return -1;
+	if (!s->body->read(out, len)) return -1;
+	s->left -= len;
+	return static_cast<intptr_t>(len);
+}
+
+} // namespace
+
+StateHistory::~StateHistory()
+{
+	/* the drainer is reading the machine's pages; it stops before anything else
+	 * does, because what it is reading belongs to somebody who is also going */
+	finishPlan();
+	m_packer.drain();
+	m_packJobs.clear();
+	dropSpillFile();
+}
+
+/* Spill files a previous session left behind.
+ *
+ * The file is named for the process that made it, so a session that died -
+ * a crash, a machine turned off - leaves its file in the project's cache with
+ * nobody to remove it, and the next runs pile theirs on top. They are cache
+ * files and the cache manager would take them in the end, but "in the end" is
+ * after they have filled a disk, and they are gigabytes each.
+ *
+ * So a history sweeps the directory it is given. A file another LIVE session
+ * is using refuses to go on Windows, which is the answer we want; on Linux the
+ * unlink costs that session its name and nothing else - it holds the handle,
+ * and its own removal simply finds nothing later. */
+void StateHistory::sweepStaleSpills(const std::string &dir)
+{
+	if (dir.empty()) return;
+	std::error_code ec;
+	for (const auto &entry : std::filesystem::directory_iterator(dir, ec))
+	{
+		if (ec) return;
+		std::error_code one;
+		if (!entry.is_regular_file(one) || one) continue;
+		const std::string name = entry.path().filename().string();
+		if (name.rfind("history-spill-", 0) != 0) continue;
+		if (name == std::filesystem::path(m_spillPath).filename().string()) continue;   /* ours */
+		std::filesystem::remove(entry.path(), one);
+	}
+}
+
+void StateHistory::spillTo(const char *dir)
+{
+	const std::string next = dir != nullptr ? dir : "";
+	if (next == m_spillDir)
+	{
+		sweepStaleSpills(next);
+		return;
+	}
+	/* Whatever is out there belongs to the old directory, and the segments
+	 * pointing at it are now unreadable - so they go, which costs replaying. */
+	dropSpillFile();
+	for (size_t i = m_segments.size(); i-- > 0; )
+	{
+		if (m_segments[i].spilled) forgetSegment(i);
+	}
+	m_spillDir = next;
+	m_spillFailed = false;   /* a new directory is a fresh chance at it */
+	sweepStaleSpills(next);
+}
+
+/* True when anything between the anchor and the last landing is pinned - the
+ * question eviction asks before throwing a stretch away. */
+static bool holdsPinned(const std::set<int64_t> &pins, int64_t from, int64_t to)
+{
+	const auto it = pins.lower_bound(from);
+	return it != pins.end() && *it <= to;
+}
+
+/* Which stretch to give up, when one has to go.
+ *
+ * Two rules, and the first is not negotiable: the stretch holding the earliest
+ * frames NEVER goes. Going back to a frame the greenzone no longer covers means
+ * starting from the beginning and replaying to it, and that is only possible
+ * while the beginning is still there. The disk budget used to drop the oldest
+ * stretch in the file whichever it was - the first one included - and once it
+ * had, nothing could reach the early movie at all: the piano roll would try,
+ * find no state at or before the target, and seek forward forever. The newest
+ * never goes either; it is where the work is.
+ *
+ * The second rule is what is left AFTER the budget has taken its share:
+ * breadcrumbs. Dropping the oldest every time empties the far past first, so a
+ * long session ends up with everything huddled around the playhead and a return
+ * to the middle costs a replay from zero. Instead the stretch that goes is the
+ * one whose absence widens the gap between its neighbours least - which, applied
+ * repeatedly, thins the run evenly and leaves anchors spread across the whole
+ * movie. Getting back to any frame then costs one anchor and a bounded replay.
+ *
+ * A stretch somebody pinned a frame in is not a candidate at all: a pin is a
+ * promise that frame can still be reached. */
+size_t StateHistory::chooseVictim(bool spilled) const
+{
+	size_t best = m_segments.size();
+	int64_t bestGap = 0;
+	for (size_t i = 1; i + 1 < m_segments.size(); i++)
+	{
+		const Segment &s = m_segments[i];
+		if (s.spilled != spilled) continue;
+		if (holdsPinned(m_pinned, s.anchorFrame, s.lastFrame())) continue;
+		const int64_t gap = m_segments[i + 1].anchorFrame - m_segments[i - 1].anchorFrame;
+		if (best == m_segments.size() || gap < bestGap) { best = i; bestGap = gap; }
+	}
+	return best;
+}
+
+/* The number given is what the FILE may weigh, because that is the number
+ * somebody watching a disk fill up cares about and the only one they can check.
+ *
+ * What is kept reachable is half of it. A compaction copies every live byte, so
+ * doing one per drop would copy the same bytes over and over; waiting until the
+ * dead part is the bigger part makes it one copy per byte written, amortised,
+ * and means the file sits between the live total and twice it. Half the number
+ * for live is what turns that into a promise that can be read off `ls`. */
+void StateHistory::diskBudget(uint64_t bytes)
+{
+	m_diskBudget = bytes / 2;
+	evictDisk();
+}
+
+/* Drops the oldest stretches in the spill file until it is under its budget,
+ * then reclaims the room they held.
+ *
+ * The newest is spared here as it is in memory - it is where the work is - and
+ * a stretch somebody pinned a frame in is spared too, for the same reason
+ * eviction spares it: a pin is a promise that frame can still be reached.
+ */
+void StateHistory::evictDisk()
+{
+	if (m_diskBudget == 0) return;
+	for (;;)
+	{
+		bool dropped = false;
+		while (m_spillLive > m_diskBudget)
+		{
+			const size_t victim = chooseVictim(true);
+			if (victim == m_segments.size()) break;   /* nothing left that may go */
+			forgetSegment(victim);
+			dropped = true;
+		}
+		if (!dropped) return;
+		/* A compaction waits for the writer first, and what that lets land
+		 * counts against the budget too - so it is asked again rather than
+		 * trusted to have been the end of it. Every turn drops a stretch, so
+		 * this ends. */
+		compactSpill();
+		if (m_spillLive <= m_diskBudget) return;
+	}
+}
+
+/* Moves what is still live to the front of the file, so the room the dropped
+ * stretches held is actually given back. Only when the dead part is the bigger
+ * part: a compaction copies every live byte, and doing it at every drop would
+ * copy the same bytes over and over.
+ *
+ * A failure here is not an error. The file stays as it was and so do the
+ * offsets in it; what is lost is the room, until the next drop asks again. */
+bool StateHistory::compactSpill()
+{
+	if (m_spill == nullptr) return false;
+	/* A compaction waits for the writer, and while a save is being written that
+	 * is the whole save. Asked again at the next drop, when it is not. */
+	if (savePending()) return false;
+	/* The cheap question first, and the wait only for an answer of yes.
+	 *
+	 * This is called after every drop and the answer is usually no - the dead
+	 * part is not the bigger part yet - so draining here unconditionally made
+	 * every spill wait for its own write within a frame or two of queuing it.
+	 * That is the synchronous behaviour with a thread's overhead on top, and it
+	 * measured exactly that way: a run that was 1.8x faster with the writer
+	 * became 2.4x SLOWER as soon as the file had a budget. */
+	/* Judge a SETTLED file.
+	 *
+	 * With writes in flight the counts describe a file that does not exist yet -
+	 * ranges are reserved and not written, and a stretch dropped before its
+	 * write lands is dead room that was never even filled. Deciding on those
+	 * numbers made a pathological run compact at every opportunity instead of
+	 * every third one, and a compaction copies every live byte.
+	 *
+	 * So a busy writer defers the question to a quieter frame. Not for ever: at
+	 * three times the live set the file is worth compacting whatever is in
+	 * flight, because the promise about its size is a promise. */
+	{
+		const uint64_t dead = m_fileBytes > m_spillLive ? m_fileBytes - m_spillLive : 0;
+		if (m_writeQueued != 0 && dead < m_spillLive * 3) return false;
+		if (m_spillLive != 0 && dead < m_spillLive) return false;
+	}
+
+	const double tCompact0 = nowSeconds();
+	if (historyTrace())
+	{
+		fprintf(stderr, "[history] compaction starts: %llu live of %llu in the file\n",
+			(unsigned long long)m_spillLive, (unsigned long long)m_fileBytes);
+		fflush(stderr);
+	}
+	drainWriter();   /* it reads every live range, and then replaces the file */
+	if (m_spill == nullptr) return false;
+	bool anySpilled = false;
+	for (const Segment &seg : m_segments) anySpilled = anySpilled || seg.spilled;
+	if (m_spillLive == 0 && !anySpilled)
+	{
+		/* Nothing of it is wanted: the cheapest compaction there is. Reopened
+		 * rather than rewound, because the writer appends where the file really
+		 * ends, and a rewound file ends where it always did. */
+		m_settle = Settling{};
+		std::fclose(m_spill);
+		m_spill = nullptr;
+		if (m_spillRead != nullptr) { std::fclose(m_spillRead); m_spillRead = nullptr; }
+		m_spill = std::fopen(m_spillPath.c_str(), "w+b");
+		if (m_spill != nullptr) m_spillRead = std::fopen(m_spillPath.c_str(), "rb");
+		m_spillBytes = 0;
+		m_fileBytes = 0;
+		m_writtenThrough = 0;
+		return m_spill != nullptr && m_spillRead != nullptr;
+	}
+	/* the drain can have landed writes, which changes both counts */
+	if (m_fileBytes <= m_spillLive || m_fileBytes - m_spillLive < m_spillLive) return false;   /* dead half is the smaller half */
+
+	const std::string path = m_spillPath;
+	const std::string tmp = path + ".compacting";
+	std::FILE *out = std::fopen(tmp.c_str(), "w+b");
+	if (out == nullptr) return false;
+
+	/* What each stretch will be once this works - applied only if it does. The
+	 * loop used to move each stretch's offset as it copied it, so a failure half
+	 * way left the first half pointing into a file that was then thrown away. */
+	StateHistory::Bytes buf;
+	uint64_t at = 0, physAt = 0;
+	std::vector<std::pair<uint64_t, uint64_t>> placed;   /* logical, physical */
+	placed.reserve(m_segments.size());
+	std::FILE *const in = m_spillRead != nullptr ? m_spillRead : m_spill;
+	for (Segment &seg : m_segments)
+	{
+		if (!seg.spilled) continue;
+		/* the compressed extent, as it is: a compaction never re-encodes */
+		buf.resize(static_cast<size_t>(seg.physLength));
+		if (!seekTo(in, seg.physAt) || !readAll(in, buf.data(), buf.size())
+			|| !writeAll(out, buf.data(), buf.size()))
+		{
+			std::fclose(out);
+			std::remove(tmp.c_str());
+			return false;
+		}
+		placed.emplace_back(at, physAt);
+		at += seg.spillLength;
+		physAt += seg.physLength;
+	}
+	if (std::fflush(out) != 0)
+	{
+		std::fclose(out);
+		std::remove(tmp.c_str());
+		return false;
+	}
+
+	/* a settle in progress holds a reader on the handle about to close */
+	m_settle = Settling{};
+	std::fclose(m_spill);
+	m_spill = nullptr;
+	if (m_spillRead != nullptr) { std::fclose(m_spillRead); m_spillRead = nullptr; }
+	if (std::rename(tmp.c_str(), path.c_str()) != 0)
+	{
+		/* the old file is still there and still right; reopen it and give up */
+		std::fclose(out);
+		std::remove(tmp.c_str());
+		m_spill = std::fopen(path.c_str(), "r+b");
+		m_spillRead = std::fopen(path.c_str(), "rb");
+		return false;
+	}
+	std::fclose(out);
+	m_spill = std::fopen(path.c_str(), "r+b");
+	m_spillRead = std::fopen(path.c_str(), "rb");
+	if (m_spill == nullptr || m_spillRead == nullptr) return false;
+	{
+		size_t k = 0;
+		for (Segment &seg : m_segments)
+		{
+			if (!seg.spilled) continue;
+			seg.spillAt = placed[k].first;
+			seg.physAt = placed[k].second;
+			k++;
+		}
+	}
+	m_spillBytes = at;
+	m_fileBytes = physAt;
+	m_writtenThrough = at;   /* every live byte was just copied, here, in full */
+	m_costs.compactions++;
+	if (historyTrace())
+	{
+		fprintf(stderr, "[history] compaction done in %.0f ms on this thread\n", (nowSeconds() - tCompact0) * 1000);
+		fflush(stderr);
+	}
+	if (historyTrace())
+	{
+		fprintf(stderr, "[history] compacted the spill file to %llu bytes\n",
+			(unsigned long long)m_spillBytes);
+		fflush(stderr);
+	}
+	return true;
+}
+
+void StateHistory::dropSpillFile()
+{
+	/* Anything in flight is writing to the handle about to be closed. Finishing
+	 * first costs a write nobody wants any more; closing first is a use after
+	 * free on another thread. */
+	drainWriter();
+	/* whatever was being settled was being read from this file */
+	m_settle = Settling{};
+	if (historyTrace() && m_spill != nullptr)
+	{
+		/* what the file really weighs against what the history counted, and
+		 * what the writer was handed against what it wrote - the whole of what
+		 * compressing spilled bodies bought, in one line */
+		uint64_t physical = 0;
+		if (seekEnd(m_spill)) tellAt(m_spill, physical);
+		/* no count of stretches: by the time a history lets its file go, clear()
+		 * has usually emptied the list, and a count of nothing reads as a fact */
+		fprintf(stderr, "[history] spill file at close: %llu bytes on disk for %llu logical,"
+			" live weighing %llu; the writer was handed %llu and wrote %llu\n",
+			(unsigned long long)physical, (unsigned long long)m_spillBytes,
+			(unsigned long long)m_spillLive,
+			(unsigned long long)m_costs.spilledRaw, (unsigned long long)m_costs.spilledPacked);
+		fflush(stderr);
+	}
+	if (m_spillRead != nullptr)
+	{
+		std::fclose(m_spillRead);
+		m_spillRead = nullptr;
+	}
+	if (m_spill != nullptr)
+	{
+		std::fclose(m_spill);
+		m_spill = nullptr;
+		std::remove(m_spillPath.c_str());
+	}
+	m_spillBytes = 0;
+	m_spillLive = 0;
+	m_fileBytes = 0;
+	m_writtenThrough = 0;
+}
+
+void StateHistory::bands(int64_t nearFrames, int64_t midFrames, int64_t midStride,
+	int64_t farStride, int64_t anchorSpacing)
+{
+	if (nearFrames > 0) m_nearFrames = nearFrames;
+	if (midFrames > 0) m_midFrames = midFrames;
+	if (midStride > 0) m_midStride = midStride;
+	if (farStride > 0) m_farStride = farStride;
+	if (anchorSpacing > 0)
+	{
+		m_anchorSpacing = anchorSpacing;
+		m_anchorByBytes = false;
+	}
+	else if (anchorSpacing < 0 && anchorSpacing != INT64_MIN)
+	{
+		m_anchorSpacing = -anchorSpacing;
+		m_anchorByBytes = true;
+	}
+	/* A band cannot be denser than the one nearer the playhead: the landings
+	 * are a grid per band, and a coarser grid inside a finer one would keep
+	 * asking for landings the band before it has already merged away. */
+	if (m_farStride < m_midStride) m_farStride = m_midStride;
+}
+
+/* The anchor spacing, chosen by the machine rather than by a table of cores.
+ *
+ * A restore loads one anchor and walks the links after it, and both cost about
+ * what their bytes cost to put back. So the stretch is closed once walking it
+ * would cost as much as loading its anchor: a seek then costs at most about two
+ * anchor loads, on any core, without anyone measuring that core first. On a
+ * PlayStation 2 - a 221 MB anchor, a few MB a frame - that is an anchor every
+ * sixty-odd frames, where a fixed 600 walked two hundred links for 91 ms and
+ * the measured floor was one anchor load (docs/state-manager.md).
+ *
+ * Two floors, because weight alone is wrong about a light machine. A NES, a
+ * Genesis or a SNES has an anchor so small that thirty frames of four-kilobyte
+ * pages outweigh it - measured: every one of them closed a stretch every
+ * thirty-one frames - and there a seek was already a millisecond, so closing
+ * stretches buys nothing and spends the budget on anchors. So the links must
+ * also weigh m_anchorWalkFloor, a walk of about twenty milliseconds on the
+ * PlayStation 2, before their weight counts. And a stretch spans at least
+ * kAnchorFloor frames, so that a machine whose every frame rewrites most of it
+ * does not become a history of anchors: those cannot be coarsened, only
+ * dropped, and the bands would have nothing to thin.
+ *
+ * Decided from the stretch's own logical bytes, on this thread, so a history
+ * with the helpers and one without close stretches at the same frames. */
+bool StateHistory::hasRoom(const Segment &seg) const
+{
+	static constexpr int64_t kAnchorFloor = 30;
+	const int64_t span = seg.lastFrame() - seg.anchorFrame;
+	if (span >= m_anchorSpacing) return false;
+	if (!m_anchorByBytes || span < kAnchorFloor || seg.spilled) return true;
+	const uint64_t walk = seg.linkBytes();
+	return walk < m_anchorWalkFloor || walk < seg.anchor.size();
+}
+
+bool StateHistory::composeAvailable() const
+{
+	return m_host != nullptr && m_host->wbx_compose_delta != nullptr;
+}
+
+bool StateHistory::deltasAvailable() const
+{
+	return !deltasRefused() && m_host != nullptr && m_host->wbx_epoch_begin != nullptr
+		&& m_host->wbx_save_delta != nullptr && m_host->wbx_load_delta != nullptr;
+}
+
+/* Links land on strictly ascending frames, so both of these are searches
+ * rather than walks - a segment near the playhead is thousands of links long. */
+int64_t StateHistory::Segment::nearestIn(int64_t f) const
+{
+	if (f < anchorFrame) return -1;
+	if (f >= lastFrame()) return lastFrame();
+	const auto it = std::upper_bound(links.begin(), links.end(), f,
+		[](int64_t v, const Link &l) { return v < l.endFrame; });
+	return it == links.begin() ? anchorFrame : (it - 1)->endFrame;
+}
+
+int64_t StateHistory::Segment::stepsTo(int64_t f) const
+{
+	if (f == anchorFrame) return 0;
+	if (f < anchorFrame || f > lastFrame()) return -1;
+	const auto it = std::lower_bound(links.begin(), links.end(), f,
+		[](const Link &l, int64_t v) { return l.endFrame < v; });
+	if (it == links.end() || it->endFrame != f) return -1;
+	return static_cast<int64_t>(it - links.begin()) + 1;
+}
+
+int64_t StateHistory::count() const
+{
+	int64_t n = 0;
+	for (const Segment &s : m_segments) n += 1 + static_cast<int64_t>(s.links.size());
+	return n;
+}
+
+const uint8_t *StateHistory::noteFor(int64_t frame, size_t &lenOut) const
+{
+	lenOut = 0;
+	for (const Segment &seg : m_segments)
+	{
+		if (seg.anchorFrame > frame) break;
+		if (seg.anchorFrame == frame)
+		{
+			lenOut = seg.anchorNote.size();
+			return seg.anchorNote.empty() ? nullptr : seg.anchorNote.data();
+		}
+		const int64_t steps = seg.stepsTo(frame);
+		if (steps <= 0) continue;
+		const Link &l = seg.links[static_cast<size_t>(steps) - 1];
+		lenOut = l.note.size();
+		return l.note.empty() ? nullptr : l.note.data();
+	}
+	return nullptr;
+}
+
+int64_t StateHistory::nearest(int64_t frame) const
+{
+	/* Stretches are ordered and never overlap, so the answer is in the last one
+	 * that starts at or before `frame` - found by searching rather than walking,
+	 * because a greenzone that keeps everything until its budget is full holds
+	 * many more stretches, and the piano roll asks this up to twice a row. */
+	const auto it = std::upper_bound(m_segments.begin(), m_segments.end(), frame,
+		[](int64_t f, const Segment &s) { return f < s.anchorFrame; });
+	if (it == m_segments.begin()) return -1;
+	return (it - 1)->nearestIn(frame);
+}
+
+void StateHistory::beforeAdvance()
+{
+	if (!enabled() || !deltasAvailable()) { m_epochOpen = false; return; }
+	/* A delta continues the newest segment, and only while there is one with
+	 * room. Otherwise the coming capture is an anchor and needs no epoch. */
+	if (m_segments.empty()) { m_epochOpen = false; return; }
+	const Segment &seg = m_segments.back();
+	if (!hasRoom(seg)) { m_epochOpen = false; return; }
+	/* An epoch left open by a frame the near band's stride skipped: it is
+	 * measuring from the last landing and must go on doing so, or what those
+	 * frames did is lost. Opening a new one here would forget it. */
+	if (m_epochOpen) return;
+	/* A delta continues the stretch, so the machine it is measured from has to
+	 * BE the stretch's last frame - the very machine stored there, captured or
+	 * restored a moment ago - and not merely a machine at that frame number.
+	 * Emulating to a stored frame again does not give back the same bytes on
+	 * every core: a GPU core reads its picture back into guest memory, and one
+	 * replayed frame measured 74 to 85 bytes apart on Ruffle. A delta taken
+	 * after such a replay, pushed onto the stored frame, restores as a machine
+	 * that is half one pass and half the other (issue #68: a guest heap musl
+	 * aborted on). So the frame after a replay is an anchor instead. */
+	if (m_machineFrame < 0 || !m_machineStored) return;
+	if (m_segments.back().lastFrame() != m_machineFrame) return;   /* a replay: nothing to measure */
+	WbxReturn r{};
+	m_host->wbx_epoch_begin(m_obj, &r);
+	m_epochOpen = r.ok();
+	m_epochFrame = m_machineFrame;
+}
+
+/* The near band's stride, from what capture is costing against what the run is.
+ *
+ * Moved gently and only every so often: a stride that chases one expensive
+ * frame would thrash, and the thing being measured is noisy by nature - one
+ * frame loads a level, the next draws a menu. */
+/* An anchor is not a delta, and the stride is about deltas.
+ *
+ * Every capture used to go into one exponential mean, anchors included, and an
+ * anchor costs what the MACHINE is where a delta costs what the frame did -
+ * two orders of magnitude apart on anything heavy. Work it through with a
+ * machine at 2 ms a capture on a 10 ms frame and one 121 ms anchor: the mean
+ * goes to about 7.9 ms and the share to 0.49 against a ceiling of 0.15, so the
+ * near band's stride trebles - and then recovers one step per thirty captures,
+ * about ninety frames, by which time the next anchor is a sixth of the way
+ * closer. A significant share of every heavy run was stored sparsely because of
+ * a cost that had nothing to do with the frames being stored.
+ *
+ * Thinning the near band cannot make an anchor cheaper, either: anchors happen
+ * on their own schedule (anchorSpacing), so the lever the tuner has does not
+ * move the cost it was reacting to. So an anchor only resets the clock the next
+ * delta measures against, and says what it cost under the trace. */
+void StateHistory::noteAnchorCost()
+{
+	m_lastCaptureEnded = nowSeconds();
+}
+
+void StateHistory::fixNearStride(int64_t stride)
+{
+	m_strideFixed = stride > 0;
+	if (stride > 0) m_nearStride = stride;
+	m_tuner.stride = m_nearStride;
+}
+
+void StateHistory::bandGoal(int64_t goal)
+{
+	m_bandGoal = goal < 1 ? 1 : goal;
+}
+
+void StateHistory::maxNearStride(int64_t cap)
+{
+	m_tuner.setMaxStride(cap);
+	if (!m_strideFixed && m_nearStride > m_tuner.maxStride) m_nearStride = m_tuner.maxStride;
+}
+
+void StateHistory::tuneStride(double captureSeconds, double wallSeconds)
+{
+	/* CHIMERA_NEAR_STRIDE=n pins the near band's stride, for measuring what a
+	 * stride costs against what it keeps. Not a setting: nothing reads it but
+	 * a person timing runs. */
+	static const long long forced = [] {
+		const char *e = getenv("CHIMERA_NEAR_STRIDE");
+		return e != nullptr ? std::atoll(e) : 0LL;
+	}();
+	if (forced > 0)
+	{
+		m_nearStride = forced;
+		return;
+	}
+	if (m_strideFixed) return;
+	if (wallSeconds <= 0 || captureSeconds < 0) return;
+	const double a = 0.05;   /* the mean follows a couple of hundred frames */
+	m_captureSeconds = m_captureSeconds == 0 ? captureSeconds : m_captureSeconds * (1 - a) + captureSeconds * a;
+	m_wallSeconds = m_wallSeconds == 0 ? wallSeconds : m_wallSeconds * (1 - a) + wallSeconds * a;
+	if (++m_capturesSinceTuned < 30) return;
+	m_capturesSinceTuned = 0;
+	if (m_wallSeconds <= 0) return;
+
+	/* A capture that is quick in absolute terms is never worth thinning for,
+	 * whatever share of the run it is. A machine that costs a millisecond a
+	 * frame and a tenth of that to store is not a machine anybody is waiting
+	 * for, and the near band's promise - every frame, where the work is - is
+	 * worth more than the tenth. Only a capture measured in milliseconds can
+	 * move the stride up - and never past the cap (stride_tuner.h). */
+	const double share = m_captureSeconds / m_wallSeconds;
+	m_tuner.stride = m_nearStride;
+	const int64_t want = m_tuner.decide(m_captureSeconds, m_wallSeconds);
+	if (want == m_nearStride) return;
+	if (historyTrace())
+	{
+		fprintf(stderr, "[history] capture is %.0f%% of the run: the near band keeps"
+			" one frame in %lld rather than one in %lld%s\n",
+			share * 100, (long long)want, (long long)m_nearStride,
+			want == m_tuner.maxStride && want > m_nearStride ? " (the cap)" : "");
+		fflush(stderr);
+	}
+	m_nearStride = want;
+	/* what was measured describes the old stride */
+	m_captureSeconds = 0;
+	m_wallSeconds = 0;
+}
+
+/* A capture allocates - a whole machine for an anchor, a frame's churn for a
+ * delta - and on a machine under pressure that allocation is where Chimera
+ * meets the end of memory first, because the history is the biggest thing it
+ * holds that it does not need.
+ *
+ * So running out is not fatal here: the budget halves, what that frees is given
+ * back, and the capture is tried again. Repeatedly, down to a floor, because
+ * one halving of a budget the machine cannot afford is unlikely to be enough.
+ * A greenzone that has quietly become half as deep is a run that continues; the
+ * alternative is a crash that loses the session.
+ *
+ * The budget is not written back to the settings. What the machine can spare
+ * today is not a decision somebody made, and it should not silently become one.
+ */
+void StateHistory::capture(int64_t frame, const uint8_t *note, size_t noteLen)
+{
+	if (m_machineFrame < 0 && m_editWhileUnknown >= 0)
+	{
+		/* an edit came while a load had left the machine's frame unknown: the
+		 * machine was on frame - 1 then, and past the edit if that is after it */
+		if (frame - 1 > m_editWhileUnknown && (m_pastEditAt < 0 || m_editWhileUnknown < m_pastEditAt))
+		{
+			m_pastEditAt = m_editWhileUnknown;
+		}
+		m_editWhileUnknown = -1;
+	}
+	/* whether or not anything is stored, this is where the machine now stands -
+	 * and it is the stored copy of that frame only if this capture stores it */
+	m_machineFrame = frame;
+	m_machineStored = false;
+	for (;;)
+	{
+		try
+		{
+			captureOnce(frame, note, noteLen);
+			/* The disk budget is met on what has LANDED: a stretch costs the
+			 * disk when the writer reports it, which can be any capture after
+			 * it was spilled. So once a frame, whatever that frame did, what
+			 * has been reported is held to the budget. Between here and the
+			 * next frame the file may run ahead of it by what is still being
+			 * written, which the writer's queue bounds. */
+			applyWrites();
+			evictDisk();
+			return;
+		}
+		catch (const std::bad_alloc &)
+		{
+			/* Already as small as a history gets: the frame is simply not
+			 * stored, which costs replaying to reach it and nothing else. */
+			if (!halveBudget()) return;
+		}
+	}
+}
+
+/* Halves what the history may hold and gives back what that frees. False when
+ * it is already at the floor - below which it could not hold one anchor, and
+ * would be spending allocations to store nothing. */
+bool StateHistory::halveBudget()
+{
+	if (m_budget <= kSmallestBudget) return false;
+	const uint64_t was = m_budget;
+	m_budget = m_budget / 2 < kSmallestBudget ? kSmallestBudget : m_budget / 2;
+	fprintf(stderr, "[history] out of memory with %llu bytes held: the budget goes from"
+		" %llu to %llu and the oldest of the run is given up\n",
+		(unsigned long long)m_bytes, (unsigned long long)was, (unsigned long long)m_budget);
+	fflush(stderr);
+	evict();
+	evictDisk();
+	return true;
+}
+
+bool StateHistory::planAvailable() const
+{
+	return m_host != nullptr && m_host->wbx_state_size != nullptr
+		&& m_host->wbx_state_plan != nullptr && m_host->wbx_state_fill != nullptr
+		&& m_host->wbx_state_finish != nullptr && m_host->wbx_state_pages != nullptr
+		&& m_drainer.threaded();
+}
+
+/* An anchor, taken as a plan: the sandbox holds the pages, the drainer copies
+ * them, and this thread pays the walk and the holds.
+ *
+ * The segment is pushed with its buffer ALREADY the right size and already the
+ * history's, because everything except the page bytes is written by the plan -
+ * so the history's accounting, its bands and its budget see exactly what they
+ * would have seen, at exactly the moment they would have seen it. What arrives
+ * late is only the contents, and nothing may read those without finishPlan. */
+bool StateHistory::captureAnchorPlanned(int64_t frame, std::vector<uint8_t> &carried)
+{
+	if (!planAvailable()) return false;
+	const double t0 = historyTrace() ? nowSeconds() : 0.0;
+
+	WbxReturn r{};
+	m_host->wbx_state_size(m_obj, &r);
+	if (!r.ok() || r.data <= 0) return false;
+	const size_t size = static_cast<size_t>(r.data);
+
+	Bytes bytes;
+	try { bytes.resize(size); }
+	catch (const std::bad_alloc &) { return false; }
+	const double tAlloc = historyTrace() ? nowSeconds() : 0.0;
+
+	m_host->wbx_state_plan(m_obj, bytes.data(), static_cast<uint64_t>(size), &r);
+	if (!r.ok()) return false;
+	/* The buffer is not zeroed (Bytes), so the state must fill it exactly: a
+	 * plan that came out smaller than the size it was asked for would leave
+	 * whatever the allocator handed us at the end of an anchor. It cannot
+	 * happen - nothing runs between the two calls - and it is checked anyway,
+	 * because the failure would be uninitialised memory inside a savestate. */
+	if (static_cast<size_t>(r.data) != size)
+	{
+		WbxReturn fr{};
+		m_host->wbx_state_finish(m_obj, &fr);
+		return false;
+	}
+	const double tPlanned = historyTrace() ? nowSeconds() : 0.0;
+
+	uint64_t pages = 0;
+	m_host->wbx_state_pages(m_obj, &r);
+	if (r.ok() && r.data > 0) pages = static_cast<uint64_t>(r.data);
+
+	m_lastAnchorBytes = size;
+	Segment seg;
+	seg.anchorFrame = frame;
+	seg.bytes = size;
+	seg.anchor = Body::make(std::move(bytes));
+	seg.anchorNote = std::move(carried);
+	m_bytes += seg.bytes;
+	m_segments.push_back(std::move(seg));
+	/* the stretch before this one has closed: what the packer made of the one
+	 * before THAT is taken, and this one goes to it */
+	finishPacking();
+	if (m_segments.size() >= 2) packSegmentLater(m_segments.size() - 2);
+
+	m_planPending = true;
+	m_planFrame = frame;
+	if (pages != 0)
+	{
+		void *const obj = m_obj;
+		const HostApi *const host = m_host;
+		m_fillMicros.store(-1);
+		m_drainer.post([this, host, obj, pages]() {
+			const double tFill = nowSeconds();
+			WbxReturn fr{};
+			host->wbx_state_fill(obj, 0, pages, &fr);
+			m_fillMicros.store(static_cast<int64_t>((nowSeconds() - tFill) * 1e6));
+		});
+	}
+	if (historyTrace())
+	{
+		fprintf(stderr, "[history] frame %lld: ANCHOR %llu bytes planned, %llu pages to fill,"
+			" %.1f ms here (buffer %.1f, plan %.1f)\n",
+			(long long)frame, (unsigned long long)size, (unsigned long long)pages,
+			(nowSeconds() - t0) * 1000, (tAlloc - t0) * 1000, (tPlanned - tAlloc) * 1000);
+		fflush(stderr);
+	}
+	return true;
+}
+
+void StateHistory::beforeLoad()
+{
+	finishPlan();
+	m_epochOpen = false;
+	m_machineFrame = -1;
+	m_machineStored = false;
+	/* whatever is loaded, the caller put it there on purpose: a branch is the
+	 * new timeline's machine, not the old one's */
+	m_pastEditAt = -1;
+	m_editWhileUnknown = -1;
+}
+
+/* CHIMERA_HISTORY_VERIFY=1: the whole machine is hashed as each frame is stored,
+ * and again after each restore, and the two are compared. A history that hands
+ * back a machine that never existed then says so AT the restore that built it,
+ * with the stretch and the chain - instead of a guest heap failing some frames
+ * later, in code that had nothing to do with it. Merges and spills are covered
+ * too: a frame keeps its digest whatever happens to the links that reach it.
+ *
+ * It costs a whole save per stored frame and per restore, and it finishes each
+ * planned anchor at once, so it is a diagnostic and nothing else. */
+namespace
+{
+/* The machine a state describes, ignoring what the state only KEEPS about it.
+ *
+ * A whole state is the status map, the dirty map and every dirty page (miniBox
+ * host.c and memblock.c). "Dirty" is bookkeeping - which pages differ from the
+ * sealed baseline and so must be carried - and two copies of one machine can
+ * disagree about it: a delta restore marks every page it writes dirty, where
+ * the machine it was taken from had un-dirtied a page it zeroed. So this hashes
+ * the status map, the program break, the thread set and the non-zero dirty
+ * pages by index, and skips zero pages (a zero page is the baseline of nearly
+ * all of them). It also counts FREE pages that hold anything but zeros, which
+ * no correct machine has. Invisible pages are dirty and never written into a
+ * state, and nothing in the state says which they are, so the host is asked.
+ * False when the bytes are not that layout. */
+bool canonicalDigest(const uint8_t *s, size_t n, const std::vector<uint8_t> &invisible,
+	uint64_t &out, size_t &freeNonZero)
+{
+	static const char hostStart[] = "ActivatedWaterboxHost_v1";
+	static const char blockMagic[] = "ActivatedMemoryBlock";
+	const size_t brkAt = (sizeof hostStart - 1) + 10 + 13;
+	const size_t head = brkAt + sizeof(uintptr_t) + 9 + 32;
+	const size_t maps = head + (sizeof blockMagic - 1) + 32 + 2 * sizeof(uintptr_t);
+	if (n < maps || std::memcmp(s, hostStart, sizeof hostStart - 1) != 0
+		|| std::memcmp(s + head, blockMagic, sizeof blockMagic - 1) != 0) return false;
+	uintptr_t size = 0;
+	std::memcpy(&size, s + maps - sizeof(uintptr_t), sizeof(uintptr_t));
+	const size_t npages = static_cast<size_t>(size >> 12);
+	if (maps + 2 * npages > n) return false;
+	const std::hash<std::string_view> hash;
+	auto view = [&](size_t at, size_t len) { return std::string_view(reinterpret_cast<const char *>(s) + at, len); };
+	const uint8_t *const status = s + maps;
+	const uint8_t *const dirty = s + maps + npages;
+	uint64_t h = hash(view(maps, npages)) ^ (hash(view(brkAt, sizeof(uintptr_t))) * 0x9e3779b97f4a7c15ull);
+	size_t at = maps + 2 * npages;
+	freeNonZero = 0;
+	for (size_t i = 0; i < npages; i++)
+	{
+		if (!dirty[i]) continue;
+		if (i < invisible.size() && invisible[i]) continue;
+		if (at + 4096 > n) return false;
+		const uint8_t *const page = s + at;
+		at += 4096;
+		bool zero = true;
+		for (size_t k = 0; k < 4096; k++) if (page[k] != 0) { zero = false; break; }
+		if (zero) continue;
+		if (status[i] == 0) { freeNonZero++; continue; }
+		h = (h * 1099511628211ull) ^ (hash(view(at - 4096, 4096)) + i);
+	}
+	out = (h * 1099511628211ull) ^ hash(view(at, n - at));   /* the thread set and the end */
+	return true;
+}
+
+/* how many blocks differ, and the offsets of the first few */
+std::string describeDifference(const std::vector<uint64_t> &a, const std::vector<uint64_t> &b, size_t &count)
+{
+	count = 0;
+	std::string where;
+	if (a.empty() || b.empty() || a[0] != b[0]) where = " (sizes differ)";
+	const size_t n = a.size() < b.size() ? a.size() : b.size();
+	for (size_t i = 1; i < n; i++)
+	{
+		if (a[i] == b[i]) continue;
+		if (++count <= 4)
+		{
+			char at[32];
+			std::snprintf(at, sizeof at, " 0x%llx", (unsigned long long)((i - 1) * 4096));
+			where += at;
+		}
+	}
+	return where;
+}
+} // namespace
+
+StateHistory::MachineDigest StateHistory::machineDigest(bool &ok)
+{
+	/* one hash per 4 KB of the state, so a mismatch can say where */
+	ok = false;
+	MachineDigest d;
+	if (m_host == nullptr || m_host->wbx_save_state == nullptr) return d;
+	finishPlan();
+	Bytes bytes;
+	if (m_lastAnchorBytes != 0) bytes.reserve(m_lastAnchorBytes);
+	ByteSink sink{ &bytes };
+	WbxReturn r{};
+	m_host->wbx_save_state(m_obj, sinkWrite, reinterpret_cast<uintptr_t>(&sink), &r);
+	if (!r.ok()) return d;
+	ok = true;
+	static constexpr size_t kBlock = 4096;
+	d.blocks.reserve(bytes.size() / kBlock + 2);
+	d.blocks.push_back(bytes.size());
+	for (size_t at = 0; at < bytes.size(); at += kBlock)
+	{
+		const size_t n = bytes.size() - at < kBlock ? bytes.size() - at : kBlock;
+		d.blocks.push_back(std::hash<std::string_view>{}(
+			std::string_view(reinterpret_cast<const char *>(bytes.data()) + at, n)));
+	}
+	if (m_verifyInvisible.empty() && m_host->wbx_get_page_len != nullptr && m_host->wbx_get_page_data != nullptr)
+	{
+		/* fixed at the seal, so asked once */
+		WbxReturn pr{};
+		m_host->wbx_get_page_len(m_obj, &pr);
+		const size_t pages = pr.ok() ? static_cast<size_t>(pr.data) : 0;
+		m_verifyInvisible.assign(pages, 0);
+		for (size_t i = 0; i < pages; i++)
+		{
+			WbxReturn qr{};
+			m_host->wbx_get_page_data(m_obj, i, &qr);
+			if (qr.ok() && (qr.data & 0x40) != 0) m_verifyInvisible[i] = 1;
+		}
+	}
+	d.canonicalOk = !m_verifyInvisible.empty()
+		&& canonicalDigest(bytes.data(), bytes.size(), m_verifyInvisible, d.canonical, d.freeNonZero);
+	return d;
+}
+
+void StateHistory::verifyStored(int64_t frame)
+{
+	bool ok = false;
+	MachineDigest digest = machineDigest(ok);
+	if (ok) m_verify[frame] = std::move(digest);
+	else m_verify.erase(frame);
+}
+
+void StateHistory::verifyRestored(int64_t frame, int64_t anchorFrame, int64_t steps, bool spilled)
+{
+	const auto it = m_verify.find(frame);
+	if (it == m_verify.end()) return;
+	bool ok = false;
+	const MachineDigest digest = machineDigest(ok);
+	if (!ok) return;
+	m_verifyChecked++;
+	const MachineDigest &stored = it->second;
+	if (digest.blocks != stored.blocks)
+	{
+		const bool sameMachine = digest.canonicalOk && stored.canonicalOk && digest.canonical == stored.canonical;
+		if (sameMachine) m_verifyBookkeeping++;
+		else m_verifyWrong++;
+		size_t count = 0;
+		const std::string where = describeDifference(stored.blocks, digest.blocks, count);
+		fprintf(stderr, "[history-verify] restore %lld (anchor %lld + %lld deltas%s): %s;"
+			" %zu of %zu blocks differ, at%s; free pages holding bytes: stored %zu, restored %zu"
+			" (%llu wrong, %llu bookkeeping only, of %llu checked)\n",
+			(long long)frame, (long long)anchorFrame, (long long)steps, spilled ? ", from disk" : "",
+			!digest.canonicalOk || !stored.canonicalOk ? "the layout could not be read"
+				: sameMachine ? "the same machine, only the dirty bookkeeping differs"
+				: "is NOT the machine stored there",
+			count, digest.blocks.size() - 1, where.c_str(), stored.freeNonZero, digest.freeNonZero,
+			(unsigned long long)m_verifyWrong, (unsigned long long)m_verifyBookkeeping,
+			(unsigned long long)m_verifyChecked);
+		fflush(stderr);
+	}
+	else if (m_verifyChecked == 1 || m_verifyChecked % 100 == 0)
+	{
+		fprintf(stderr, "[history-verify] %llu restores checked, %llu wrong, %llu bookkeeping only\n",
+			(unsigned long long)m_verifyChecked, (unsigned long long)m_verifyWrong,
+			(unsigned long long)m_verifyBookkeeping);
+		fflush(stderr);
+	}
+}
+
+void StateHistory::finishPlan()
+{
+	if (!m_planPending) return;
+	/* the drainer first, always: it is reading the machine's pages, and
+	 * everything after this may take them away */
+	const double tWait = historyTrace() ? nowSeconds() : 0.0;
+	const bool stillFilling = historyTrace() && m_fillMicros.load() < 0;
+	m_drainer.drain();
+	if (historyTrace())
+	{
+		/* what a second drainer could buy: nothing, unless this thread waited */
+		fprintf(stderr, "[history] plan of frame %lld: filled in %.1f ms on the drainer; this thread %s %.2f ms\n",
+			(long long)m_planFrame, m_fillMicros.load() / 1000.0,
+			stillFilling ? "WAITED" : "waited", (nowSeconds() - tWait) * 1000);
+		fflush(stderr);
+	}
+	m_planPending = false;
+	m_planFrame = -1;
+	if (m_host == nullptr || m_host->wbx_state_finish == nullptr) return;
+	WbxReturn r{};
+	m_host->wbx_state_finish(m_obj, &r);
+	if (!r.ok() && historyTrace())
+	{
+		fprintf(stderr, "[history] the planned anchor would not finish: %s\n", r.errorMessage);
+		fflush(stderr);
+	}
+}
+
+void StateHistory::captureOnce(int64_t frame, const uint8_t *note, size_t noteLen)
+{
+	std::vector<uint8_t> carried(note, note + (note != nullptr ? noteLen : 0));
+	if (!enabled()) return;
+	/* what the writer has reported since the last frame, applied here, on the
+	 * one thread that is allowed to change anything */
+	applyWrites();
+	/* An anchor still being filled is NOT finished here. It used to be, on every
+	 * capture, and on a PlayStation 2 that made the frame after each anchor wait
+	 * 103 to 145 ms for the drainer - most of what planning the anchor had taken
+	 * off this thread, handed back one frame later. A delta does not read the
+	 * anchor, and the sandbox serves an epoch and a plan on the same pages (its
+	 * test_an_epoch_across_a_plan), so the fill goes on while frames are captured.
+	 * What does need the bytes waits for them itself: the next anchor, a
+	 * restore, a spill or a drop of THAT stretch, a save, a clear. */
+	/* A frame the history already reaches past is a REPLAY, and a replay changes
+	 * nothing (user-decided, 2026-09-13). It used to be taken as a re-record:
+	 * everything after it was dropped before it was stored, so going back and
+	 * playing forward over the same input threw the greenzone ahead away, and
+	 * the way back to the end was emulated frame by frame - 3000 frames in 99 s
+	 * on nss102. What changes the timeline says so itself, with invalidateAfter:
+	 * every TAStudio edit, recording over an entry, input that is not the
+	 * movie's. So nothing is stored and nothing is dropped, and the epoch is let
+	 * go. A replay that goes on past the stretch's end starts an anchor there
+	 * rather than a delta: see beforeAdvance. */
+	/* A machine that was already past an edit when it was made (issue #68) is
+	 * playing the timeline the edit replaced, and nothing it reaches belongs
+	 * in the history - until a restore or a load puts it back at or before the
+	 * edit, which is the only way a frame this low can arrive. */
+	if (m_pastEditAt >= 0)
+	{
+		if (frame > m_pastEditAt + 1) { m_epochOpen = false; return; }
+		m_pastEditAt = -1;
+	}
+	if (!m_segments.empty() && frame <= m_segments.back().lastFrame())
+	{
+		m_epochOpen = false;
+		return;
+	}
+	m_newest = frame;
+
+	Bytes bytes;
+	ByteSink sink{ &bytes };
+	WbxReturn r{};
+
+	/* Never onto a spilled stretch. An edit far enough back truncates one that
+	 * is on disk, and a delta pushed onto it would sit in memory while every
+	 * restore reads the file - where the old timeline's links still are at
+	 * those positions. The frames after the edit would come back as the
+	 * frames before it. A fresh anchor starts a stretch of its own instead. */
+	/* A frame the near band's stride skips is not stored at all: the epoch
+	 * stays open and the next delta describes this frame along with it. The
+	 * invalidation above has already happened, which is what matters - a
+	 * timeline that no longer happens must go whether or not this frame is
+	 * kept. */
+	if (m_epochOpen && m_nearStride > 1 && !m_segments.empty()
+		&& !m_segments.back().spilled
+		&& m_epochFrame == m_segments.back().lastFrame()
+		&& m_segments.back().lastFrame() < frame
+		&& frame - m_segments.back().lastFrame() < m_nearStride
+		&& hasRoom(m_segments.back()))
+	{
+		m_newest = frame;
+		return;
+	}
+
+	const double tCapture0 = nowSeconds();
+
+	/* Room for the delta before it is written, not while.
+	 *
+	 * The sink appends each page as the sandbox hands it over, and a vector
+	 * that grows by doubling copies everything it already holds each time it
+	 * does - so a twenty megabyte delta was written once and copied about as
+	 * much again, in pieces, on the way. The sandbox knows how many pages the
+	 * frame touched before any of them are read, so the room is asked for
+	 * once: an index and a page each, and a little for the header and the
+	 * status list. Asking for slightly too much costs a moment's memory;
+	 * asking for nothing cost a second copy of every delta. */
+	if (m_epochOpen && m_host->wbx_get_epoch_page_count != nullptr)
+	{
+		WbxReturn pr{};
+		m_host->wbx_get_epoch_page_count(m_obj, &pr);
+		if (pr.ok())
+		{
+			const uint64_t pages = static_cast<uint64_t>(pr.data);
+			if (pages > 0 && pages < (1ull << 32)) bytes.reserve(pages * (4096 + 8) + 4096);
+		}
+	}
+
+	/* A delta is what changed since its epoch was marked, so it continues the
+	 * stretch only if it was marked ON the stretch's last frame. Pushed after
+	 * any other it describes a machine that never existed - which is what
+	 * issue #68 was: an epoch marked past an edit, pushed after the frame the
+	 * edit cut the stretch back to, and a heap the guest aborted on later. */
+	const bool wantDelta = m_epochOpen
+		&& !m_segments.empty()
+		&& !m_segments.back().spilled
+		&& m_epochFrame == m_segments.back().lastFrame()
+		&& m_segments.back().lastFrame() < frame
+		&& hasRoom(m_segments.back());
+	m_epochOpen = false;
+
+	if (wantDelta)
+	{
+		m_host->wbx_save_delta(m_obj, true, sinkWrite, reinterpret_cast<uintptr_t>(&sink), &r);
+		const double tSaved = historyTrace() ? nowSeconds() : 0.0;
+		if (r.ok())
+		{
+			const uint64_t added = bytes.size();
+			/* the push first, the arithmetic after: an allocation that throws
+			 * between them leaves a count describing bytes nobody holds */
+			m_segments.back().links.push_back(Link{ Body::make(std::move(bytes)), frame, std::move(carried) });
+			m_segments.back().bytes += added;
+			m_bytes += added;
+			m_machineStored = true;
+			if (historyVerify()) verifyStored(frame);
+			const size_t links = m_segments.back().links.size();
+			coarsen(frame);
+			const double tCoarsened = historyTrace() ? nowSeconds() : 0.0;
+			evict();
+			const double now = nowSeconds();
+			if (historyTrace())
+			{
+				/* where a captured frame's time goes: the sandbox copying the
+				 * frame's pages out, merging landings the playhead has left,
+				 * and the budget */
+				fprintf(stderr, "[history] frame %lld: delta %llu bytes (segment %zu links, %llu total)"
+					" - save %.2f ms, coarsen %.2f, evict %.2f\n",
+					(long long)frame, (unsigned long long)added, links, (unsigned long long)m_bytes,
+					(tSaved - tCapture0) * 1000, (tCoarsened - tSaved) * 1000, (now - tCoarsened) * 1000);
+				fflush(stderr);
+			}
+			tuneStride(now - tCapture0, m_lastCaptureEnded > 0 ? now - m_lastCaptureEnded : 0);
+			m_lastCaptureEnded = now;
+			return;
+		}
+		bytes.clear();   /* fall through to a whole state rather than lose the frame */
+	}
+
+	/* The same for a whole machine: an anchor is the same size every time it is
+	 * taken, so the one before it is the measure. */
+	/* Planned if this host can: the pages are held and filled on the drainer,
+	 * and what is paid here is the walk. Falls through to writing it in line
+	 * when it cannot - an older host, no helper thread, or no room. */
+	/* one plan at a time: the anchor before this one is finished first */
+	finishPlan();
+	if (captureAnchorPlanned(frame, carried))
+	{
+		m_machineStored = true;
+		if (historyVerify()) verifyStored(frame);
+		coarsen(frame);
+		evict();
+		evictDisk();
+		/* An anchor does not feed the stride: see noteAnchorCost. */
+		noteAnchorCost();
+		return;
+	}
+
+	if (m_lastAnchorBytes != 0) bytes.reserve(m_lastAnchorBytes + (m_lastAnchorBytes >> 4));
+	m_host->wbx_save_state(m_obj, sinkWrite, reinterpret_cast<uintptr_t>(&sink), &r);
+	if (!r.ok()) return;   /* a missed capture only costs a longer replay later */
+	m_lastAnchorBytes = bytes.size();
+	const double anchorMs = historyTrace() ? (nowSeconds() - tCapture0) * 1000 : 0.0;
+	Segment seg;
+	seg.anchorFrame = frame;
+	seg.bytes = bytes.size();
+	seg.anchor = Body::make(std::move(bytes));
+	seg.anchorNote = std::move(carried);
+	m_bytes += seg.bytes;
+	if (historyTrace())
+	{
+		fprintf(stderr, "[history] frame %lld: ANCHOR %llu bytes (%llu total), %.1f ms here%s\n",
+			(long long)frame, (unsigned long long)seg.bytes, (unsigned long long)m_bytes, anchorMs,
+			deltasAvailable() ? "" : " - this host has no epochs, every frame is an anchor");
+		fflush(stderr);
+	}
+	m_segments.push_back(std::move(seg));
+	finishPacking();
+	if (m_segments.size() >= 2) packSegmentLater(m_segments.size() - 2);
+	m_machineStored = true;
+	if (historyVerify()) verifyStored(frame);
+	coarsen(frame);
+	evict();
+	evictDisk();
+	noteAnchorCost();
+}
+
+/* Drops one stretch and gives back whatever it was holding - memory, room in
+ * the spill file, or neither. Every erase goes through this: the accounting bug
+ * that wrapped the budget past zero was one erase that did its own arithmetic. */
+void StateHistory::forgetSegment(size_t index)
+{
+	/* the drainer writes into this stretch's anchor until the plan finishes, so
+	 * letting it go first would free the buffer under it */
+	if (m_planPending && m_segments[index].anchorFrame == m_planFrame) finishPlan();
+	Segment &seg = m_segments[index];
+	releaseBytes(seg.memoryBytes(), "forget");
+	/* nobody will ever read this stretch again, so a write still waiting to
+	 * happen should not happen */
+	if (seg.writeWanted) seg.writeWanted->store(false);
+	if (seg.spilled)
+	{
+		/* what it really weighed - nothing, if its write had not reported yet */
+		if (seg.physLength > m_spillLive) m_spillLive = 0;
+		else m_spillLive -= seg.physLength;
+	}
+	m_segments.erase(m_segments.begin() + static_cast<std::ptrdiff_t>(index));
+}
+
+void StateHistory::releaseBytes(uint64_t n, const char *where)
+{
+	if (n > m_bytes)
+	{
+		fprintf(stderr, "[history] %s gave back %llu bytes of the %llu held; "
+			"the count was wrong before this\n", where,
+			(unsigned long long)n, (unsigned long long)m_bytes);
+		fflush(stderr);
+		m_bytes = 0;
+		return;
+	}
+	m_bytes -= n;
+}
+
+void StateHistory::invalidateAfter(int64_t frame)
+{
+	/* the stretch being filled may be one of the ones about to go */
+	if (m_planPending && m_planFrame > frame) finishPlan();
+	/* The machine itself past the edit: what it plays from here is the old
+	 * timeline, until a restore or a load puts it at or before the edit. Its
+	 * epoch was marked beyond the cut, so that goes too. */
+	if (m_machineFrame > frame)
+	{
+		if (m_pastEditAt < 0 || frame < m_pastEditAt) m_pastEditAt = frame;
+		m_epochOpen = false;
+		m_machineStored = false;
+	}
+	else if (m_machineFrame < 0 && (m_editWhileUnknown < 0 || frame < m_editWhileUnknown))
+	{
+		m_editWhileUnknown = frame;
+	}
+	if (historyVerify())
+	{
+		for (auto it = m_verify.begin(); it != m_verify.end();)
+		{
+			if (it->first > frame) it = m_verify.erase(it);
+			else ++it;
+		}
+	}
+	while (!m_segments.empty() && m_segments.back().anchorFrame > frame)
+	{
+		forgetSegment(m_segments.size() - 1);
+	}
+	if (m_segments.empty()) return;
+	Segment &s = m_segments.back();
+	while (s.lastFrame() > frame && !s.links.empty())
+	{
+		/* A spilled segment's links hold nothing here and its `bytes` describes
+		 * the file, so there is nothing to give back and nothing to correct.
+		 * What it can still answer shrinks, which is the point. */
+		if (!s.spilled)
+		{
+			const uint64_t n = s.links.back().bytes.held();
+			s.bytes -= n;
+			releaseBytes(n, "invalidateAfter");
+		}
+		s.links.pop_back();
+	}
+}
+
+/* ---- the bands ----
+ *
+ * A landing survives in a band if it sits on that band's grid - the multiples
+ * of its stride. Everything else is composed into the landing after it, which
+ * is a merge of two stored deltas and needs no machine.
+ *
+ * Only the landings that have just crossed a boundary are looked at, so this is
+ * a couple of merges a frame rather than a sweep. The grid rule is what makes
+ * that safe: it does not matter when a landing is examined or in what order,
+ * because whether it survives depends only on where it lands.
+ */
+void StateHistory::pin(int64_t frame, bool isPinned)
+{
+	if (isPinned) m_pinned.insert(frame);
+	else m_pinned.erase(frame);
+}
+
+bool StateHistory::pinned(int64_t frame) const
+{
+	return m_pinned.count(frame) != 0;
+}
+
+void StateHistory::unpinAll()
+{
+	m_pinned.clear();
+}
+
+
+void StateHistory::coarsen(int64_t newestFrame)
+{
+	if (!composeAvailable()) return;   /* an older host: keep every link */
+	/* Nothing in memory is thinned by distance. It used to be: every frame kept
+	 * for 120, one in 3 for 1800 behind that, one in 1200 beyond - whatever the
+	 * budget - so a 16 GB greenzone sat at 3 GB while a jump 2000 frames back
+	 * replayed up to 1200 of them (user-reported on nss, 2026-09-15). A
+	 * greenzone now keeps every frame it captured until its budget is full,
+	 * and evict() thins it then. What is on disk still settles to the far band. */
+	settleSpilled(newestFrame - m_nearFrames - m_midFrames);
+}
+
+bool StateHistory::composePair(const Link &a, const Link &b, uint64_t anchorLen, Bytes &merged, bool capped)
+{
+	/* A merge reads both links and writes their union, so it costs their
+	 * combined size - and coarsening merges into a neighbour that KEEPS the
+	 * span, so that neighbour accumulates and every later merge re-reads
+	 * all of it. Collapsing four hundred landings that way cost four and a
+	 * half seconds of pure composition on a machine whose frames overlap
+	 * ninety per cent, and thirteen seconds at seventy; measured per frame,
+	 * ten to thirty milliseconds spent reclaiming a few per cent.
+	 *
+	 * So a merge is capped at what fits in about a millisecond of memory
+	 * bandwidth. It costs almost nothing: the merges it refuses are the
+	 * handful of biggest ones, which are exactly the ones where the union
+	 * is closest to the sum and least is reclaimed - a tenth of a per cent
+	 * of the work buys back four to fourteen per cent of the memory.
+	 * Leaving the landing in place only makes the band denser than asked,
+	 * which is safe; the budget is what answers for the memory.
+	 *
+	 * The anchor is the outer bound on the same thought: a composed link
+	 * that already costs what a whole machine costs is not worth composing
+	 * further, because the band would be better served by the anchor it is
+	 * walking from. */
+	static constexpr uint64_t kMergeCap = 8u << 20;
+	const uint64_t together = a.bytes.size() + b.bytes.size();
+	/* Both caps were about thinning by DISTANCE, a little every frame whatever
+	 * the budget. Meeting the budget is another matter: a frame in the middle of
+	 * a stretch can only go by composition, and a merge always gives memory back
+	 * (the union is at most both), so a greenzone over its budget that refused
+	 * them would simply stay over it - measured: a single stretch held 1478 bytes
+	 * against a budget of 821. thinOne passes capped=false and bounds its own
+	 * spend per call instead. */
+	if (capped && together > kMergeCap) return false;
+	if (capped && anchorLen != 0 && together > anchorLen) return false;
+
+	merged.clear();
+	/* a packed input is decoded whole for the merge: it is at most megabytes,
+	 * and a merge reads its inputs at random */
+	Bytes ua, ub;
+	const uint8_t *pa = a.bytes.data(), *pb = b.bytes.data();
+	if (a.bytes.packed)
+	{
+		if (!unpackBody(a.bytes, ua)) return false;
+		pa = ua.data();
+	}
+	if (b.bytes.packed)
+	{
+		if (!unpackBody(b.bytes, ub)) return false;
+		pb = ub.data();
+	}
+	/* The merge of two sorted lists is at most both of them, and asking for
+	 * that up front is one allocation instead of a dozen doublings with a
+	 * copy each - on a delta of megabytes that is most of the write. */
+	merged.reserve(a.bytes.size() + b.bytes.size());
+	ByteSink sink{ &merged };
+	WbxReturn r{};
+	if (m_host->wbx_compose_delta_mem != nullptr)
+	{
+		/* Both are already contiguous here, so the host has no reason to
+		 * copy them into buffers of its own to look at them. */
+		m_host->wbx_compose_delta_mem(pa, a.bytes.size(), pb, b.bytes.size(),
+			sinkWrite, reinterpret_cast<uintptr_t>(&sink), &r);
+	}
+	else
+	{
+		ByteSource sa{ pa, a.bytes.size(), 0 };
+		ByteSource sb{ pb, b.bytes.size(), 0 };
+		m_host->wbx_compose_delta(sourceRead, reinterpret_cast<uintptr_t>(&sa),
+			sourceRead, reinterpret_cast<uintptr_t>(&sb),
+			sinkWrite, reinterpret_cast<uintptr_t>(&sink), &r);
+	}
+	return r.ok();   /* a merge that will not happen costs memory, nothing else */
+}
+
+bool StateHistory::composeInto(Segment &seg, size_t i, bool capped)
+{
+	/* composePair reads the anchor's LENGTH, which is fixed when the anchor is
+	 * planned, and a merge reads link bodies, which the drainer never touches -
+	 * so this does not wait for a fill */
+	if (i + 1 >= seg.links.size()) return false;   /* the last link has nothing to merge into */
+	Link &a = seg.links[i];
+	Link &b = seg.links[i + 1];
+	Bytes merged;
+	if (!composePair(a, b, seg.anchor.size(), merged, capped)) return false;
+
+	const uint64_t was = a.bytes.held() + b.bytes.held();
+	const uint64_t wasRaw = a.bytes.size() + b.bytes.size();
+	/* a merge in a packed stretch stays packed: the result is small (a merge
+	 * gives memory back, and thinning bounds what it spends), so packing it
+	 * here costs a few milliseconds and keeps the stretch's cost what it was */
+	Body result = Body::make(std::move(merged));
+	if (a.bytes.packed || b.bytes.packed) result = packBody(result);
+	seg.bytes -= was;
+	releaseBytes(was, "tidy");
+	seg.bytes += result.held();
+	m_bytes += result.held();
+	if (historyTrace())
+	{
+		fprintf(stderr, "[history] merged the landing at %lld into %lld: %llu -> %zu bytes%s\n",
+			(long long)a.endFrame, (long long)b.endFrame, (unsigned long long)wasRaw, result.size(),
+			result.packed ? " (packed)" : "");
+		fflush(stderr);
+	}
+	b.bytes = std::move(result);
+	seg.links.erase(seg.links.begin() + static_cast<std::ptrdiff_t>(i));
+	return true;
+}
+
+/* ---- settling what was spilled too early ----
+ *
+ * The bands were once kept by tidy(), which composed a landing into its neighbour as
+ * the playhead moves away from it - and skips a spilled stretch, whose bytes
+ * are on disk. So a stretch spilled out of the near or mid band, which a budget
+ * smaller than those bands does every time, kept every frame's delta on disk
+ * for good: six thousand Game Boy frames under a 64MB budget put 1567MB in the
+ * file. Once the far boundary has passed such a stretch its links are read
+ * back one at a time and composed down to the far grid - the same merge, under
+ * the same caps - and what is left is appended to the file; what it was
+ * becomes dead room and the compaction takes it back. A stretch already on the
+ * far grid when it was spilled is marked settled then and never read.
+ *
+ * Streamed on purpose. A stretch spilled under a small budget is one that did
+ * not fit in memory, so reading it back whole would be the very thing the
+ * budget forbids; what is held is one accumulating link, one just read, and
+ * the settled result, which is far-band sized.
+ */
+void StateHistory::settleSpilled(int64_t farFrame)
+{
+	/* a far stride of one keeps every landing, so there is nothing to settle */
+	if (!composeAvailable() || m_spill == nullptr || m_farStride <= 1) return;
+	/* This one runs inside a capture, so it must not simply wait for the writer
+	 * - that would put the write back on the frame's critical path, which is
+	 * the whole thing being removed. But it must not SKIP on a busy writer
+	 * either: which stretch gets settled would then depend on when a write
+	 * landed, and the history would hold different frames threaded than in
+	 * line, which is exactly the difference this design promises not to have.
+	 *
+	 * So the choice is made from metadata, as it always was, and the file is
+	 * only waited for when the stretch actually chosen is one the writer has
+	 * not finished - which is the rare case of settling a stretch spilled a
+	 * moment ago. In line, that wait is nothing at all. */
+	applyWrites();
+	std::FILE *const in = m_spillRead != nullptr ? m_spillRead : m_spill;
+	Settling &st = m_settle;
+	if (!st.active)
+	{
+		for (size_t i = 0; i + 1 < m_segments.size(); i++)
+		{
+			Segment &seg = m_segments[i];
+			if (!seg.spilled || seg.settled || seg.lastFrame() >= farFrame) continue;
+			if (seg.links.size() <= 1) { seg.settled = true; continue; }   /* nothing to compose */
+			/* the head of the body: the anchor's length is the cap, the rest is stepped over */
+			uint64_t noteLen = 0, count = 0;
+			if (seg.spillAt + seg.spillLength > m_writtenThrough)
+			{
+				drainWriter();
+				if (!seg.spilled) continue;   /* its write failed and it came back */
+			}
+			st = Settling{};
+			auto reader = std::make_unique<SpillBodyReader>();
+			if (!reader->open(in, seg.physAt, seg.physLength, seg.packed)
+				|| !reader->readU64(st.anchorLen) || st.anchorLen > seg.spillLength
+				|| !reader->skip(st.anchorLen) || !reader->readU64(noteLen) || noteLen > kMaxNote
+				|| !reader->skip(noteLen) || !reader->readU64(count))
+			{
+				seg.settled = true;   /* unreadable: left as it is, and not asked again */
+				continue;
+			}
+			st.reader = std::move(reader);
+			st.active = true;
+			st.anchorFrame = seg.anchorFrame;
+			st.spillAt = seg.spillAt;
+			st.spillLength = seg.spillLength;
+			/* what the stretch still answers for may be less than the file
+			 * holds - an edit truncated it - and the rest is not wanted back */
+			st.linkCount = count < seg.links.size() ? static_cast<size_t>(count) : seg.links.size();
+			break;
+		}
+		if (!st.active) return;
+	}
+
+	/* The stretch, as it is NOW: a compaction moves bodies and a drop removes
+	 * them, so it is looked up every time and never kept. */
+	const Segment *seg = settlingSegment();
+	if (seg == nullptr)
+	{
+		m_settle = Settling{};   /* gone or moved meanwhile: nothing to finish */
+		return;
+	}
+	/* the bytes about to be read have to BE there */
+	if (seg->spillAt + seg->spillLength > m_writtenThrough)
+	{
+		drainWriter();
+		seg = settlingSegment();
+		if (seg == nullptr) { m_settle = Settling{}; return; }
+	}
+
+	/* a few links, then the rest next frame - reading one back costs what
+	 * spilling it cost, and the far boundary moves one frame at a time */
+	static constexpr int kLinksPerFrame = 4;
+	for (int n = 0; n < kLinksPerFrame && st.linkIndex < st.linkCount; n++)
+	{
+		uint64_t endFrame = 0, noteLen = 0, len = 0;
+		Link next;
+		/* every read stays inside the body: a record that claims more is damage */
+		SpillBodyReader &body = *st.reader;
+		bool ok = body.pos() < seg->spillLength
+			&& body.readU64(endFrame) && body.readU64(noteLen) && noteLen <= kMaxNote;
+		if (ok)
+		{
+			next.note.resize(static_cast<size_t>(noteLen));
+			ok = body.read(next.note.data(), next.note.size()) && body.readU64(len)
+				&& len <= seg->spillLength - body.pos();
+		}
+		if (ok)
+		{
+			Bytes bytes(static_cast<size_t>(len));
+			ok = body.read(bytes.data(), bytes.size());
+			next.bytes = Body::make(std::move(bytes));
+		}
+		if (!ok)
+		{
+			/* unreadable: this stretch is left as it is, and not asked again */
+			if (Segment *mine = settlingSegment()) mine->settled = true;
+			m_settle = Settling{};
+			return;
+		}
+		next.endFrame = static_cast<int64_t>(endFrame);
+		st.linkIndex++;
+
+		if (!st.hasAcc)
+		{
+			st.acc = std::move(next);
+			st.hasAcc = true;
+			continue;
+		}
+		Bytes merged;
+		const bool keep = st.acc.endFrame % m_farStride == 0 || pinned(st.acc.endFrame)
+			|| !composePair(st.acc, next, st.anchorLen, merged);
+		if (keep)
+		{
+			/* the grid, a pin, or the caps: this landing stays */
+			st.out.push_back(std::move(st.acc));
+			st.acc = std::move(next);
+			continue;
+		}
+		st.acc.bytes = Body::make(std::move(merged));
+		st.acc.endFrame = next.endFrame;
+		st.acc.note = std::move(next.note);
+		st.merges++;
+	}
+	if (st.linkIndex < st.linkCount) return;
+	if (st.hasAcc) st.out.push_back(std::move(st.acc));
+	finishSettling();
+}
+
+StateHistory::Segment *StateHistory::settlingSegment()
+{
+	for (Segment &s : m_segments)
+	{
+		if (s.anchorFrame != m_settle.anchorFrame || !s.spilled) continue;
+		/* the same stretch, in the same place, the same length: anything else
+		 * with this anchor frame is another timeline's */
+		if (s.spillAt != m_settle.spillAt || s.spillLength != m_settle.spillLength) return nullptr;
+		return &s;
+	}
+	return nullptr;
+}
+
+void StateHistory::finishSettling()
+{
+	/* The old body is read back for its anchor, so it has to be in the file -
+	 * which it nearly always is; the wait is only for one spilled a moment ago.
+	 * This used to drain the writer unconditionally and then write the settled
+	 * body HERE, a whole machine written on the emulation thread once per
+	 * settled stretch. It is reserved here and written on the writer now, the
+	 * way a spill is. */
+	Segment *seg = settlingSegment();
+	if (seg != nullptr && seg->spillAt + seg->spillLength > m_writtenThrough)
+	{
+		drainWriter();
+		seg = settlingSegment();
+	}
+	Settling st = std::move(m_settle);
+	m_settle = Settling{};
+	/* gone meanwhile - dropped, moved, re-recorded over - or nothing was
+	 * merged: either way the file is right as it is */
+	if (seg == nullptr) return;
+	seg->settled = true;
+	if (st.merges == 0) return;
+
+	/* an edit may have shortened the stretch while this worked: keep only what
+	 * it still answers for. Composition never moves a landing, so the settled
+	 * frames are a subset of the ones it had. */
+	const int64_t last = seg->lastFrame();
+	while (!st.out.empty() && st.out.back().endFrame > last) st.out.pop_back();
+
+	/* the anchor comes across from the old body; it is one machine, which is
+	 * what capturing it held in memory in the first place */
+	Segment work;
+	work.anchorFrame = seg->anchorFrame;
+	work.anchorNote = seg->anchorNote;
+	{
+		std::FILE *const in = m_spillRead != nullptr ? m_spillRead : m_spill;
+		SpillBodyReader body;
+		uint64_t anchorLen = 0;
+		Bytes anchorBody(static_cast<size_t>(st.anchorLen));
+		if (!body.open(in, seg->physAt, seg->physLength, seg->packed) || !body.readU64(anchorLen)
+			|| anchorLen != st.anchorLen || !body.read(anchorBody.data(), anchorBody.size()))
+		{
+			return;
+		}
+		work.anchor = Body::make(std::move(anchorBody));
+	}
+	work.bytes = st.anchorLen;
+	for (Link &l : st.out) work.bytes += l.bytes.size();
+	work.links = std::move(st.out);
+
+	const uint64_t at = m_spillBytes;
+	const uint64_t length = segmentBodyLength(work);
+	const uint64_t was = seg->spillLength;
+
+	PendingWrite job;
+	job.at = at;
+	job.length = length;
+	job.anchorFrame = seg->anchorFrame;
+	job.wanted = std::make_shared<std::atomic<bool>>(true);
+	seg->writeWanted = job.wanted;
+	job.body.anchorFrame = work.anchorFrame;
+	job.body.anchor = work.anchor;
+	job.body.anchorNote = work.anchorNote;
+	job.body.links = work.links;
+
+	m_spillBytes = at + length;
+	m_writeQueued += length;
+	/* the old body stops costing the disk now; the settled one costs it when
+	 * the writer says it landed */
+	m_spillLive = seg->physLength > m_spillLive ? 0 : m_spillLive - seg->physLength;
+	seg->spillAt = at;
+	seg->spillLength = length;
+	seg->physAt = 0;
+	seg->physLength = 0;
+	seg->packed = false;
+	seg->bytes = work.bytes;
+	/* the landings it now has: metadata only, as a spilled stretch keeps them */
+	seg->links.clear();
+	for (Link &l : work.links)
+	{
+		seg->links.push_back(Link{ Body{}, l.endFrame, l.note });
+	}
+	postWrite(std::move(job));
+
+	if (historyTrace())
+	{
+		fprintf(stderr, "[history] settled frames %lld-%lld on disk: %llu -> %llu bytes, %d merges"
+			" (%llu live, file %llu)\n",
+			(long long)seg->anchorFrame, (long long)last, (unsigned long long)was,
+			(unsigned long long)seg->spillLength, st.merges,
+			(unsigned long long)m_spillLive, (unsigned long long)m_spillBytes);
+		fflush(stderr);
+	}
+	/* the old body is dead room now; take it back when it is the bigger half */
+	if (m_fileBytes > m_spillLive && m_fileBytes - m_spillLive >= m_spillLive) compactSpill();
+}
+
+/* ---- spilling ----
+ *
+ * One file, appended to. A segment that is dropped or re-recorded over leaves
+ * its space behind unreclaimed, which is the right trade for a cache: the file
+ * is thrown away wholesale when the history is, and the alternative is
+ * bookkeeping that buys nothing a user would notice.
+ */
+/* What a body of this shape weighs in the file.
+ *
+ * It must agree with writeSegmentBody to the byte, because this is what
+ * reserves the range the write will land in - and the next reservation starts
+ * where this one ends. test_state_history pins the two together by writing a
+ * body and comparing. */
+uint64_t StateHistory::segmentBodyLength(const Segment &seg)
+{
+	uint64_t n = sizeof(uint64_t) + seg.anchor.size()
+		+ sizeof(uint64_t) + seg.anchorNote.size()
+		+ sizeof(uint64_t);
+	for (const Link &l : seg.links)
+	{
+		n += sizeof(uint64_t) * 3 + l.note.size() + l.bytes.size();
+	}
+	return n;
+}
+
+/* Finishes every write in flight, then applies what they said.
+ *
+ * Everything that READS the spill file calls this first. The writer owns that
+ * handle while it has work, so the rule is not about the bytes - the ranges
+ * never overlap - but about the FILE itself, whose position and buffer are one
+ * object with one owner. */
+void StateHistory::drainWriter()
+{
+	if (m_writer.pending() != 0)
+	{
+		const double t0 = nowSeconds();
+		m_costs.waits++;
+		m_writer.drain();
+		const double waited = nowSeconds() - t0;
+		m_costs.waitSeconds += waited;
+		if (historyTrace() && waited >= 0.1)
+		{
+			fprintf(stderr, "[history] waited %.0f ms for the writer (%llu queued)\n",
+				waited * 1000, (unsigned long long)m_writeQueued);
+			fflush(stderr);
+		}
+	}
+	applyWrites();
+}
+
+/* What the writer reported, applied HERE, on the thread that owns the history.
+ *
+ * A write that succeeded needs nothing done: its metadata was settled when it
+ * was queued. A write that FAILED is undone - the stretch gets its bytes back
+ * and stops being spilled - which leaves the history exactly where a
+ * synchronous spill returning false left it, and lets evict() fall through to
+ * thinning as it always did. */
+void StateHistory::applyWrites()
+{
+	std::vector<PendingWrite> done;
+	{
+		std::lock_guard<std::mutex> lock(m_writtenLock);
+		done.swap(m_written);
+	}
+	for (PendingWrite &w : done)
+	{
+		m_writeQueued = w.length > m_writeQueued ? 0 : m_writeQueued - w.length;
+		/* Ranges are reserved in order and written in order, so the end of the
+		 * one just reported is the point up to which the file is whole. A
+		 * failed write leaves dead room rather than a hole, so it moves this
+		 * along too. */
+		if (!w.skipped && w.at + w.length > m_writtenThrough) m_writtenThrough = w.at + w.length;
+		for (Segment &s : m_segments)
+		{
+			if (s.writeWanted != w.wanted) continue;
+			s.writeWanted.reset();
+			/* where the bytes really are: nothing but a reader looks at these */
+			if (w.ok && !w.skipped)
+			{
+				s.physAt = w.physAt;
+				s.physLength = w.physLength;
+				s.packed = w.packed;
+				/* The disk budget counts what the file really holds (user-decided,
+				 * 2026-09-13), so this is the moment a stretch starts to cost it -
+				 * and only a stretch still here: one dropped before its report
+				 * never cost anything. */
+				m_spillLive += w.physLength;
+			}
+			break;
+		}
+		if (w.ok && !w.skipped)
+		{
+			m_costs.spilledRaw += w.length;
+			m_costs.spilledPacked += w.physLength;
+			/* the bytes are in the file whether or not their stretch still is */
+			if (w.physAt + w.physLength > m_fileBytes) m_fileBytes = w.physAt + w.physLength;
+		}
+		if (w.ok) continue;
+
+		for (Segment &s : m_segments)
+		{
+			/* the same stretch, in the same place: anything else with this
+			 * anchor frame belongs to a timeline an edit has since ended */
+			if (s.anchorFrame != w.anchorFrame || !s.spilled) continue;
+			if (s.spillAt != w.at || s.spillLength != w.length) continue;
+			s.spilled = false;
+			s.anchor = w.body.anchor;
+			/* an edit may have shortened it meanwhile; give back only the
+			 * bodies of the links it still answers for */
+			for (size_t i = 0; i < s.links.size() && i < w.body.links.size(); i++)
+			{
+				s.links[i].bytes = w.body.links[i].bytes;
+			}
+			s.bytes = s.anchor.held();
+			for (const Link &l : s.links) s.bytes += l.bytes.held();
+			m_bytes += s.bytes;
+			break;
+		}
+		if (!m_spillFailed)
+		{
+			m_spillFailed = true;
+			fprintf(stderr, "[history] a spill to %s did not land - the far band will be dropped"
+				" instead (the disk is full, or the directory has gone)\n", m_spillDir.c_str());
+			fflush(stderr);
+		}
+	}
+}
+
+/* The writer's half of a spill or a settle: compress the body and append it
+ * where the file really ends, then say where that was.
+ *
+ * Appended rather than written at the reserved offset, because a compressed
+ * body is a fraction of the range reserved for it: written in place it would
+ * leave a hole the size of the difference after every one, which NTFS fills
+ * with zeros. The reservation stays what every decision is made from; this is
+ * only where the bytes go. */
+/* CHIMERA_SPILL_COLD=1: after each body lands, put it on the disk for real and
+ * ask the kernel to forget its cached pages, so the next read of it is a read
+ * of a disk rather than a memcpy of the page cache.
+ *
+ * For measuring, and only that. A stretch spilled a moment ago otherwise sits
+ * in the page cache and reads back at memory speed, which hides exactly the
+ * cost that compressing bodies exists to remove - and there is no dropping the
+ * cache system-wide without root. Evicting one's own file needs no privilege.
+ * Linux only; elsewhere it does nothing. */
+static void forgetCachedPages(std::FILE *f)
+{
+	static const int cold = [] {
+		const char *e = getenv("CHIMERA_SPILL_COLD");
+		return e != nullptr && e[0] != '\0' && e[0] != '0' ? 1 : 0;
+	}();
+	if (cold == 0) return;
+#ifndef _WIN32
+	const int fd = fileno(f);
+	fdatasync(fd);
+	posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+#else
+	(void)f;
+#endif
+}
+
+void StateHistory::postWrite(PendingWrite &&job)
+{
+	std::FILE *const f = m_spill;
+	m_writer.post([this, f, job = std::move(job)]() mutable {
+		if (job.wanted->load())
+		{
+			uint64_t start = 0, end = 0;
+			job.ok = seekEnd(f) && tellAt(f, start)
+				&& writeSegmentBodyPacked(f, job.body, job.packed)
+				&& std::fflush(f) == 0 && tellAt(f, end);
+			job.physAt = start;
+			job.physLength = job.ok ? end - start : 0;
+			if (job.ok) forgetCachedPages(f);
+		}
+		else
+		{
+			/* dropped while it waited: those bytes will never be read, so the
+			 * cheapest correct thing is not to write them */
+			job.skipped = true;
+			job.ok = true;
+		}
+		/* the bodies go here, on the writer, rather than on the thread that
+		 * runs the machine */
+		job.body = Segment{};
+		std::lock_guard<std::mutex> lock(m_writtenLock);
+		m_written.push_back(std::move(job));
+	});
+}
+
+uint64_t StateHistory::writeQueueCap() const
+{
+	uint64_t cap = m_budget / 2;
+	if (cap < (4ull << 20)) cap = 4ull << 20;
+	if (cap > (64ull << 20)) cap = 64ull << 20;
+	return cap;
+}
+
+bool StateHistory::spill(Segment &seg)
+{
+	if (seg.spilled || m_spillDir.empty()) return false;
+	/* the bytes are about to go to a file, so they have to be there - if this is
+	 * the stretch still being filled */
+	if (m_planPending && seg.anchorFrame == m_planFrame) finishPlan();
+
+	/* A stretch the far boundary has already passed goes to disk on the far
+	 * grid: its landings off the grid are composed into the next, here, while
+	 * the bytes are still in memory - the same merges, under the same caps, that
+	 * settleSpilled would otherwise read back and rewrite, appending to the file
+	 * a second copy the compaction has to reclaim. This used to happen in memory
+	 * as the playhead moved (tidy); nothing thins by distance now, so it happens
+	 * at the one moment it still matters. */
+	const bool pastFar = m_newest >= 0 && seg.lastFrame() < m_newest - m_nearFrames - m_midFrames;
+	if (pastFar && m_farStride > 1 && composeAvailable())
+	{
+		for (size_t i = 0; i + 1 < seg.links.size();)
+		{
+			const int64_t end = seg.links[i].endFrame;
+			if (end % m_farStride == 0 || pinned(end) || !composeInto(seg, i)) i++;
+		}
+	}
+
+	/* Let the writer catch up before handing it more than it can hold. See
+	 * writeQueueCap: a queue nobody bounds is memory the budget cannot see and
+	 * a file full of ranges that were dropped before they were written. */
+	if (m_writeQueued > writeQueueCap()) drainWriter();
+
+	if (m_spill == nullptr)
+	{
+		m_spillPath = m_spillDir + "/" + spillFileName();
+		m_spill = std::fopen(m_spillPath.c_str(), "w+b");
+		if (m_spill == nullptr) return false;
+		/* the loop's own view of the same file: its own position, so a read
+		 * here and a write there cannot move each other (see m_spillRead) */
+		m_spillRead = std::fopen(m_spillPath.c_str(), "rb");
+		if (m_spillRead == nullptr) { std::fclose(m_spill); m_spill = nullptr; return false; }
+		m_spillBytes = 0;
+	}
+
+	/* The range is reserved here, and the bytes go to the writer. Everything
+	 * the history knows about this stretch is therefore true immediately - the
+	 * budget's arithmetic is what it always was, and so are the decisions that
+	 * follow it - and the only thing that happens later is the write. */
+	const uint64_t at = m_spillBytes;
+	const uint64_t length = segmentBodyLength(seg);
+
+	PendingWrite job;
+	job.at = at;
+	job.length = length;
+	job.anchorFrame = seg.anchorFrame;
+	job.wanted = std::make_shared<std::atomic<bool>>(true);
+	seg.writeWanted = job.wanted;
+	job.body.anchorFrame = seg.anchorFrame;
+	job.body.anchor = seg.anchor;          /* shared: a pointer, not a machine */
+	job.body.anchorNote = seg.anchorNote;
+	job.body.links = seg.links;            /* shared bodies, copied notes */
+
+	m_spillBytes = at + length;
+	/* Before the flag, not after: once it is set the segment costs no memory by
+	 * definition, and taking its bytes off the count afterwards takes nothing. */
+	releaseBytes(seg.memoryBytes(), "spill");
+	seg.spilled = true;
+	/* Settled means there is nothing for settleSpilled to do: it was put on the
+	 * far grid just above (a merge the caps refused stays refused there too),
+	 * every link it holds already lands on the grid or is pinned, or it has too
+	 * few to merge. */
+	seg.settled = pastFar || seg.links.size() <= 1;
+	if (!seg.settled && m_farStride > 1)
+	{
+		bool onGrid = true;
+		for (const Link &l : seg.links)
+		{
+			if (l.endFrame % m_farStride != 0 && !pinned(l.endFrame)) { onGrid = false; break; }
+		}
+		seg.settled = onGrid;
+	}
+	else if (m_farStride <= 1)
+	{
+		seg.settled = true;   /* a far stride of one keeps everything: nothing to settle */
+	}
+	seg.spillAt = at;
+	seg.spillLength = length;
+	/* Not counted against the disk yet: what it will weigh there is decided by
+	 * the compressor, and it is counted when the writer says it landed. */
+	m_writeQueued += length;
+
+	/* What it held is now the file's; give the memory back for real. The notes
+	 * stay: they are metadata, like the landings, and answering what was stored
+	 * with a frame must not touch a disk. */
+	seg.anchor.reset();
+	for (Link &l : seg.links)
+	{
+		l.bytes.reset();
+	}
+
+	postWrite(std::move(job));
+
+	if (historyTrace())
+	{
+		fprintf(stderr, "[history] spilled frames %lld-%lld: %llu bytes to disk"
+			" (%llu in memory, %llu on disk, file %llu)\n",
+			(long long)seg.anchorFrame, (long long)seg.lastFrame(),
+			(unsigned long long)seg.bytes, (unsigned long long)m_bytes,
+			(unsigned long long)m_spillLive, (unsigned long long)m_spillBytes);
+		fflush(stderr);
+	}
+	return true;
+}
+
+bool StateHistory::restoreSpilled(const Segment &seg, int64_t steps, std::string &error)
+{
+	/* The writer owns that handle while it has work, so a read waits - but only
+	 * for a stretch it has not finished. The barrier the design calls "help
+	 * finish" costs what the write costs, which is what the synchronous path
+	 * paid at the moment of spilling; paying it for a stretch already on disk
+	 * would be paying it for nothing. */
+	if (seg.spillAt + seg.spillLength > m_writtenThrough) drainWriter();
+	std::FILE *const in = m_spillRead != nullptr ? m_spillRead : m_spill;
+	SpillBodyReader body;
+	uint64_t anchorLen = 0, linkCount = 0, noteLen = 0;
+	if (in == nullptr || !body.open(in, seg.physAt, seg.physLength, seg.packed) || !body.readU64(anchorLen))
+	{
+		error = "the spilled state history could not be read";
+		return false;
+	}
+
+	WbxReturn r{};
+	ReaderSource anchor{ &body, anchorLen };
+	m_host->wbx_load_state(m_obj, readerRead, reinterpret_cast<uintptr_t>(&anchor), &r);
+	if (!r.ok()) { error = r.errorMessage; return false; }
+	/* the sandbox may stop reading before the end - skip whatever it left, and
+	 * the anchor's note, which is already in memory */
+	if (!body.skip(anchor.left) || !body.readU64(noteLen) || !body.skip(noteLen) || !body.readU64(linkCount))
+	{
+		error = "the spilled state history could not be read";
+		return false;
+	}
+	for (int64_t i = 0; i < steps; i++)
+	{
+		uint64_t endFrame = 0, len = 0;
+		if (!body.readU64(endFrame) || !body.readU64(noteLen) || !body.skip(noteLen) || !body.readU64(len))
+		{
+			error = "the spilled state history could not be read";
+			return false;
+		}
+		ReaderSource link{ &body, len };
+		m_host->wbx_load_delta(m_obj, readerRead, reinterpret_cast<uintptr_t>(&link), &r);
+		if (!r.ok()) { error = r.errorMessage; return false; }
+		if (!body.skip(link.left))
+		{
+			error = "the spilled state history could not be read";
+			return false;
+		}
+	}
+	return true;
+}
+
+/* Over the memory budget, and only then, the history gives frames up.
+ *
+ * First choice, when a spill directory is set, is still to put the oldest
+ * stretch on disk (the frontend sets none: a greenzone is kept in memory).
+ * Otherwise frames go one at a time toward the shape in greenzone_shape.h
+ * (user-decided, 2026-09-15): bands measured back from the frontier that double
+ * in length, each aiming for the same number of snapshots; the band holding the
+ * most gives one up, so what aged with more than its share goes first and then
+ * every band shrinks in turn; a band's last snapshot, frame 0, a pinned frame
+ * and the frontier never go. If nothing may go, the budget is missed rather
+ * than a band emptied - the promise pins already made.
+ *
+ * Once over the budget it thins a little further, to 95%, so a full greenzone
+ * is not thinned again on every frame; that extra is bounded per call
+ * (kThinExtraPerCall frames), and composition by kThinMergeBytes, so meeting
+ * the budget is a little work each frame rather than a stall. Getting back
+ * under the budget itself is not bounded - the budget is the promise. */
+void StateHistory::evict()
+{
+	static constexpr int kThinExtraPerCall = 16;
+	static constexpr uint64_t kThinMergeBytes = 32u << 20;   /* as thinOne's kThinMergeBytesPerCall */
+	const uint64_t target = m_budget - m_budget / 20;
+	uint64_t mergeLeft = kThinMergeBytes;
+	int thinned = 0;
+	while (m_bytes > m_budget || (thinned > 0 && thinned < kThinExtraPerCall && m_bytes > target))
+	{
+		/* First choice: put the oldest stretch on disk, oldest to newest. It
+		 * costs reading it back rather than replaying to it, and the far end of
+		 * the history is where that trade is obviously right. The newest is
+		 * never spilled - it is where the work is. */
+		bool moved = false;
+		/* Not while a save is being written. The save is one job on the writer,
+		 * and it is the size of the whole history - 4.35 GB of nss102, 46 s to
+		 * NTFS - so a spill queued behind it is a write that lands when the save
+		 * does, and the NEXT spill, finding the queue over its cap, waits for
+		 * both on this thread: a 42 s frame, measured. For that long the budget
+		 * is kept by thinning instead, which is what a history with nowhere to
+		 * spill has always done; the run carries on, which is what saving in the
+		 * background promised. Not a failure, so not reported as one. */
+		const bool saving = savePending();
+		for (size_t i = 0; !saving && i + 1 < m_segments.size(); i++)
+		{
+			if (m_segments[i].spilled) continue;
+			if (spill(m_segments[i]))
+			{
+				/* right here, not after the whole memory pass: the file is over
+				 * its budget from the moment the write lands, and a limit that
+				 * is only true once the loop finishes is a limit somebody
+				 * watching a disk fill up cannot read off `ls` */
+				evictDisk();
+				moved = true;
+				break;
+			}
+			/* Asked to spill, and could not - a full disk, near enough always.
+			 * The thinning below carries on, so this costs frames rather than
+			 * the session, but it is not something to keep to ourselves. */
+			if (!m_spillDir.empty() && !m_spillFailed)
+			{
+				m_spillFailed = true;
+				fprintf(stderr, "[history] could not spill to %s - the far band will be dropped instead"
+					" (the disk is full, or the directory has gone)\n", m_spillDir.c_str());
+				fflush(stderr);
+			}
+			break;   /* nowhere to spill: everything after this fails the same way */
+		}
+		if (moved) continue;
+
+		if (!thinOne(mergeLeft)) return;
+		thinned++;
+	}
+}
+
+bool StateHistory::thinOne(uint64_t &mergeLeft)
+{
+	static constexpr uint64_t kThinMergeBytesPerCall = 32u << 20;   /* evict's allowance, below */
+	if (m_segments.empty()) return false;
+	const int64_t frontier = m_segments.back().lastFrame();
+	const int64_t nearSpacing = m_tuner.maxStride < 1 ? 1 : m_tuner.maxStride;
+
+	/* Every stored frame in order, with the band it has fallen into. Spilled
+	 * stretches count as members of their bands - they are still reachable -
+	 * but cost nothing in memory, so none of their frames is a candidate. */
+	struct Entry
+	{
+		int64_t frame;
+		size_t seg;
+		std::ptrdiff_t link;   /* -1: the stretch's anchor */
+		int band;
+	};
+	std::vector<Entry> entries;
+	entries.reserve(static_cast<size_t>(count()));
+	std::vector<int64_t> counts;
+	for (size_t si = 0; si < m_segments.size(); si++)
+	{
+		const Segment &seg = m_segments[si];
+		const auto add = [&](int64_t frame, std::ptrdiff_t link) {
+			const int band = CeGreenzoneShape::bandOf(frontier - frame, nearSpacing, m_bandGoal);
+			if (static_cast<size_t>(band) >= counts.size()) counts.resize(static_cast<size_t>(band) + 1, 0);
+			counts[static_cast<size_t>(band)]++;
+			entries.push_back(Entry{ frame, si, link, band });
+		};
+		add(seg.anchorFrame, -1);
+		for (size_t li = 0; li < seg.links.size(); li++) add(seg.links[li].endFrame, static_cast<std::ptrdiff_t>(li));
+	}
+	/* Frame 0 and the frontier are kept on their own account, so they are not
+	 * what a band keeps as its last snapshot. Counted, the frontier was always
+	 * the near band's "last", the frame before it always went, and under a
+	 * starved budget no frame ever lived long enough to age into a farther band:
+	 * the history collapsed to frame 0 and the frontier. */
+	if (!entries.empty())
+	{
+		counts[static_cast<size_t>(entries.front().band)]--;
+		if (entries.size() > 1) counts[static_cast<size_t>(entries.back().band)]--;
+	}
+
+	/* A history that spills keeps the stretch being written whole in memory, as
+	 * it always has: its stretches go to disk in time, and settling composes
+	 * them there. The frontend spills nowhere, so for it the newest is thinned
+	 * like any other - the frontier itself aside. */
+	const bool keepNewest = !m_spillDir.empty() && !m_spillFailed;
+	for (const int band : CeGreenzoneShape::removalOrder(counts))
+	{
+		/* this band's frames that may go, by the gap their going leaves */
+		std::vector<std::pair<int64_t, size_t>> candidates;
+		for (size_t i = 1; i + 1 < entries.size(); i++)   /* never the first frame, never the frontier */
+		{
+			const Entry &e = entries[i];
+			if (e.band != band) continue;
+			const Segment &seg = m_segments[e.seg];
+			if (seg.spilled) continue;
+			if (keepNewest && e.seg + 1 == m_segments.size()) continue;
+			if (pinned(e.frame)) continue;
+			if (e.link < 0 && (e.seg == 0 || !seg.links.empty())) continue;   /* an anchor goes only alone */
+			candidates.emplace_back(entries[i + 1].frame - entries[i - 1].frame, i);
+		}
+		std::sort(candidates.begin(), candidates.end());
+
+		for (const auto &[gap, i] : candidates)
+		{
+			const Entry e = entries[i];
+			Segment &seg = m_segments[e.seg];
+			if (e.link < 0)
+			{
+				if (historyTrace())
+				{
+					fprintf(stderr, "[history] dropped the stretch at %lld from band %d (%lld there, gap %lld)\n",
+						(long long)e.frame, band, (long long)counts[static_cast<size_t>(band)], (long long)gap);
+					fflush(stderr);
+				}
+				forgetSegment(e.seg);
+				return true;
+			}
+			const size_t li = static_cast<size_t>(e.link);
+			if (li + 1 == seg.links.size())
+			{
+				const uint64_t n = seg.links.back().bytes.held();
+				seg.bytes -= n;
+				releaseBytes(n, "thin");
+				seg.links.pop_back();
+				if (historyTrace())
+				{
+					fprintf(stderr, "[history] thinned frame %lld from band %d (%lld there, gap %lld)\n",
+						(long long)e.frame, band, (long long)counts[static_cast<size_t>(band)], (long long)gap);
+					fflush(stderr);
+				}
+				return true;
+			}
+			const uint64_t input = seg.links[li].bytes.size() + seg.links[li + 1].bytes.size();
+			/* The first merge of a call always happens, however big - otherwise a
+			 * heavy core whose links outgrow the allowance could never thin at all;
+			 * after it, this call composes no more than the allowance. */
+			if (mergeLeft < kThinMergeBytesPerCall && input > mergeLeft) continue;
+			if (composeInto(seg, li, false))
+			{
+				mergeLeft = input > mergeLeft ? 0 : mergeLeft - input;
+				if (historyTrace())
+				{
+					fprintf(stderr, "[history] thinned frame %lld from band %d (%lld there, gap %lld)\n",
+						(long long)e.frame, band, (long long)counts[static_cast<size_t>(band)], (long long)gap);
+					fflush(stderr);
+				}
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+/* A restore that fails part way is the worst thing this file can do quietly.
+ *
+ * The chain is an anchor and the deltas after it, applied to the live machine.
+ * Fail on the fourth of thirty and the machine is not frame N, and it is not
+ * the frame it was on before either - it is a machine that never existed, and
+ * the session carries on with it: frames are captured from it, a movie is
+ * recorded against it, and the desync surfaces somewhere else entirely. The
+ * old code returned false and left it exactly there.
+ *
+ * So a failure is CONTAINED. The anchor is loaded again - it was read once
+ * already, so this is the one step most likely to work - and the machine is
+ * then a machine that did exist, at the anchor's frame, which `landedOn`
+ * reports so the caller's idea of where it is can follow. The stretch that
+ * failed is dropped, because whatever is wrong with it will be wrong the next
+ * time somebody walks it; what that costs is replaying, which is what the
+ * history is allowed to cost. If even the anchor will not load, nothing here
+ * can help and `landedOn` stays -1: the caller must reload the machine.
+ */
+bool StateHistory::restoreFailed(const Segment *seg, std::string &error, int64_t *landedOn)
+{
+	const int64_t anchorFrame = seg->anchorFrame;
+	bool consistent = false;
+	if (!seg->spilled)
+	{
+		WbxReturn r{};
+		MemBodyReader in(seg->anchor);
+		BodySource anchor{ &in, seg->anchor.size() };
+		m_host->wbx_load_state(m_obj, bodyRead, reinterpret_cast<uintptr_t>(&anchor), &r);
+		consistent = r.ok();
+	}
+	else
+	{
+		std::string ignored;
+		consistent = restoreSpilled(*seg, 0, ignored);
+	}
+	fprintf(stderr, "[history] the stored frames from %lld could not be walked (%s); "
+		"the machine is %s and those frames are given up\n",
+		(long long)anchorFrame, error.c_str(),
+		consistent ? "back on that anchor" : "NOT to be trusted - reload it");
+	fflush(stderr);
+	for (size_t i = 0; i < m_segments.size(); i++)
+	{
+		if (m_segments[i].anchorFrame == anchorFrame) { forgetSegment(i); break; }
+	}
+	if (landedOn != nullptr) *landedOn = consistent ? anchorFrame : -1;
+	m_epochOpen = false;
+	m_machineFrame = consistent ? anchorFrame : -1;
+	m_machineStored = consistent;
+	m_pastEditAt = -1;
+	m_editWhileUnknown = -1;
+	return false;
+}
+
+bool StateHistory::restore(int64_t frame, std::string &error, int64_t *landedOn)
+{
+	/* a half-filled anchor is not a state; and a load replaces the machine the
+	 * plan is holding pages of */
+	finishPlan();
+	if (landedOn != nullptr) *landedOn = -1;
+	const Segment *seg = nullptr;
+	int64_t steps = -1;
+	for (const Segment &s : m_segments)
+	{
+		const int64_t n = s.stepsTo(frame);
+		if (n >= 0) { seg = &s; steps = n; break; }
+	}
+	if (seg == nullptr)
+	{
+		error = "no stored state at that frame";
+		return false;   /* nothing was touched: the machine is where it was */
+	}
+
+	const double t0 = historyTrace() ? nowSeconds() : 0.0;
+	if (seg->spilled)
+	{
+		if (!restoreSpilled(*seg, steps, error)) return restoreFailed(seg, error, landedOn);
+		if (historyTrace())
+		{
+			fprintf(stderr, "[history] restore %lld: from disk, anchor %lld + %lld deltas, %.0f ms\n",
+				(long long)frame, (long long)seg->anchorFrame, (long long)steps,
+				(nowSeconds() - t0) * 1000);
+		}
+		m_epochOpen = false;
+		m_machineFrame = frame;
+		m_machineStored = true;
+		m_pastEditAt = -1;
+		m_editWhileUnknown = -1;
+		if (historyVerify()) verifyRestored(frame, seg->anchorFrame, steps, true);
+		return true;
+	}
+
+	WbxReturn r{};
+	{
+		MemBodyReader in(seg->anchor);
+		BodySource anchor{ &in, seg->anchor.size() };
+		m_host->wbx_load_state(m_obj, bodyRead, reinterpret_cast<uintptr_t>(&anchor), &r);
+	}
+	if (!r.ok())
+	{
+		/* the anchor itself: nothing was applied on top of it, so the machine is
+		 * whatever the failed load left - which only the caller can repair */
+		error = r.errorMessage;
+		return restoreFailed(seg, error, landedOn);
+	}
+	const double t1 = historyTrace() ? nowSeconds() : 0.0;
+	for (int64_t i = 0; i < steps; i++)
+	{
+		const Body &d = seg->links[static_cast<size_t>(i)].bytes;
+		MemBodyReader in(d);
+		BodySource src{ &in, d.size() };
+		m_host->wbx_load_delta(m_obj, bodyRead, reinterpret_cast<uintptr_t>(&src), &r);
+		if (!r.ok())
+		{
+			error = r.errorMessage;
+			return restoreFailed(seg, error, landedOn);
+		}
+	}
+	if (historyTrace())
+	{
+		const int64_t chain = steps;
+		const double t2 = nowSeconds();
+		fprintf(stderr,
+			"[history] restore %lld: anchor %lld (%.1f MB%s) %.0f ms + %lld deltas %.0f ms = %.0f ms\n",
+			(long long)frame, (long long)seg->anchorFrame, seg->anchor.size() / 1048576.0,
+			seg->anchor.packed ? ", packed" : "",
+			(t1 - t0) * 1000, (long long)chain, (t2 - t1) * 1000, (t2 - t0) * 1000);
+	}
+	/* whatever epoch was marked described the machine we have just left */
+	m_epochOpen = false;
+	m_machineFrame = frame;
+	m_machineStored = true;
+	m_pastEditAt = -1;
+	m_editWhileUnknown = -1;
+	if (historyVerify()) verifyRestored(frame, seg->anchorFrame, steps, false);
+	return true;
+}
+
+/* ---- persistence ----
+ *
+ * One file, written and read a segment at a time. Nothing here assembles the
+ * history in memory: the old greenzone did, through a managed array that stops
+ * near 2GB, and a long run's history therefore failed to save and said nothing.
+ */
+namespace
+{
+
+/* 5: the bodies as they are HELD. A closed stretch's bodies are zstd frames in
+ * memory already (see packSegmentLater), so a save copies them out as they are
+ * and a load takes them back as they are - no decoding, no re-encoding, and no
+ * packing in line before the budget looks. A body still raw at the save (the
+ * newest stretch, one that would not shrink) is packed on the way out. Every
+ * body record is `raw length, held length, bytes`, and held < raw says it is a
+ * frame: a packed body is only ever kept when it shrank, so the two lengths
+ * are the flag. The file itself is not compressed: its bodies are. */
+const char kMagic[] = "ChimeraHistory5";
+
+/* One version back: 3's layout as one zstd stream behind the magic. Read, no
+ * longer written. */
+const char kMagicV4[] = "ChimeraHistory4";
+
+/* Two back, uncompressed. Still read, and still what is written when
+ * CHIMERA_HISTORY_RAW=1 asks for it. */
+const char kMagicRaw[] = "ChimeraHistory3";
+
+bool historyRaw()
+{
+	static const int raw = [] {
+		const char *e = getenv("CHIMERA_HISTORY_RAW");
+		return e != nullptr && e[0] != '\0' && e[0] != '0' ? 1 : 0;
+	}();
+	return raw != 0;
+}
+
+/* Versions this build can no longer read. A history from one of these is not
+ * damage and not the user's doing: it is a cache written by an older build, and
+ * the contract for losing a cache is that it costs recomputation and never
+ * work. So it is treated exactly as a history of another machine is - dropped,
+ * quietly, and rebuilt by playing. 1 had a stride of one frame per link, from
+ * before links could span more than a frame; 2 had no room for the caller's
+ * note. */
+const char *const kSuperseded[] = { "ChimeraHistory1", "ChimeraHistory2" };
+
+/* A note is a frontend's lag flag and its counters - a few bytes, ridden along
+ * because keeping them in a table of the caller's own would mean mirroring
+ * every eviction this class does. It is not a place to keep things, and a file
+ * claiming otherwise is damaged. */
+
+} // namespace
+
+/* `n` bytes of a spilled body into a saved history, through a small buffer. The
+ * body comes out of the spill file raw whatever it is stored as, and goes into
+ * whatever the history is being written through. */
+static bool copyFromReader(SpillBodyReader &in, const std::function<bool(const void *, size_t)> &put, uint64_t n)
+{
+	std::vector<uint8_t> chunk(256 * 1024);
+	while (n != 0)
+	{
+		const size_t take = static_cast<size_t>(n < chunk.size() ? n : chunk.size());
+		if (!in.read(chunk.data(), take) || !put(chunk.data(), take)) return false;
+		n -= take;
+	}
+	return true;
+}
+
+bool StateHistory::copySpilledBody(std::FILE *spill, const std::function<bool(const void *, size_t)> &put,
+	const Segment &seg)
+{
+	auto u64 = [&](uint64_t v) { return put(&v, sizeof v); };
+	SpillBodyReader body;
+	if (!body.open(spill, seg.physAt, seg.physLength, seg.packed)) return false;
+	uint64_t anchorLen = 0, noteLen = 0, count = 0;
+	if (!body.readU64(anchorLen) || anchorLen > seg.spillLength) return false;
+	if (!u64(anchorLen) || !copyFromReader(body, put, anchorLen)) return false;
+	if (!body.readU64(noteLen) || noteLen > kMaxNote) return false;
+	if (!u64(noteLen) || !copyFromReader(body, put, noteLen)) return false;
+	if (!body.readU64(count)) return false;
+	if (count > seg.links.size()) count = seg.links.size();
+	if (!u64(count)) return false;
+	for (uint64_t k = 0; k < count; k++)
+	{
+		uint64_t endFrame = 0, len = 0;
+		if (!body.readU64(endFrame) || !body.readU64(noteLen) || noteLen > kMaxNote) return false;
+		if (!u64(endFrame) || !u64(noteLen) || !copyFromReader(body, put, noteLen)) return false;
+		if (!body.readU64(len) || len > seg.spillLength) return false;
+		if (!u64(len) || !copyFromReader(body, put, len)) return false;
+	}
+	return true;
+}
+
+/* One body into a ChimeraHistory5 file: packed on the way out if it is not
+ * already, and written as it is held. */
+static bool putBodyV5(const std::function<bool(const void *, size_t)> &put, const StateHistory::Body &b)
+{
+	auto u64 = [&](uint64_t v) { return put(&v, sizeof v); };
+	return u64(b.size()) && u64(b.held()) && put(b.p ? b.p->data() : nullptr, b.held());
+}
+
+bool StateHistory::writeSegmentBodyV5(const std::function<bool(const void *, size_t)> &put, const Segment &seg)
+{
+	auto u64 = [&](uint64_t v) { return put(&v, sizeof v); };
+	bool ok = putBodyV5(put, packBody(seg.anchor))
+		&& u64(seg.anchorNote.size())
+		&& put(seg.anchorNote.data(), seg.anchorNote.size())
+		&& u64(seg.links.size());
+	for (const Link &l : seg.links)
+	{
+		if (!ok) break;
+		ok = u64(static_cast<uint64_t>(l.endFrame))
+			&& u64(l.note.size())
+			&& put(l.note.data(), l.note.size())
+			&& putBodyV5(put, packBody(l.bytes));
+	}
+	return ok;
+}
+
+/* A spilled stretch into a ChimeraHistory5 file. Its bodies come out of the
+ * spill file raw, one at a time, and go in packed; one body - an anchor at
+ * most - is held whole meanwhile, never the stretch. (The frontend spills
+ * nothing; this is chimera-run's --spill.) */
+bool StateHistory::copySpilledBodyV5(std::FILE *spill, const std::function<bool(const void *, size_t)> &put,
+	const Segment &seg)
+{
+	auto u64 = [&](uint64_t v) { return put(&v, sizeof v); };
+	SpillBodyReader body;
+	if (!body.open(spill, seg.physAt, seg.physLength, seg.packed)) return false;
+	auto oneBody = [&](uint64_t len) {
+		Bytes raw(static_cast<size_t>(len));
+		if (!body.read(raw.data(), raw.size())) return false;
+		return putBodyV5(put, packBody(Body::make(std::move(raw))));
+	};
+	uint64_t anchorLen = 0, noteLen = 0, count = 0;
+	if (!body.readU64(anchorLen) || anchorLen > seg.spillLength) return false;
+	if (!oneBody(anchorLen)) return false;
+	if (!body.readU64(noteLen) || noteLen > kMaxNote) return false;
+	if (!u64(noteLen) || !copyFromReader(body, put, noteLen)) return false;
+	if (!body.readU64(count)) return false;
+	if (count > seg.links.size()) count = seg.links.size();
+	if (!u64(count)) return false;
+	for (uint64_t k = 0; k < count; k++)
+	{
+		uint64_t endFrame = 0, len = 0;
+		if (!body.readU64(endFrame) || !body.readU64(noteLen) || noteLen > kMaxNote) return false;
+		if (!u64(endFrame) || !u64(noteLen) || !copyFromReader(body, put, noteLen)) return false;
+		if (!body.readU64(len) || len > seg.spillLength) return false;
+		if (!oneBody(len)) return false;
+	}
+	return true;
+}
+
+/* The whole of writing a history, with nothing of the history in it but the
+ * segments handed over. That is what lets it happen on the writer: the bodies
+ * are shared and immutable, the metadata is a copy taken the moment the save
+ * was asked for, and the spill file belongs to the thread doing the writing. */
+bool StateHistory::writeHistoryFile(std::FILE *spill, const char *path, const std::string &id,
+	const std::vector<Segment> &segments, std::string &error)
+{
+	std::FILE *f = std::fopen(path, "wb");
+	if (f == nullptr)
+	{
+		error = std::string("could not write the state history: ") + std::strerror(errno);
+		return false;
+	}
+
+	/* ChimeraHistory5: the bodies as they are held, packed where they were
+	 * not. A saved history is what the greenzone was, and most of it is
+	 * already zstd frames in memory, so most of a save is a copy. Nothing of
+	 * the history is assembled in memory, which is the promise this function
+	 * exists to keep; CHIMERA_HISTORY_RAW=1 writes 3's raw layout instead. */
+	const bool packed = !historyRaw();
+	const std::function<bool(const void *, size_t)> put = [&](const void *d, size_t n) {
+		return writeAll(f, d, n);
+	};
+	auto u64 = [&](uint64_t v) { return put(&v, sizeof v); };
+
+	bool ok = writeAll(f, packed ? kMagic : kMagicRaw, sizeof kMagic - 1)
+		&& u64(id.size())
+		&& put(id.data(), id.size())
+		&& u64(segments.size());
+	for (const Segment &seg : segments)
+	{
+		if (!ok) break;
+		ok = u64(static_cast<uint64_t>(seg.anchorFrame));
+		if (!ok) break;
+		if (seg.spilled)
+		{
+			/* A spilled segment is already in exactly this shape, minus the
+			 * frame just written, so it is copied rather than rebuilt - which
+			 * keeps the promise that nothing here is assembled in memory. Link
+			 * by link, and only as many as the stretch still answers for: an
+			 * edit that truncated it left the old timeline's links in the file,
+			 * and copying the body whole put them in the saved history, where
+			 * a reopened project offered frames the movie no longer had. */
+			ok = packed ? copySpilledBodyV5(spill, put, seg) : copySpilledBody(spill, put, seg);
+			continue;
+		}
+		ok = packed ? writeSegmentBodyV5(put, seg) : writeSegmentBodyTo(put, seg);
+	}
+	if (std::fclose(f) != 0) ok = false;
+	if (!ok)
+	{
+		error = "the state history could not be written in full";
+		std::remove(path);   /* half a history is worse than none */
+		return false;
+	}
+	return true;
+}
+
+bool StateHistory::saveTo(const char *path, const char *machineId, std::string &error)
+{
+	finishPlan();
+	drainWriter();   /* spilled bodies are copied from the file, so it must be whole */
+	return writeHistoryFile(m_spillRead != nullptr ? m_spillRead : m_spill, path,
+		machineId != nullptr ? machineId : "", m_segments, error);
+}
+
+/* The same save, handed to the writer.
+ *
+ * WHY. Saving a project writes the whole history, and the budgets it is written
+ * against are four gigabytes in memory and ten on disk - so this is up to
+ * fourteen gigabytes, on the thread that runs the machine, measured at ten
+ * seconds to a Linux disk and over a minute to NTFS. TAStudio's autosave fires
+ * it every thirty minutes without being asked.
+ *
+ * WHAT MAKES IT SAFE. The metadata is copied here, now - so the file describes
+ * the history as it was at the moment of asking, which is what a save means -
+ * and the bodies are shared and immutable, so what the history does next
+ * (coarsening, evicting, an edit) cannot touch them. Spilled stretches are read
+ * from the spill file by the same thread that writes it, in queue order, and
+ * the one thing that could move them underneath - a compaction - waits for the
+ * writer like every other reader.
+ *
+ * False means it was not started; true means it was queued and `saveDone` will
+ * say what happened. */
+bool StateHistory::saveToLater(const char *path, const char *machineId, std::string &error)
+{
+	finishPlan();   /* the snapshot below shares the anchor's bytes */
+	if (path == nullptr || path[0] == '\0')
+	{
+		error = "no path to save the state history to";
+		return false;
+	}
+	if (!m_writer.threaded())
+	{
+		/* No writer: it happens here, and the ANSWER is recorded all the same.
+		 * saveWait has one contract whichever way the save went, or a caller
+		 * that checks it would read "the save failed" from a save that worked
+		 * simply because the helpers were off. */
+		const bool ok = saveTo(path, machineId, error);
+		std::lock_guard<std::mutex> lock(m_savedLock);
+		m_saved.asked = true;
+		m_saved.pending = false;
+		m_saved.ok = ok;
+		m_saved.error = ok ? std::string() : error;
+		return ok;
+	}
+
+	/* One at a time: the second would be describing a history the first has
+	 * already been told about, and a save nobody waited for is not worth
+	 * queueing twice. */
+	saveWait(error);
+
+	{
+		std::lock_guard<std::mutex> lock(m_savedLock);
+		m_saved = SaveResult{};
+		m_saved.asked = true;
+		m_saved.pending = true;
+	}
+	const std::string id = machineId != nullptr ? machineId : "";
+	const std::string where = path;
+	std::vector<Segment> snapshot = m_segments;   /* shared bodies; copied metadata */
+	std::FILE *const spill = m_spill;
+	m_writer.post([this, spill, where, id, snapshot = std::move(snapshot)]() mutable {
+		std::string why;
+		const bool ok = writeHistoryFile(spill, where.c_str(), id, snapshot, why);
+		std::lock_guard<std::mutex> lock(m_savedLock);
+		m_saved.pending = false;
+		m_saved.ok = ok;
+		m_saved.error = std::move(why);
+	});
+	return true;
+}
+
+bool StateHistory::savePending() const
+{
+	std::lock_guard<std::mutex> lock(m_savedLock);
+	return m_saved.pending;
+}
+
+bool StateHistory::saveWait(std::string &error)
+{
+	m_writer.drain();
+	applyWrites();
+	std::lock_guard<std::mutex> lock(m_savedLock);
+	/* Nothing was ever asked for, so there is nothing that failed. A caller
+	 * closing a project calls this whether or not it saved. */
+	if (!m_saved.asked) return true;
+	if (!m_saved.ok && !m_saved.error.empty()) error = m_saved.error;
+	return m_saved.ok;
+}
+
+bool StateHistory::loadFrom(const char *path, const char *machineId, std::string &error)
+{
+	clear();
+	std::FILE *f = std::fopen(path, "rb");
+	if (f == nullptr) return true;   /* no history yet is not a failure */
+
+	auto give_up = [&](std::string why) {
+		std::fclose(f);
+		clear();
+		error = std::move(why);
+		return false;
+	};
+
+	char magic[sizeof kMagic - 1];
+	if (!readAll(f, magic, sizeof magic)) return give_up("that is not a state history");
+	bool packed = false;   /* 4: one zstd stream */
+	bool held = false;     /* 5: bodies as held */
+	if (std::memcmp(magic, kMagic, sizeof magic) == 0)
+	{
+		held = true;
+	}
+	else if (std::memcmp(magic, kMagicV4, sizeof magic) == 0)
+	{
+		packed = true;
+	}
+	else if (std::memcmp(magic, kMagicRaw, sizeof magic) != 0)
+	{
+		for (const char *old : kSuperseded)
+		{
+			if (std::memcmp(magic, old, sizeof magic) != 0) continue;
+			std::fclose(f);
+			clear();
+			return true;
+		}
+		return give_up("that is not a state history");
+	}
+
+	/* The rest, raw or as one zstd stream, through the reader spilled bodies
+	 * already go through. It is bounded by the file: a record claiming more
+	 * than there is fails here rather than reading past the end. */
+	uint64_t fileLen = 0;
+	if (!seekEnd(f) || !tellAt(f, fileLen) || fileLen < sizeof magic) return give_up("the state history is damaged");
+	SpillBodyReader in;
+	if (!in.open(f, sizeof magic, fileLen - sizeof magic, packed)) return give_up("the state history could not be read");
+	/* a length the file cannot hold is damage, not an allocation to try; packed,
+	 * the file holds at most what zstd's densest block (a run, 3 bytes for up to
+	 * 128 KB) could expand to */
+	const uint64_t most = packed ? fileLen << 16 : fileLen;
+
+	uint64_t idLen = 0;
+	if (!in.readU64(idLen) || idLen > (1u << 20)) return give_up("the state history is damaged");
+	std::string id(static_cast<size_t>(idLen), '\0');
+	if (!in.read(id.data(), id.size())) return give_up("the state history is damaged");
+	if (id != (machineId != nullptr ? machineId : ""))
+	{
+		/* Not damage, and not an error the user did anything about: these states
+		 * belong to a machine with other settings, files or core. */
+		std::fclose(f);
+		clear();
+		return true;
+	}
+
+	/* A body record. 3 and 4: length, bytes. 5: raw length, held length,
+	 * bytes - and held < raw is a zstd frame, taken as it is. A frame is not
+	 * decoded here to be checked; one that will not decode is found by the
+	 * restore that needs it, which drops that stretch and says so, the way any
+	 * chain that will not walk is treated. */
+	auto readBody = [&](Body &out) {
+		uint64_t rawLen = 0, heldLen = 0;
+		if (!in.readU64(rawLen)) return false;
+		heldLen = rawLen;
+		if (held)
+		{
+			if (!in.readU64(heldLen) || heldLen > rawLen) return false;
+			/* what a frame that long could decode to, at zstd's densest */
+			if (heldLen < rawLen && rawLen > (heldLen << 16)) return false;
+		}
+		if (heldLen > most) return false;
+		Bytes bytes(static_cast<size_t>(heldLen));
+		if (!in.read(bytes.data(), bytes.size())) return false;
+		out = heldLen < rawLen ? Body::makePacked(std::move(bytes), rawLen) : Body::make(std::move(bytes));
+		return true;
+	};
+
+	uint64_t segCount = 0;
+	if (!in.readU64(segCount)) return give_up("the state history is damaged");
+	for (uint64_t i = 0; i < segCount; i++)
+	{
+		Segment seg;
+		uint64_t anchorFrame = 0, deltaCount = 0, noteLen = 0;
+		if (!in.readU64(anchorFrame)) return give_up("the state history is damaged");
+		seg.anchorFrame = static_cast<int64_t>(anchorFrame);
+		if (!readBody(seg.anchor)) return give_up("the state history is damaged");
+		if (!in.readU64(noteLen) || noteLen > kMaxNote) return give_up("the state history is damaged");
+		seg.anchorNote.resize(static_cast<size_t>(noteLen));
+		if (!in.read(seg.anchorNote.data(), seg.anchorNote.size())) return give_up("the state history is damaged");
+		if (!in.readU64(deltaCount)) return give_up("the state history is damaged");
+		seg.bytes = seg.anchor.held();
+		int64_t landed = seg.anchorFrame;
+		for (uint64_t d = 0; d < deltaCount; d++)
+		{
+			uint64_t endFrame = 0;
+			if (!in.readU64(endFrame) || !in.readU64(noteLen) || noteLen > kMaxNote)
+			{
+				return give_up("the state history is damaged");
+			}
+			std::vector<uint8_t> note(static_cast<size_t>(noteLen));
+			if (!in.read(note.data(), note.size())) return give_up("the state history is damaged");
+			/* the spans have to tile: a file whose links go backwards or stand
+			 * still would offer frames it cannot walk to */
+			if (static_cast<int64_t>(endFrame) <= landed) return give_up("the state history is damaged");
+			landed = static_cast<int64_t>(endFrame);
+			Body delta;
+			if (!readBody(delta)) return give_up("the state history is damaged");
+			seg.bytes += delta.held();
+			seg.links.push_back(Link{ std::move(delta), landed, std::move(note) });
+		}
+		m_bytes += seg.bytes;
+		/* An older file's bodies arrive raw and are packed here, in line,
+		 * before the budget looks at them: a history saved from twenty packed
+		 * stretches would otherwise be thinned to three the moment it came
+		 * back. The newest stretch is the one still written to, and stays raw
+		 * until it closes. A 5 arrives as it was held. */
+		if (!held && i + 1 < segCount) packSegmentNow(seg);
+		m_segments.push_back(std::move(seg));
+		/* Per segment, not at the end: a history can be larger than the budget
+		 * - that is what spilling is for - and holding all of it at once while
+		 * deciding what to keep would be the very thing this design removed. */
+		if (enabled()) evict();
+	}
+	std::fclose(f);
+	if (enabled()) evict();
+	return true;
+}
+
+} // namespace chimera

@@ -21,7 +21,22 @@ A single JSON file (extension `.chimeraProject`) that contains literally
 everything required to reproduce the work, except the data bytes
 themselves, which are named by their SHA1:
 
-- **Core identity**: package name, version, hash - pinned at creation.
+- **Core identity**: package name, version, hash - pinned at creation, and
+  re-pinned by a save to the core that actually ran. Opening a project on
+  another build warns and starts the greenzone empty (the cached states were
+  another machine's); saving then records the build in use, so the question is
+  asked once rather than at every open. The Chimera version is rewritten by
+  every save the same way, with the one that created the project kept beside it
+  (`OriginalEmuVersion`).
+- **What the cached states are** (issue #115): `StateFormat`, the savestate
+  format number the engine was on when this project was last saved, and
+  `StateWrittenBy`, the build that wrote them. Read at the next open: when the
+  number has moved, the person is told once that those states cannot be loaded
+  and why, instead of finding out one refused branch at a time. The engine still
+  checks every state file for itself - this is the same news, said earlier and
+  about the whole cache (docs/state-manager.md, "The savestate format number").
+  A project saved before these existed says nothing, and silence is not a
+  disagreement.
 - **File manifest**: names + SHA1 + the core-defined slot id each file
   fills (cdrom, floppy, hdd, config, ...), order within a slot = swap
   order, cue-referenced bins auto-added as support, cue closure enforced.
@@ -31,6 +46,11 @@ themselves, which are named by their SHA1:
   concept; the engine's `ce_multifile_*` code evolves into this section,
   and headless descriptors remain available during the transition.
 - **Firmware**: resolved at creation, pinned by hash.
+- **Compiled code**: for a core that translates the machine's code before
+  running it, the list of objects it compiled for this game - names and
+  SHA1s, never the files, which regenerate from the game and the package
+  (docs/compile-cache.md). The wizard will not create a project until they
+  all exist.
 - **Settings**: defined once, in the creation wizard. There is ONE kind
   of setting: every setting shapes the machine, so all of them are part
   of the reproduction contract. (The BizHawk lineage's "settings"
@@ -40,19 +60,37 @@ themselves, which are named by their SHA1:
   the movie; publishing a finished TAS means handing over the project
   file, and anyone holding files matching the SHA1s can reproduce
   everything.
+- **TAStudio's layout** (user-decided, 2026-09-15, issue #83): which
+  piano-roll columns are shown, their order and widths, the orientation
+  and how lag frames are shown - the `tastudio` object, written by the
+  frontend and kept verbatim by the engine. It is not a sync setting; it
+  is here because it is part of the work somebody set up. It used to live
+  in the greenzone cache, which is set aside whenever the machine changes
+  (a new core, a new Chimera) and holds only what the last save wrote, so
+  people set their columns up again after every update. A project saved
+  before the move still has it in its cache, which is read once.
 
 Not in the project:
 
-- **Paths.** Never stored. Only names and SHA1s.
-- **Greenzone / cached states.** A sibling cache file next to the project;
-  if present it is loaded, otherwise the session starts from a clean
-  state-memory slate. Losing it costs recomputation, never work. It records
+- **Paths.** Never stored. Only names and SHA1s. A game that was dumped as a
+  FOLDER therefore cannot be named at all - a directory has no SHA1 - and has
+  to become one file first, reproducibly, so that everyone who packs it gets
+  the same hash (docs/media-maker.md).
+- **Greenzone / cached states.** Kept in the per-user cache, keyed by the
+  project's id (docs/state-manager.md), not beside the project: a project
+  folder is the folder people sync, and a multi-gigabyte sibling there is
+  uploaded again on every save. If present it is loaded, otherwise the
+  session starts from a clean state-memory slate. A greenzone left beside
+  an older project is moved into the cache the first time it is opened.
+  Losing it costs recomputation, never work. It records
   which machine made its states (core build, settings, firmware pins, file
   hashes) and is used only when the project still describes that machine:
   a savestate is the memory of one exact machine, and the sandbox checks
   only the core binary when it loads one.
-- **Per-user preferences.** Keybinds, window layout, hotkeys stay in user
-  config; the project holds only what affects sync and reproduction.
+- **Per-user preferences.** Keybinds, window positions, hotkeys and
+  TAStudio's own preferences (font, autosave, scrolling) stay in user
+  config; the project holds what affects sync and reproduction, and the
+  one exception above.
 
 ## Creation
 
@@ -165,7 +203,10 @@ the user can own); the chosen file's actual hash is recorded.
 The wizard's firmware page inspects the Firmware folder (a path entry)
 FIRST, so a dump dropped there once satisfies wizards forever: every
 plausible file is hashed and matched, and a satisfied requirement
-shows its checkmark and the file in use. A per-item Select File button
+shows its checkmark and the file in use. Config > Firmware is the same
+question asked of every installed core at once, before any project: it
+surveys the packages present, says what the folder already answers, and
+takes a file for the rest - remembered where it lives, never copied. A per-item Select File button
 covers what the folder could not - allowed even when something was
 found - and only the exact file satisfies. Create stays DISABLED until
 every requirement is satisfied.
@@ -177,7 +218,14 @@ than creation: each pin must be matched exactly, by hash, from the
 Firmware folder or the remembered paths - whichever file matches is
 what the session mounts - and a pin nothing satisfies takes a severe
 are-you-sure (different firmware is a different machine: expect
-desync) to get past.
+desync) to get past. "Plausible" is by size alone, and the bar is a
+gigabyte: a PS3 system software update is 206 MB and is firmware, and
+the bar it replaced (64 MiB) let no PS3 project ever find its own,
+while a disc image is bigger still. That check is also the one that
+does the mounting: for a while it existed but nothing called it, so a
+project whose config remembered no path booted its disc with no system
+software and no word about it - a machine that ran, polled nothing and
+drew nothing (2026-09-03).
 
 The declaration lives in a static file generated at core build time and
 shipped in the core package - the same pattern as `waterbox.config` for
@@ -217,6 +265,13 @@ to build the form, and by `ce_project_*` to validate a manifest:
   floppy or a hard disk - the user's slot choice resolves what
   sniffing had to guess).
 - `help`: the circled-question-mark tooltip text.
+- `namePattern` / `nameHelp` (optional): a regular expression the FILE
+  NAME must match, for a slot whose files the core reads by name (a
+  Dreamcast's memory cards are `vmu_A1.bin`..`vmu_D1.bin` and nothing
+  else). The wizard refuses a file that does not match when it is
+  picked, saying `nameHelp` (or `help`), instead of the core refusing
+  the whole project at boot. The engine does not enforce it: the core
+  still says no at load, which is what a hand-written project meets.
 - `exposedWhen` (optional): the condition language above, evaluated over
   the CURRENT slot map (settings do not take part - the files come
   first in the wizard). The form re-evaluates after every add and
@@ -252,31 +307,57 @@ SHA1 is checked and divergence is warned about immediately, in the dialog.
 A differing file NAME on disk is fine - the project's recorded name is the
 canonical label and mount name, the hash is the identity.
 
-### The local sidecar: `<project>.chimeraLocal`
+### Where this machine last found the files
 
 The project carries names and hashes and never a path, because it is meant
 to be handed to someone else and a path is true of one machine only. But
 the machine that made it knows where those files are, and asking it again
 every time you open your own work is friction for nothing.
 
-So the paths live in a sibling with the same name and a different
-extension, written whenever the project is saved and whenever one is
-opened: `{"files": {"<name>": "<path>"}, "firmware": {"<id>": "<path>"}}`.
-It is never distributed, and never authority - a HINT. Every path it
-offers is checked: the file must still be there and still hash to what the
-project records, and a path that now holds something else is put back to
-unresolved so the dialog asks rather than mounting the wrong bytes
-quietly. Deleting it costs nothing but the asking. A machine that has no
-sidecar behaves exactly as before.
+So the paths are remembered: `{"files": {"<name>": "<path>"}, "firmware":
+{"<id>": "<path>"}}`, written whenever the project is saved and whenever
+one is opened. They are never distributed, and never authority - HINTS.
+Every path is checked: the file must still be there and still hash to what
+the project records, and a path that now holds something else is put back
+to unresolved so the dialog asks rather than mounting the wrong bytes
+quietly. Losing them costs nothing but the asking, and a machine that has
+never seen the project behaves exactly as before.
+
+They live in the PER-USER CACHE, keyed by the project's id
+(docs/state-manager.md), not in a file beside the project. A
+`.chimeraProject` is the one file that exists as far as anyone else is
+concerned: it is what gets handed over, and what a cloud folder syncs, so
+nothing that can be recomputed belongs in the folder with it. The key is
+the id rather than the path because a path stops being true the moment the
+file is renamed, moved, or opened on another machine through a synced
+folder - and because two attempts at the same game must not share a cache,
+which anything derived from the contents would have got wrong. A project
+written before ids existed is given one when it opens and keeps it from
+its next save; a `<project>.chimeraLocal` left beside an older project is
+read once, moved into the cache, and taken out of the folder.
 
 The engine keeps each file's source path in memory (`ce_project_file_source_path`)
 so a frontend can write one, and never serializes it: the distributable
 file stays free of paths by construction, not by convention.
 
-Core pin mismatch (installed package differs from the pinned
-version+hash): refuse by default with a clear pinned-vs-installed message,
+The pinned build runs whenever it is installed, beside any other builds of the
+same core (issue #63): several builds of one core can be loaded in a session as
+long as their packages are different bytes, and a project is never booted on
+whichever of them happened to load first.
+
+Core pin mismatch (the pinned build is not installed, and another build of the
+core is): refuse by default with a clear pinned-vs-installed message,
 with a knowing override - and the project then records what actually ran,
 mirroring the file-hash posture.
+
+Build skew (issue #115): once the core is running, the date this Chimera was
+built on is held against the date the core package says it was built on
+(`versionDate`, issue #67). More than a fortnight apart and an on-screen message
+names both dates, both builds and what to do. It is a heuristic and nothing
+more: it never refuses, never asks, and says nothing at all when either side
+does not date itself. What actually decides whether a state can be read is the
+savestate format number, checked state by state in the engine
+(docs/state-manager.md).
 
 Opening boots the machine EXACTLY ONCE. The movie (which is the project)
 is queued before the rom load, so the single boot already runs with the
@@ -288,6 +369,83 @@ load, TAStudio open, tasproj load - seconds each on a machine with a
 checks a project-recorded setting is live in the guest. Headless runs
 skip the TAStudio landing (it opens paused, and nobody is there to
 operate it): they just play the project.
+
+## Recovery
+
+The work in a project survives any end of the process - a GPU driver that
+fast-fails, a kill, a power cut - because none of it waits for a crash to be
+saved (docs/design-principles.md, "A crash takes nothing that was entered").
+
+While a project is open, its recovery folder is `<data>/Recovery/<id>/` - its
+own root, never inside the project's cache, so removing a greenzone cannot take
+it:
+
+- `work.journal` - one journal for all of the work. The engine writes the
+  movie's input log into it (`ce_movie_log_journal_open_with`), and the frontend
+  writes its markers and branches in the same fresh file; then every change is
+  appended as it happens - an input by the engine, a marker or branch by the
+  frontend (`ce_movie_log_journal_note`: `M` the markers, `B` one branch whole,
+  `O` the branch order) - flushed to the OS at once and synced at most once a
+  second. It is rewritten only when it has grown well past its last image.
+- `snapshot.chimeraProject` - the rest of the project as it stands (settings,
+  headers; never the greenzone), rewritten every few seconds while there is
+  unsaved work, and at once when an error is caught.
+- `session.json` - the process that owns the folder and the project's title, so
+  a project open in another running Chimera is never mistaken for a crash.
+
+The folder is a cache entry of its own ("Unsaved work" in the cache manager),
+locked by default: the auto-clean never takes it, it is in use while its
+session runs, and removing it by hand is a person's decision. Closing the
+project removes it.
+
+Opening a project whose folder outlived its process rebuilds the work first: the
+newer of the snapshot and the saved file, with the journal's inputs, markers and
+branches, written to the backups folder as `<name>.recovered <time>.chimeraProject`.
+The person is then asked whether to open that work in place of the file's (it
+opens unsaved; saving writes it to the project) or the project as last saved
+(the copy stays). A recovered copy never overwrites a project. Headless runs do
+not ask; they report the copy's path. A folder left where an earlier build kept
+it (`Projects/<id>/recovery`) is moved to the new root the first time.
+
+## Crash notes
+
+Recovery keeps the work; a crash note says why it was needed. A crash that no
+handler sees - a graphics driver that fast-fails, an access violation nothing
+catches - still leaves `<data>/Crashes/<time> pid<id>.txt` and a minidump
+(`.dmp`) beside it, on Windows.
+
+Nothing in the dying process writes them. At start Chimera registers
+`dll/chimera_crash.dll` with Windows Error Reporting
+(`WerRegisterRuntimeExceptionModule`; the per-user registry list
+`HKCU\Software\Microsoft\Windows\Windows Error Reporting\RuntimeExceptionHelperModules`
+allows it, so no administrator is needed). When the process dies, WER loads that
+module into WerFault.exe and hands it the dead process. The module reads a
+block Chimera keeps in its own memory - the folder to write to, the frame (set
+every loop), and a few lines about the session (the project, the machine and the
+movie header, set when a project boots) - and writes:
+
+- the note: time, process id, exception code and kind (a fast fail's own code
+  too), the address and the module and offset it is in, the frame, the session
+  lines, and the faulting thread's stack, symbolized as far as the modules'
+  exports allow. Each line is flushed as it is written, so a note is never lost
+  to the dump that follows it.
+- the minidump: threads, modules and the memory the stacks reference; enough to
+  open in WinDbg.
+- in the note, when a GPU drew: the last calls that crossed the GPU bridge,
+  named, oldest first, with where frames took and gave back the context and
+  where a state was loaded (docs/gpu-bridge.md, "The flight recorder").
+
+The module claims nothing; Windows still records the crash as it always does.
+Registry values naming a `chimera_crash.dll` that no longer exists (a moved or
+deleted install) are removed at start, and only the newest 20 notes are kept.
+
+Opening a project whose recovery folder outlived its process looks for the note
+that process left (the same process id, written after it started) and says what
+ended it - "a fast fail in nvoglv64.dll+0x108eb9d (the NVIDIA graphics driver)
+at frame 21" - and where the note is.
+
+Linux has no equivalent here: the journal still keeps the work, and the kernel's
+core dump settings decide what else is kept.
 
 ## Architecture decisions
 

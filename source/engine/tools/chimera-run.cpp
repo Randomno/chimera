@@ -7,7 +7,8 @@
  * the managed frontend produces.
  *
  *   chimera-run <package> <rom> <movie.txt>
- *       [--rerecord] [--seek <frame>] [--record <out.txt>] [--settings <json>]
+ *       [--rerecord] [--seek <frame>] [--play <n>] [--edit-from <movie>] [--stop-at-seek] [--bands n,m,ms,fs,anchor] [--record <out.txt>]
+ *       [--settings <json>]
  *       [--dump <domain>=<path>]... [--export-savedata <dir>] [--meta <path>]
  *   chimera-run --project <p.chimeraProject> <package>
  *       [--files <dir>]... [--allow-core-mismatch] [the same run flags]
@@ -24,6 +25,17 @@
  *
  * --rerecord round-trips the whole machine through save/load state around
  * every frame, which must not change anything - that is the point.
+ * --bands sets the history's density at each distance from the playhead;
+ * --greenzone <MB> its memory budget and --spill <dir> where the far band
+ * goes when that budget is full; --greenzone-disk <MB> bounds that file too
+ * (near frames, mid frames, mid stride, far stride, anchor spacing; 0 keeps a
+ * default). Its use in a test is to make the bands narrow enough that the
+ * history is constantly coarsening, which is what the defaults spend minutes
+ * of real play reaching.
+ *
+ * --stop-at-seek ends the run where the seek landed, so the dumps describe
+ * frame N itself rather than the end of a replay from it.
+ *
  * --seek plays the movie to its end, seeks BACK to the given frame through
  * the greenzone, and plays to the end again - and that must not change
  * anything either.
@@ -32,6 +44,9 @@
  * log itself, and it is written to <out.txt>. Feeding that file back in as an
  * ordinary movie must reach the same machine - which is what witnesses record
  * mode and entry generation, the paths playback never touches.
+ * --history-out <file> keeps the state history, and --history-in <file> starts
+ * from one kept earlier - which is what reopening a project does, and the only
+ * way to witness that a history outlives the process that made it.
  * --export-savedata writes the core's exported save-data tree under <dir>
  * after the run (docs/save-data.md) - the gates diff it like a memory dump.
  * --firmware <id>=<path> mounts a firmware file under the id the core declares
@@ -39,6 +54,9 @@
  * and the SHA1 it expects; this tool has no user to ask, so it mounts what it
  * is given and the engine checks the hash.
  * --save-state <frame>=<path> writes the whole machine after that frame;
+ * --save-state-file <frame>=<path> and --state-file <path> are the same through a
+ * state KEPT IN A FILE (no size limit; what a TAStudio branch keeps), and
+ * --state-file-roundtrip <frame> saves to one and loads it straight back.
  * --state <path> starts from one instead of from power-on, and --frames <n>
  * stops after n. The three together are for looking at a picture: a state saved
  * near the end of a long movie makes "what does this frame look like" a
@@ -46,6 +64,10 @@
  * still starts at 0, so the INPUT after a loaded state is the movie's first
  * entries rather than the ones that belong there - fine for a rendering
  * question, wrong for anything about the machine.
+ * --draw-every-frame keeps the core drawing on frames nobody looks at and
+ * skips only the readback (ce_session_draw_every_frame) - which is what a core
+ * whose picture persists on the GPU needs, and what --render-every-frame
+ * over-pays for.
  * --screenshot <frame>=<path> writes one frame's picture as a TGA. Repeatable.
  * The run is otherwise undrawn (turbo), so only the frames asked for cost
  * anything to draw - which is what makes "show me frame 1910 of this movie" a
@@ -54,6 +76,7 @@
 
 #include "chimera/engine.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -62,6 +85,9 @@
 
 #ifdef _WIN32
 #include <direct.h>
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <shellapi.h>
 #else
 #include <sys/stat.h>
 #endif
@@ -138,10 +164,44 @@ int fail(const std::string &metaPath, const std::string &detail)
 	return 2;
 }
 
+#if defined(_WIN32)
+// The C runtime hands main an ANSI argv: a path with a letter outside the
+// code page ("Broderbund" with its o-slash) arrives already wrong. The wide
+// command line is what the shell really said; every path here is UTF-8 from
+// this point on, as the engine takes them.
+std::vector<std::string> utf8Arguments()
+{
+	std::vector<std::string> out;
+	int n = 0;
+	wchar_t **wide = CommandLineToArgvW(GetCommandLineW(), &n);
+	if (wide == nullptr) return out;
+	for (int i = 0; i < n; i++)
+	{
+		int len = WideCharToMultiByte(CP_UTF8, 0, wide[i], -1, nullptr, 0, nullptr, nullptr);
+		std::string s(len > 0 ? static_cast<size_t>(len - 1) : 0, '\0');
+		if (len > 0) WideCharToMultiByte(CP_UTF8, 0, wide[i], -1, &s[0], len, nullptr, nullptr);
+		out.push_back(std::move(s));
+	}
+	LocalFree(wide);
+	return out;
+}
+#endif
+
 } // namespace
 
 int main(int argc, char **argv)
 {
+#if defined(_WIN32)
+	std::vector<std::string> utf8 = utf8Arguments();
+	std::vector<char *> utf8Argv;
+	if (!utf8.empty())
+	{
+		for (std::string &a : utf8) utf8Argv.push_back(&a[0]);
+		utf8Argv.push_back(nullptr);
+		argc = static_cast<int>(utf8.size());
+		argv = utf8Argv.data();
+	}
+#endif
 	const char *packagePath = nullptr, *romPath = nullptr, *moviePath = nullptr;
 	const char *settings = nullptr;
 	std::string metaPath;
@@ -150,21 +210,107 @@ int main(int argc, char **argv)
 	std::vector<std::pair<std::string, std::string>> firmwareArgs; // id -> path
 	std::map<int64_t, std::string> stateOuts; // frame -> state path
 	std::string stateIn;
+	std::string stateFileIn;                       // --state-file: the same, from a state kept in a file
+	std::map<int64_t, std::string> stateFileOuts; // --save-state-file frame -> path
+	int64_t stateFileRoundTrip = -1;               // --state-file-roundtrip frame
 	int64_t frameLimit = -1;
 	bool rerecord = false;
 	int64_t seekFrame = -1;
+	bool stopAtSeek = false;
+	std::string bands;
+	std::string spillDir;
+	int64_t greenzoneMb = 256;
+	int64_t greenzoneDiskMb = 0;
+	std::string greenzoneMap; // where to write the frames the history holds at the end
+	int64_t greenzoneMaxStride = 0; // 0: the engine's default cap
+	int64_t greenzoneBandGoal = 0; // 0: the engine's default goal
+	int64_t greenzoneBytes = -1;   // an exact budget in bytes, for machines too small to fill a megabyte
 	std::string recordPath;
 	std::string savedataDir;
 	std::string projectPath;
+	std::string historyIn, historyOut;
+	/* --history-out-later: save the history the way a PROJECT save does - queued
+	 * on the writer (ce_session_history_save_later) and waited for - rather than
+	 * in line. The frontend's autosave takes the queued path and chimera-run has
+	 * only ever taken the synchronous one, which is the one structural
+	 * difference between them; this exists to ask whether that is why a
+	 * greenzone reloaded through the frontend diverges when one reloaded through
+	 * this tool does not. */
+	bool historyOutLater = false;
+	/* --play/--edit-from/--final-state: the re-recording shape. Play a while,
+	 * seek back, put a DIFFERENT movie in from that frame on, and carry on past
+	 * where the first pass reached. What comes out has to be what a straight run
+	 * of the edited movie produces - that is the whole promise a tool-assisted
+	 * run rests on, and nothing else here tests it, because --seek replays the
+	 * same inputs and can pass with the edit path broken. */
+	int64_t playFrames = -1;
+	std::string editFrom, finalStatePath, finalShot, finalBuses;
+	std::vector<std::pair<std::string, std::string>> finalBusDumps;
 	std::vector<std::string> fileDirs;
 	bool allowCoreMismatch = false;
 	bool wantGpu = false;
+	/* Frames are drawn only when a screenshot asks for one, which makes this
+	 * runner a measurement of a seek rather than of play. --render-every-frame
+	 * is the other half of that A/B: the same run, drawing. */
+	bool renderEveryFrame = false;
+	bool drawEveryFrame = false;
+	/* --rewind-loop <frame>,<times>: what re-recording actually does. A single
+	 * --seek asks whether the history holds one frame; this asks whether doing
+	 * it over and over leaves the machine, and the PICTURE, where a straight
+	 * run leaves them. A renderer whose objects live outside the savestate
+	 * degrades a little on each pass, and only a repetition shows it. */
+	int64_t rewindTo = -1;
+	int64_t rewindTimes = 0;
+	/* --greenzone-check: the machine at the seek/rewind destination, restored
+	 * through the history, must be byte-for-byte the machine the first pass had
+	 * at that frame. A full ce_session_save_state is captured there on the way
+	 * out, and every landing is compared against it. This catches a greenzone
+	 * DELTA restore that drops or mis-restores a guest page - which a dump
+	 * comparison at the end cannot, because a replay from the landing runs the
+	 * GPU (outside the savestate) and its output is not deterministic, whereas
+	 * the guest memory AT the frame is. The suspected cause of the Ruffle
+	 * rewind crashes (guest heap/GC corruption after a restore, 2026-09-14). */
+	bool greenzoneCheck = false;
+	/* --greenzone-check-vs-restore: take the reference from the FIRST restore
+	 * rather than from the forward pass. Comparing a restore against the
+	 * forward pass asks whether the history reproduces the machine the run
+	 * HAD; comparing restores against each other asks whether the history is
+	 * self-consistent - and for a core whose guest memory takes bytes back
+	 * from a GPU (outside the savestate), only the second question has a
+	 * defined answer. */
+	bool gzTruthFromRestore = false;
+	std::vector<uint8_t> gzTruth;
+	/* How many frames before the destination to start DRAWING again. A seek
+	 * replays with rendering off, and a renderer whose display stage carries
+	 * state from frame to frame needs a few composed frames to catch up. */
+	int64_t rewindWarmup = 1;
 
 	for (int i = 1; i < argc; i++)
 	{
 		std::string arg = argv[i];
 		if (arg == "--rerecord") rerecord = true;
 		else if (arg == "--seek" && i + 1 < argc) seekFrame = std::atoll(argv[++i]);
+		else if (arg == "--play" && i + 1 < argc) playFrames = std::atoll(argv[++i]);
+		else if (arg == "--edit-from" && i + 1 < argc) editFrom = argv[++i];
+		else if (arg == "--final-state" && i + 1 < argc) finalStatePath = argv[++i];
+		else if (arg == "--final-screenshot" && i + 1 < argc) finalShot = argv[++i];
+		else if (arg == "--final-buses" && i + 1 < argc) finalBuses = argv[++i];
+		else if (arg == "--final-bus" && i + 1 < argc)
+		{
+			std::string spec = argv[++i];
+			size_t eq = spec.find('=');
+			if (eq == std::string::npos) { std::fprintf(stderr, "--final-bus wants NAME=PATH\n"); return 2; }
+			finalBusDumps.emplace_back(spec.substr(0, eq), spec.substr(eq + 1));
+		}
+		else if (arg == "--bands" && i + 1 < argc) bands = argv[++i];
+		else if (arg == "--spill" && i + 1 < argc) spillDir = argv[++i];
+		else if (arg == "--greenzone" && i + 1 < argc) greenzoneMb = std::atoll(argv[++i]);
+		else if (arg == "--greenzone-disk" && i + 1 < argc) greenzoneDiskMb = std::atoll(argv[++i]);
+		else if (arg == "--greenzone-map" && i + 1 < argc) greenzoneMap = argv[++i];
+		else if (arg == "--greenzone-max-stride" && i + 1 < argc) greenzoneMaxStride = std::atoll(argv[++i]);
+		else if (arg == "--greenzone-band-goal" && i + 1 < argc) greenzoneBandGoal = std::atoll(argv[++i]);
+		else if (arg == "--greenzone-bytes" && i + 1 < argc) greenzoneBytes = std::atoll(argv[++i]);
+		else if (arg == "--stop-at-seek") stopAtSeek = true;
 		else if (arg == "--record" && i + 1 < argc) recordPath = argv[++i];
 		else if (arg == "--settings" && i + 1 < argc) settings = argv[++i];
 		else if (arg == "--export-savedata" && i + 1 < argc) savedataDir = argv[++i];
@@ -173,6 +319,22 @@ int main(int argc, char **argv)
 		else if (arg == "--files" && i + 1 < argc) fileDirs.push_back(argv[++i]);
 		else if (arg == "--allow-core-mismatch") allowCoreMismatch = true;
 		else if (arg == "--gpu") wantGpu = true;
+		else if (arg == "--render-every-frame") renderEveryFrame = true;
+		else if (arg == "--draw-every-frame") drawEveryFrame = true;
+		else if (arg == "--greenzone-check") greenzoneCheck = true;
+		else if (arg == "--greenzone-check-vs-restore") { greenzoneCheck = true; gzTruthFromRestore = true; }
+		else if (arg == "--rewind-warmup" && i + 1 < argc) rewindWarmup = std::atoll(argv[++i]);
+		else if (arg == "--rewind-loop" && i + 1 < argc)
+		{
+			std::string spec = argv[++i];
+			auto comma = spec.find(',');
+			if (comma == std::string::npos) return fail(metaPath, "--rewind-loop wants <frame>,<times>");
+			rewindTo = std::atoll(spec.substr(0, comma).c_str());
+			rewindTimes = std::atoll(spec.substr(comma + 1).c_str());
+		}
+		else if (arg == "--history-in" && i + 1 < argc) historyIn = argv[++i];
+		else if (arg == "--history-out" && i + 1 < argc) historyOut = argv[++i];
+		else if (arg == "--history-out-later" && i + 1 < argc) { historyOut = argv[++i]; historyOutLater = true; }
 		else if (arg == "--firmware" && i + 1 < argc)
 		{
 			std::string spec = argv[++i];
@@ -188,6 +350,15 @@ int main(int argc, char **argv)
 			stateOuts[std::atoll(spec.substr(0, eq).c_str())] = spec.substr(eq + 1);
 		}
 		else if (arg == "--state" && i + 1 < argc) stateIn = argv[++i];
+		else if (arg == "--state-file" && i + 1 < argc) stateFileIn = argv[++i];
+		else if (arg == "--state-file-roundtrip" && i + 1 < argc) stateFileRoundTrip = std::atoll(argv[++i]);
+		else if (arg == "--save-state-file" && i + 1 < argc)
+		{
+			std::string spec = argv[++i];
+			auto eq = spec.find('=');
+			if (eq == std::string::npos) return fail(metaPath, "--save-state-file wants <frame>=<path>");
+			stateFileOuts[std::atoll(spec.substr(0, eq).c_str())] = spec.substr(eq + 1);
+		}
 		else if (arg == "--frames" && i + 1 < argc) frameLimit = std::atoll(argv[++i]);
 		else if (arg == "--screenshot" && i + 1 < argc)
 		{
@@ -211,7 +382,7 @@ int main(int argc, char **argv)
 	bool projectMode = !projectPath.empty();
 	if (projectMode ? packagePath == nullptr : moviePath == nullptr)
 	{
-		std::fprintf(stderr, "usage: chimera-run <package> <rom> <movie.txt> [--rerecord] [--seek <frame>] [--record <out.txt>] [--settings <json>] [--dump <domain>=<path>]... [--firmware <id>=<path>]... [--state <path>] [--frames <n>] [--save-state <frame>=<path>]... [--screenshot <frame>=<path>]... [--export-savedata <dir>] [--meta <path>] [--gpu]\n"
+		std::fprintf(stderr, "usage: chimera-run <package> <rom> <movie.txt> [--rerecord] [--seek <frame>] [--play <n>] [--edit-from <movie>] [--stop-at-seek] [--bands n,m,ms,fs,anchor] [--record <out.txt>] [--settings <json>] [--dump <domain>=<path>]... [--firmware <id>=<path>]... [--state <path>] [--frames <n>] [--save-state <frame>=<path>]... [--screenshot <frame>=<path>]... [--export-savedata <dir>] [--meta <path>] [--gpu] [--draw-every-frame]\n"
 			"       chimera-run --project <p.chimeraProject> <package> [--files <dir>]... [--allow-core-mismatch] [the same run flags]\n");
 		return 1;
 	}
@@ -445,6 +616,8 @@ int main(int argc, char **argv)
 		static_cast<int32_t>(extraNames.size()), &error);
 	if (session == nullptr) return fail(metaPath, error != nullptr ? error : "session open failed");
 
+	if (drawEveryFrame) ce_session_draw_every_frame(session, 1);
+
 	int64_t frames = ce_movie_log_count(movie);
 
 	/* the movie is the SESSION's from here: the engine parses entries, tracks
@@ -461,7 +634,51 @@ int main(int argc, char **argv)
 	 * a limit applied after it would leave the decoded input shorter than the
 	 * run. */
 	if (frameLimit >= 0 && (frameLimit < frames || !recordPath.empty())) frames = frameLimit;
-	if (seekFrame >= 0) ce_session_greenzone_enable(session, 256ull << 20);
+	/* --rewind-loop needs the history too: it seeks back through it, and a run
+	 * without one fails at the first pass with "no stored state at or before
+	 * the target frame". */
+	if (seekFrame >= 0 || rewindTo >= 0 || !historyIn.empty() || !historyOut.empty() || !greenzoneMap.empty()
+		|| greenzoneBytes > 0)
+	{
+		/* Bands before enabling: enabling captures the anchor, and the anchor
+		 * spacing decides whether it is the only one. */
+		if (!bands.empty())
+		{
+			int64_t v[5] = { 0, 0, 0, 0, 0 };
+			size_t at = 0;
+			for (int64_t &slot : v)
+			{
+				if (at > bands.size()) break;
+				const size_t comma = bands.find(',', at);
+				slot = std::atoll(bands.substr(at, comma == std::string::npos ? comma : comma - at).c_str());
+				if (comma == std::string::npos) break;
+				at = comma + 1;
+			}
+			ce_session_greenzone_bands(session, v[0], v[1], v[2], v[3], v[4]);
+		}
+		/* Where the far band goes when the budget is full. Without one the
+		 * history can only DROP, which is why the default here is nowhere: a
+		 * measurement of what the greenzone costs should not quietly become a
+		 * measurement of what the disk costs. */
+		if (!spillDir.empty()) ce_session_greenzone_spill(session, spillDir.c_str());
+		ce_session_greenzone_disk_budget(session, (uint64_t)greenzoneDiskMb << 20);
+		if (greenzoneMaxStride > 0) ce_session_greenzone_max_near_stride(session, greenzoneMaxStride);
+		if (greenzoneBandGoal > 0) ce_session_greenzone_band_goal(session, greenzoneBandGoal);
+		ce_session_greenzone_enable(session, greenzoneBytes > 0 ? (uint64_t)greenzoneBytes : (uint64_t)greenzoneMb << 20);
+	}
+	/* A history kept from a previous run, which is the thing a reopened project
+	 * lives on. The machine id is this tool's own convention; a frontend passes
+	 * whatever it knows about cores, settings and files. */
+	if (!historyIn.empty())
+	{
+		const auto t0 = std::chrono::steady_clock::now();
+		if (ce_session_history_load(session, historyIn.c_str(), "chimera-run") != 0)
+		{
+			return fail(metaPath, std::string("history: ") + ce_session_last_error(session));
+		}
+		std::fprintf(stderr, "chimera-run: history loaded in %.1f ms\n",
+			std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+	}
 
 	/* Record mode: decode the source movie's entries into machine input and
 	 * hand THAT to the session, which generates its own log. The source is an
@@ -479,9 +696,12 @@ int main(int argc, char **argv)
 		{
 			std::vector<uint8_t> states(static_cast<size_t>(buttonCount), 0);
 			std::vector<int32_t> axes(static_cast<size_t>(axisCount), 0);
-			/* past the source movie's end the input is idle, which is what the
-			 * two vectors already hold. A run may outlast its input source
-			 * while recording (see --frames above); it may not read past it. */
+			for (int64_t a = 0; a < axisCount; a++) axes[static_cast<size_t>(a)] = ce_session_axis_neutral(session, a);
+			/* past the source movie's end the input is idle: no button, every
+			 * axis at its neutral (0 on a signed stick, 127 on an Apple II
+			 * paddle - zero there is the stick held hard up-left). A run may
+			 * outlast its input source while recording (see --frames above);
+			 * it may not read past it. */
 			if (i < sourceFrames && ce_session_movie_entry_decode_wide(
 					session, ce_movie_log_entry(movie, i),
 					buttonCount != 0 ? states.data() : nullptr,
@@ -511,6 +731,19 @@ int main(int argc, char **argv)
 		}
 	}
 
+	/* --state-file: the same beginning, from a state the engine kept in a file
+	 * (ce_session_state_save_file) - what a TAStudio branch keeps */
+	if (!stateFileIn.empty())
+	{
+		uint8_t tag[64];
+		uint32_t tagLen = 0;
+		if (ce_session_state_load_file(session, stateFileIn.c_str(), tag, sizeof tag, &tagLen) != 0)
+		{
+			return fail(metaPath, ce_session_last_error(session));
+		}
+		fprintf(stderr, "state file tag: %.*s\n", (int)(tagLen < sizeof tag ? tagLen : sizeof tag), (const char *)tag);
+	}
+
 	std::vector<uint8_t> state;
 	if (rerecord)
 	{
@@ -520,7 +753,8 @@ int main(int argc, char **argv)
 		state.assign(p, p + len);
 	}
 
-	for (int64_t i = 0; i < frames; i++)
+	const int64_t firstPass = playFrames >= 0 && playFrames < frames ? playFrames : frames;
+	for (int64_t i = 0; i < firstPass; i++)
 	{
 		if (rerecord && ce_session_load_state(session, state.data(), state.size()) != 0)
 		{
@@ -538,7 +772,8 @@ int main(int argc, char **argv)
 			? nullptr
 			: recAxes[static_cast<size_t>(i)].data();
 		auto shot = shots.find(i);
-		if (ce_session_movie_advance(session, 0, axes, shot != shots.end() ? 1 : 0) < 0)
+		if (ce_session_movie_advance(session, 0, axes,
+			(renderEveryFrame || shot != shots.end()) ? 1 : 0) < 0)
 		{
 			return fail(metaPath, ce_session_last_error(session));
 		}
@@ -559,6 +794,42 @@ int main(int argc, char **argv)
 				return fail(metaPath, "could not write " + st->second);
 			}
 		}
+		auto sf = stateFileOuts.find(i);
+		if (sf != stateFileOuts.end())
+		{
+			const std::string tag = "frame " + std::to_string(i);
+			const auto began = std::chrono::steady_clock::now();
+			if (ce_session_state_save_file(session, sf->second.c_str(), reinterpret_cast<const uint8_t *>(tag.data()), (uint32_t)tag.size()) != 0)
+			{
+				return fail(metaPath, ce_session_last_error(session));
+			}
+			const auto saved = std::chrono::steady_clock::now();
+			uint64_t rawBytes = 0, storedBytes = 0;
+			ce_session_state_file_bytes(session, &rawBytes, &storedBytes);
+			/* and straight back, timed: what a branch costs both ways */
+			if (ce_session_state_load_file(session, sf->second.c_str(), nullptr, 0, nullptr) != 0)
+			{
+				return fail(metaPath, ce_session_last_error(session));
+			}
+			const auto loaded = std::chrono::steady_clock::now();
+			fprintf(stderr, "state file at frame %lld: raw %llu bytes, stored %llu bytes (%.2fx), save %lld ms, load %lld ms\n",
+				(long long)i, (unsigned long long)rawBytes, (unsigned long long)storedBytes,
+				storedBytes != 0 ? (double)rawBytes / (double)storedBytes : 0.0,
+				(long long)std::chrono::duration_cast<std::chrono::milliseconds>(saved - began).count(),
+				(long long)std::chrono::duration_cast<std::chrono::milliseconds>(loaded - saved).count());
+		}
+		/* saved to a file and loaded straight back: the machine must not notice,
+		 * so a run that does this ends exactly where one that does not ends */
+		if (i == stateFileRoundTrip)
+		{
+			const std::string path = (metaPath.empty() ? std::string("chimera-run") : metaPath) + ".roundtrip.state";
+			if (ce_session_state_save_file(session, path.c_str(), nullptr, 0) != 0
+				|| ce_session_state_load_file(session, path.c_str(), nullptr, 0, nullptr) != 0)
+			{
+				return fail(metaPath, ce_session_last_error(session));
+			}
+			std::remove(path.c_str());
+		}
 		if (rerecord)
 		{
 			uint64_t len = 0;
@@ -566,7 +837,78 @@ int main(int argc, char **argv)
 			if (p == nullptr) return fail(metaPath, ce_session_last_error(session));
 			state.assign(p, p + len);
 		}
+		/* the ground truth for --greenzone-check: the machine as the first,
+		 * straight pass had it at the frame every later restore lands on */
+		if (greenzoneCheck && !gzTruthFromRestore && gzTruth.empty())
+		{
+			const int64_t checkFrame = rewindTo >= 0 ? rewindTo : seekFrame;
+			if (checkFrame >= 0 && ce_session_frame(session) == checkFrame)
+			{
+				uint64_t len = 0;
+				const uint8_t *p = ce_session_save_state(session, &len);
+				if (p == nullptr) return fail(metaPath, ce_session_last_error(session));
+				gzTruth.assign(p, p + len);
+			}
+		}
 	}
+
+	/* Compare the machine at a restore landing to that ground truth. First
+	 * differing byte, and how many differ, is enough to point at the dropped
+	 * page; the delta restore is the whole guest image, so an offset maps
+	 * straight to a memory domain. */
+	auto greenzoneVerify = [&](const char *what, int64_t landedFrame) -> const char * {
+		if (!greenzoneCheck) return nullptr;
+		uint64_t len = 0;
+		const uint8_t *p = ce_session_save_state(session, &len);
+		if (p == nullptr) return ce_session_last_error(session);
+		if (gzTruth.empty())
+		{
+			if (!gzTruthFromRestore) return "the ground-truth frame was never reached in the first pass";
+			gzTruth.assign(p, p + len);
+			std::fprintf(stderr, "[greenzone-check] %s at frame %lld: reference taken from this restore (%llu bytes)\n",
+				what, (long long)landedFrame, (unsigned long long)len);
+			std::fflush(stderr);
+			return nullptr;
+		}
+		/* Both machines to disk on any mismatch. The blob carries the dirty map
+		 * and the dirty pages themselves, so comparing the two offline says
+		 * exactly which guest pages the restore failed to reproduce - which a
+		 * size or a first-differing-byte alone cannot. */
+		auto dumpBoth = [&]() {
+			writeWholeFile("gz-truth.state", gzTruth.data(), gzTruth.size());
+			writeWholeFile("gz-restored.state", p, static_cast<size_t>(len));
+			std::fprintf(stderr, "[greenzone-check] wrote gz-truth.state (%zu) and gz-restored.state (%llu)\n",
+				gzTruth.size(), (unsigned long long)len);
+			std::fflush(stderr);
+		};
+		if (len != gzTruth.size())
+		{
+			std::fprintf(stderr, "[greenzone-check] %s at frame %lld: state SIZE changed %zu -> %llu (%lld bytes, %lld pages)\n",
+				what, (long long)landedFrame, gzTruth.size(), (unsigned long long)len,
+				(long long)len - (long long)gzTruth.size(),
+				((long long)len - (long long)gzTruth.size()) / 4096);
+			dumpBoth();
+			return "greenzone restore changed the state size";
+		}
+		uint64_t first = UINT64_MAX, differ = 0;
+		for (uint64_t k = 0; k < len; k++)
+		{
+			if (p[k] != gzTruth[k]) { if (first == UINT64_MAX) first = k; differ++; }
+		}
+		if (differ != 0)
+		{
+			std::fprintf(stderr, "[greenzone-check] %s at frame %lld: %llu of %llu state bytes differ,"
+				" first at 0x%llx (truth %02x, restored %02x)\n",
+				what, (long long)landedFrame, (unsigned long long)differ, (unsigned long long)len,
+				(unsigned long long)first, gzTruth[first], p[first]);
+			dumpBoth();
+			return "greenzone restore did not reproduce the machine";
+		}
+		std::fprintf(stderr, "[greenzone-check] %s at frame %lld: exact (%llu bytes)\n",
+			what, (long long)landedFrame, (unsigned long long)len);
+		std::fflush(stderr);
+		return nullptr;
+	};
 
 	if (seekFrame >= 0)
 	{
@@ -576,9 +918,88 @@ int main(int argc, char **argv)
 		 * it would just restore the cached end state and prove nothing. */
 		if (ce_session_seek(session, seekFrame) != 0) return fail(metaPath, ce_session_last_error(session));
 		if (ce_session_frame(session) != seekFrame) return fail(metaPath, "seek landed on the wrong frame");
+		if (const char *bad = greenzoneVerify("seek", seekFrame)) return fail(metaPath, bad);
+		/* --stop-at-seek dumps the machine the seek ARRIVED AT, rather than the
+		 * machine at the end of a replay from it. It is the difference between
+		 * asking whether the run still finishes correctly and asking whether
+		 * the history actually holds frame N - and a core whose ending is
+		 * decided by its inputs answers the first question yes either way. */
+		if (stopAtSeek) frames = seekFrame;
+		/* The edit itself. A frontend changes the entries a person retyped and
+		 * throws away everything the old ones produced; this puts the whole
+		 * edited movie in, which is the same thing said in one go. The
+		 * invalidate is what makes the forward seek REPLAY rather than restore
+		 * the ending it already had. */
+		if (!editFrom.empty())
+		{
+			std::vector<uint8_t> editText;
+			if (!readWholeFile(editFrom.c_str(), editText))
+			{
+				return fail(metaPath, "could not read " + editFrom);
+			}
+			ce_movie_log *edited = ce_movie_log_new();
+			if (ce_movie_log_parse(edited, reinterpret_cast<const char *>(editText.data()),
+					editText.size()) != 0)
+			{
+				return fail(metaPath, std::string("edit movie: ") + ce_movie_log_last_error(edited));
+			}
+			if (ce_movie_log_count(edited) < frames)
+			{
+				return fail(metaPath, "the edit movie is shorter than the run");
+			}
+			if (ce_session_movie_load(session, edited) != 0)
+			{
+				return fail(metaPath, "could not load the edited movie");
+			}
+			ce_movie_log_free(edited);
+		}
 		ce_session_greenzone_invalidate(session, seekFrame);
-		if (ce_session_seek(session, frames) != 0) return fail(metaPath, ce_session_last_error(session));
+		if (!stopAtSeek)
+		{
+			if (ce_session_seek(session, frames) != 0) return fail(metaPath, ce_session_last_error(session));
+			if (ce_session_frame(session) != frames) return fail(metaPath, "replay landed on the wrong frame");
+		}
+	}
+
+	/* Re-recording, as many times as asked. Each pass goes back to the same
+	 * frame and replays to the end, invalidating first so the replay is a real
+	 * replay rather than a restore of the ending already cached - which is what
+	 * a person retyping inputs makes the frontend do.
+	 *
+	 * The machine must come back the same every time; the dumps at the end say
+	 * whether it did. The picture is the other half, and the reason this exists:
+	 * a renderer whose objects live on the far side of the bridge cannot be
+	 * rewound with the machine, and what that costs only shows over repetition.
+	 */
+	for (int64_t pass = 0; pass < rewindTimes && rewindTo >= 0; pass++)
+	{
+		if (ce_session_seek(session, rewindTo) != 0) return fail(metaPath, ce_session_last_error(session));
+		if (ce_session_frame(session) != rewindTo) return fail(metaPath, "rewind landed on the wrong frame");
+		if (const char *bad = greenzoneVerify("rewind", rewindTo))
+		{
+			std::fprintf(stderr, "[rewind-loop] failed on pass %lld of %lld\n",
+				(long long)(pass + 1), (long long)rewindTimes);
+			return fail(metaPath, bad);
+		}
+		ce_session_greenzone_invalidate(session, rewindTo);
+		/* Stop ONE frame short and take the last one by hand, drawing. A seek
+		 * replays with rendering off - correctly, nobody is looking at the
+		 * frames on the way - so a picture taken after a seek would be whatever
+		 * was last composed rather than this frame. The final frame has to be
+		 * drawn for the screenshot to mean anything. */
+		const int64_t warm = rewindWarmup < 1 ? 1 : rewindWarmup;
+		if (ce_session_seek(session, frames - warm) != 0) return fail(metaPath, ce_session_last_error(session));
+		for (int64_t w = 0; w < warm; w++)
+		{
+			if (ce_session_movie_advance(session, 0, nullptr, 1) < 0)
+			{
+				return fail(metaPath, ce_session_last_error(session));
+			}
+		}
 		if (ce_session_frame(session) != frames) return fail(metaPath, "replay landed on the wrong frame");
+		std::fprintf(stderr, "[rewind-loop] pass %lld of %lld done\n",
+			(long long)(pass + 1), (long long)rewindTimes);
+		std::fflush(stderr);
 	}
 
 	if (!recordPath.empty())
@@ -603,6 +1024,25 @@ int main(int argc, char **argv)
 		}
 	}
 
+	/* --greenzone-map: every frame the history can restore without replaying,
+	 * newest first, one per line - the spacing a person sees in TAStudio's
+	 * green rows, read from the engine rather than from the screen. */
+	if (!greenzoneMap.empty())
+	{
+		std::string text;
+		for (int64_t f = ce_session_frame(session); f >= 0;)
+		{
+			const int64_t stored = ce_session_greenzone_nearest(session, f);
+			if (stored < 0) break;
+			text += std::to_string(stored) + "\n";
+			f = stored - 1;
+		}
+		if (!writeWholeFile(greenzoneMap, reinterpret_cast<const uint8_t *>(text.data()), text.size()))
+		{
+			return fail(metaPath, "could not write " + greenzoneMap);
+		}
+	}
+
 	for (const auto &dump : dumps)
 	{
 		int32_t count = ce_session_domain_count(session);
@@ -615,7 +1055,17 @@ int main(int argc, char **argv)
 				break;
 			}
 		}
-		if (found < 0) return fail(metaPath, "no memory domain named " + dump.first);
+		if (found < 0)
+		{
+			std::string had;
+			for (int32_t d = 0; d < count; d++)
+			{
+				had += (d ? ", " : "");
+				had += ce_session_domain_name(session, d);
+			}
+			return fail(metaPath, "no memory domain named '" + dump.first
+				+ "'; this core has: " + had);
+		}
 		int64_t size = ce_session_domain_size(session, found);
 		std::vector<uint8_t> bytes(static_cast<size_t>(size));
 		ce_session_domain_read(session, found, 0, bytes.data(), size);
@@ -652,6 +1102,92 @@ int main(int argc, char **argv)
 			if (!ok) return fail(metaPath, "could not write " + path);
 		}
 		std::printf("savedata=%d\n", files);
+	}
+
+	if (!finalShot.empty()
+		&& !writeTga(finalShot, ce_session_video(session),
+			ce_session_video_width(session), ce_session_video_height(session)))
+	{
+		return fail(metaPath, "could not write " + finalShot);
+	}
+
+	if (!finalBuses.empty())
+	{
+		/* Every bus the core publishes, end to end, where the run finished.
+		 * This is the machine's own memory rather than the sandbox's arena -
+		 * two runs that reach the same machine agree here byte for byte, which
+		 * the arena does not promise. */
+		std::string text;
+		for (int32_t b = 0; b < ce_session_bus_count(session); b++)
+		{
+			int64_t size = ce_session_bus_size(session, b);
+			text += ce_session_bus_name(session, b);
+			text += ' ';
+			uint64_t h = 1469598103934665603ull;
+			for (int64_t a = 0; a < size; a++)
+			{
+				h ^= (uint64_t)(uint8_t)ce_session_bus_peek(session, b, (int32_t)a);
+				h *= 1099511628211ull;
+			}
+			char line[64];
+			std::snprintf(line, sizeof line, "%016llx %lld\n", (unsigned long long)h, (long long)size);
+			text += line;
+		}
+		if (!writeWholeFile(finalBuses, reinterpret_cast<const uint8_t *>(text.data()), text.size()))
+		{
+			return fail(metaPath, "could not write " + finalBuses);
+		}
+	}
+
+	for (const auto &bd : finalBusDumps)
+	{
+		int32_t which = -1;
+		for (int32_t b = 0; b < ce_session_bus_count(session); b++)
+			if (bd.first == ce_session_bus_name(session, b)) { which = b; break; }
+		if (which < 0) return fail(metaPath, "no bus named " + bd.first);
+		int64_t size = ce_session_bus_size(session, which);
+		std::vector<uint8_t> bytes(static_cast<size_t>(size));
+		for (int64_t a = 0; a < size; a++)
+			bytes[static_cast<size_t>(a)] = (uint8_t)ce_session_bus_peek(session, which, (int32_t)a);
+		if (!writeWholeFile(bd.second, bytes.data(), bytes.size()))
+			return fail(metaPath, "could not write " + bd.second);
+	}
+
+	if (!finalStatePath.empty())
+	{
+		/* The whole machine where the run actually ended - after any seek and
+		 * replay, which is where --save-state cannot reach. */
+		uint64_t len = 0;
+		const uint8_t *p = ce_session_save_state(session, &len);
+		if (p == nullptr) return fail(metaPath, ce_session_last_error(session));
+		if (!writeWholeFile(finalStatePath, p, static_cast<size_t>(len)))
+		{
+			return fail(metaPath, "could not write " + finalStatePath);
+		}
+	}
+
+	if (!historyOut.empty())
+	{
+		const auto t0 = std::chrono::steady_clock::now();
+		if (historyOutLater)
+		{
+			/* queued, then waited for - exactly what a project save does */
+			if (ce_session_history_save_later(session, historyOut.c_str(), "chimera-run") != 0)
+			{
+				return fail(metaPath, std::string("history (queued): ") + ce_session_last_error(session));
+			}
+			if (ce_session_history_save_wait(session) != 0)
+			{
+				return fail(metaPath, std::string("history (wait): ") + ce_session_last_error(session));
+			}
+		}
+		else if (ce_session_history_save(session, historyOut.c_str(), "chimera-run") != 0)
+		{
+			return fail(metaPath, std::string("history: ") + ce_session_last_error(session));
+		}
+		std::fprintf(stderr, "chimera-run: history saved%s in %.1f ms\n",
+			historyOutLater ? " (queued, as a project save does)" : "",
+			std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
 	}
 
 	if (!metaPath.empty())

@@ -16,7 +16,11 @@
 
 #include "../source/sha1.hpp"
 
+#include "chimera/engine.h"
+
 #include <cassert>
+#include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -34,8 +38,60 @@ std::string hashWith(bool software, const std::vector<uint8_t> &data, size_t len
 
 } // namespace
 
+namespace {
+
+uint64_t g_lastDone = 0, g_lastTotal = 0;
+int g_reports = 0;
+void onProgress(const char *stage, uint64_t done, uint64_t total, void *)
+{
+	assert(stage != nullptr);
+	g_lastDone = done;
+	g_lastTotal = total;
+	g_reports++;
+}
+
+void testProgressOfAFileHash()
+{
+	/* a file bigger than the 4 MiB report interval, hashed with a sink installed:
+	 * the sink hears at least one report on the way and the last says done ==
+	 * total == the file's length; with no sink, nothing is heard */
+	const char *path = "progress-probe.bin";
+	{
+		FILE *f = fopen(path, "wb");
+		assert(f != nullptr);
+		std::vector<uint8_t> block(1 << 20, 0x5A);
+		for (int i = 0; i < 9; i++) assert(fwrite(block.data(), 1, block.size(), f) == block.size());
+		fclose(f);
+	}
+	char hex[41];
+	uint64_t len = 0;
+	ce_progress_set(&onProgress, nullptr);
+	assert(ce_sha1_file(path, hex, &len) == 1);
+	assert(len == 9u << 20);
+	assert(g_reports >= 2);
+	assert(g_lastDone == len && g_lastTotal == len);
+	ce_progress_set(nullptr, nullptr);
+	g_reports = 0;
+	/* the answer for a file already hashed comes from the cache, so rewrite it
+	 * to make the hash run again with nobody listening */
+	remove(path);
+	{
+		FILE *f = fopen(path, "wb");
+		std::vector<uint8_t> block(1 << 20, 0x3C);
+		for (int i = 0; i < 5; i++) assert(fwrite(block.data(), 1, block.size(), f) == block.size());
+		fclose(f);
+	}
+	assert(ce_sha1_file(path, hex, &len) == 1);
+	assert(g_reports == 0);
+	remove(path);
+	printf("progress: a file hash reports its way to the end\n");
+}
+
+} // namespace
+
 int main(void)
 {
+	testProgressOfAFileHash();
 	{ // the known answers, so that "they agree" cannot mean "both are wrong"
 		const std::string empty = chimera::sha1Hex(nullptr, 0);
 		assert(empty == "DA39A3EE5E6B4B0D3255BFEF95601890AFD80709");
@@ -87,6 +143,39 @@ int main(void)
 		// that is not: the staging block and the bulk path have to agree about
 		// where they left off
 		assert(hashWith(true, big, 1000) == hashWith(false, big, 1000));
+	}
+
+	{ // the file hash is the same hash. A firmware may be a disk image - bigger
+	  // than the frontend can hold - so its identity has to come from reading
+	  // it, and the two ways of taking it must not disagree about one byte.
+		std::vector<uint8_t> big(3 << 20);
+		uint32_t x = 987654321u;
+		for (size_t i = 0; i < big.size(); i++)
+		{
+			x = x * 1664525u + 1013904223u;
+			big[i] = static_cast<uint8_t>(x >> 24);
+		}
+		const std::string path = "test_sha1_file.bin"; // the test's own working directory
+		FILE *f = std::fopen(path.c_str(), "wb");
+		assert(f != nullptr);
+		assert(std::fwrite(big.data(), 1, big.size(), f) == big.size());
+		std::fclose(f);
+
+		char hex[41] = { 0 };
+		uint64_t len = 0;
+		assert(ce_sha1_file(path.c_str(), hex, &len) == 1);
+		assert(len == big.size());
+		assert(std::string(hex) == chimera::sha1Hex(big.data(), big.size()));
+
+		// and again, which the cache answers - the same digest, not a stale one
+		char hex2[41] = { 0 };
+		assert(ce_sha1_file(path.c_str(), hex2, nullptr) == 1);
+		assert(std::string(hex2) == std::string(hex));
+
+		std::remove(path.c_str());
+		// a file that is not there is not an identity: it says so rather than
+		// handing back a digest of nothing
+		assert(ce_sha1_file(path.c_str(), hex, &len) == 0);
 	}
 
 	std::printf("test_sha1: ok\n");
