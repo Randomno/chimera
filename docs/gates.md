@@ -1,15 +1,22 @@
-# Seven ways a gate goes green on a broken thing
+# Eight ways a green tick lies to you
 
-Every failure mode below is one that shipped here. None is hypothetical, and
-all seven were found on 2026-09-20, in a single day, across three different
-repositories. They are written down because they are a class of mistake rather
-than seven accidents, and because the cost of each was measured in months.
+Every failure mode below is one that shipped here. None is hypothetical. The
+first seven were found on 2026-09-20, in a single day, across three different
+repositories; they are ways a GATE goes green on a broken thing, and the cost
+of each was measured in months. They are written down because they are a class
+of mistake rather than seven accidents.
 
 A gate is a claim. When the claim is wrong, the damage is not that a bug
 reached a user - bugs reach users anyway. The damage is that the green tick
 said one would not, so nobody looked.
 
-Read this before writing a leg, and when a leg has never been seen to fail.
+The eighth arrived the next day and is the same disease one step downstream: a
+MEASUREMENT that lies while you are debugging what a gate caught. It costs days
+rather than months, and it is easier to fall for, because a measurement is not
+something anybody thinks to test.
+
+Read this before writing a leg, when a leg has never been seen to fail, and
+before believing a number that came out of a probe you wrote this morning.
 
 ## A. A leg that never runs, anywhere
 
@@ -73,10 +80,25 @@ The check inspects the thing at rest and never in the state where it breaks.
 > selected rows in every list were unreadable - light text on a light
 > selection. It only ever looked at UNSELECTED rows.
 
+> The theme round-trip test took a window Light - Dark - Light and compared it
+> against one that started Light. Both ends of that journey are Light whether
+> the middle worked or not, and the middle - a window wearing Light after being
+> born Dark - was the only state a user ever saw, because the frontend now
+> opens on Dark. Every test built its windows under Light, which is the one
+> starting state in which the bug cannot happen.
+
+> And a third time on the same control, which is what makes it a pattern rather
+> than three mistakes: after the normal row and the chosen row came the row
+> under the POINTER, drawn as a bar with nothing written on it. A control the
+> frontend draws itself has no toolkit underneath, so a state nobody enumerated
+> is not drawn wrong - it is not drawn.
+
 **What to do.** Enumerate the states the thing has - selected, focused, empty,
 disabled, mid-operation, at a boundary - and say which the leg covers. A leg
 that covers one state should say so in its own description, so the next person
-does not read it as covering all of them.
+does not read it as covering all of them. Where a thing has a starting state as
+well as an end state, the starting state is one of them: a check that only ever
+starts from the default has not been told what the default hides.
 
 ## E. A synthetic stand-in that does not behave like the real subject
 
@@ -94,10 +116,20 @@ uncatchable - not missed, uncatchable.
 > not always (issue #120). The gate is green and the guarantee it stands for is
 > unestablished for games.
 
+> Every frontend test runs on Mono under Xvfb. The people who use Chimera run
+> .NET Framework WinForms on Windows. That toolkit decides what an assignment
+> to `BackColor` does, whether a control repaints, and whether visual styles
+> override either - so 889 green tests said nothing at all about whether the
+> theme menu worked, which twice it did not.
+
 **What to do.** A synthetic subject is often the only lawful one - a gate
-cannot ship somebody's game. That is fine, but write down what it does NOT
-stand in for, in PLAN.md, next to the leg. The failure is not using a stand-in;
-it is forgetting that it is one.
+cannot ship somebody's game, and it cannot run Windows on a Linux runner. That
+is fine, but write down what it does NOT stand in for, in PLAN.md, next to the
+leg. The failure is not using a stand-in; it is forgetting that it is one. Then
+ask what the cheapest real-subject check would be: for the theme menu it was
+one program compiled against the frontend assemblies and run on the developer's
+own Windows box (`tests/ui/windows/live-theme-switch.sh`), which found the bug
+in a minute after two rounds of guessing at it.
 
 ## F. A timing or ordering assumption that makes the check vacuous
 
@@ -129,19 +161,88 @@ running it, and the PLAN.md says who and when.
 
 ---
 
+## H. The instrument changes the answer
+
+Everything above is about a check that lies. This one is about a MEASUREMENT
+that lies, and it costs whole days rather than whole months, because the wrong
+answer it gives is specific, confident and reproducible-looking.
+
+A heavy probe is not free. If it allocates, writes a file, or simply takes long
+enough inside a path the subject is sensitive to, the run you measured is not
+the run you were asking about - and the difference it reports is a difference
+your instrument made.
+
+> Chasing the Windows-only flycast divergence on 2026-09-21, the arena was
+> hashed from inside the fault handler after every fault - a gigabyte and a
+> half per fault, a thousand faults a frame. It named a guest heap page that
+> diverged at a precise moment, which was exactly the lead the investigation
+> wanted. Made cheap, the same comparison said only dead stack differed, twice.
+> Three readings were discarded in that session for the same reason: one said
+> memory diverged at syscall 1400 when a lighter build said 1654, and one
+> "differ" turned out to be two runs of the SAME configuration because a knob
+> lived in a file that had been reverted between builds.
+
+> Two more from the same hunt, a week later, both instruments that could not
+> see what they were pointed at. The first: to ask whether a store made with the
+> guest's stack pointer behaved differently from one made with the handler's,
+> the handler swapped `rsp` to the guest's value, stored, and let a data
+> breakpoint fire. Windows lays an exception's context record at a fixed
+> distance below the interrupted `rsp` - so the nested exception put its record
+> exactly where the outer exception's record already sat, and every reading
+> taken through it described a corrupted outer context. The "rule map" built on
+> that killed the guest with a wild read; the four numbers it had produced
+> before dying were void. A nested exception at the same stack pointer is not a
+> measurement, it is a second experiment overwriting the first.
+>
+> The second is quieter. To learn what an exception's delivery writes below
+> `rsp`, the handler filled the region with a marker on its way out and read it
+> back at the next exception's entry; the marker survived, and "delivery writes
+> nothing there" went into the record. What delivery actually does is put back
+> the bytes as they were at the previous exception's return - and the marker
+> WAS those bytes. An exit-write, entry-read census is structurally blind to a
+> restore-to-last-exit, and it hid the mechanism for two rounds. The reading
+> that saw it was a second thread watching the same words while the guest ran,
+> with nothing written from the handler at all: the guest's value appeared and
+> was then replaced. When the effect you are looking for might be "put back
+> what was there", the instrument must not be the thing that was there.
+
+**What to do.** Three habits, all cheap:
+
+- **Re-run every finding with the lightest instrument that can still see it.**
+  A result that survives only under the heavy probe is the probe's result.
+- **Run the instrument against itself.** Two runs of the SAME configuration,
+  diffed. If they disagree, the instrument is the subject; if they agree, you
+  have earned the right to compare two different configurations. This is B
+  pointed at the measurement rather than at the check.
+- **Say which build produced which number.** When a knob is added, reverted and
+  re-added across a session, a number carries the build it came from and not
+  the build you think it came from. Reverting a file silently removes a knob
+  that another file still reads, and the two configurations you believe you are
+  comparing become one.
+
+The tell is a finding that is *too good*: it lands exactly where the theory
+predicted, and it is the only place anything differs. Measure it again the
+cheap way before you believe it.
+
+---
+
 ## How they group
 
 A, C and G are checks that do not execute. B, D and F are checks that execute
-but cannot fail. E is a check on the wrong subject.
+but cannot fail. E is a check on the wrong subject. H is not a check at all -
+it is the measurement you reach for when a check has gone red and you are
+trying to find out why, and it is the one that wastes days rather than months.
 
-The two cheapest audits, by a wide margin:
+The three cheapest audits, by a wide margin:
 
 1. **G** - diff what CI runs against what the gate script contains. Reading
    only, and it tells you which legs are load-bearing.
 2. **B** - break the thing, watch the leg go red, revert. Minutes per leg, and
    it converts a belief into a fact.
+3. **H** - run the instrument twice on the same configuration before comparing
+   two. One extra run, and it tells you whether the number means anything.
 
-## The rule that covers all seven
+## The rule that covers all eight
 
 **A leg that has never been seen to fail is a leg that has not been tested.**
 

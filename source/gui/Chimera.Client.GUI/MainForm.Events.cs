@@ -429,6 +429,127 @@ namespace Chimera.Client.GUI
 			if (this.ShowDialogWithTempMute(form).IsOk()) AddOnScreenMessage("Message settings saved");
 		}
 
+		/// <summary>
+		/// Config &gt; Theme. Built every time it opens rather than once, because the
+		/// list is a folder's contents and the folder is the user's to change while
+		/// Chimera is running.
+		/// </summary>
+		private void ThemeSubMenu_DropDownOpened(object sender, EventArgs e)
+		{
+			ThemeSubMenu.DropDownItems.Clear();
+			foreach (var theme in ThemeLibrary.All)
+			{
+				ToolStripMenuItemEx item = new()
+				{
+					Checked = string.Equals(theme.Name, ThemeLibrary.Current.Name, StringComparison.OrdinalIgnoreCase),
+					Text = theme.Name,
+					ToolTipText = theme.Description,
+				};
+				var chosen = theme.Name;
+				item.Click += (_, _) => ChooseTheme(chosen);
+				ThemeSubMenu.DropDownItems.Add(item);
+			}
+
+			ThemeSubMenu.DropDownItems.Add(new ToolStripSeparator());
+
+			ToolStripMenuItemEx folder = new() { Text = "Open Themes Folder" };
+			folder.Click += (_, _) => OpenThemesFolder();
+			ThemeSubMenu.DropDownItems.Add(folder);
+
+			ToolStripMenuItemEx export = new() { Text = "Write a Copy to Edit..." };
+			export.Click += (_, _) => ExportCurrentTheme();
+			ThemeSubMenu.DropDownItems.Add(export);
+
+			ToolStripMenuItemEx reload = new() { Text = "Reload Themes" };
+			reload.Click += (_, _) =>
+			{
+				ThemeLibrary.Reload();
+				ThemeEngine.ApplyToOpenForms(ThemeLibrary.Current);
+				ReportThemeFailures();
+				AddOnScreenMessage($"{ThemeLibrary.All.Count} themes");
+			};
+			ThemeSubMenu.DropDownItems.Add(reload);
+
+			var failures = ThemeLibrary.Failures;
+			if (failures.Count is not 0)
+			{
+				ToolStripMenuItemEx bad = new() { Text = $"{failures.Count} theme file(s) would not load..." };
+				bad.SetItemForeRole(ThemeColorRole.AccentError);
+				bad.Click += (_, _) => ReportThemeFailures();
+				ThemeSubMenu.DropDownItems.Add(bad);
+			}
+		}
+
+		private void ChooseTheme(string name)
+		{
+			var theme = ThemeLibrary.Select(name);
+			Config.Theme = theme.Name;
+			ThemeEngine.ApplyToOpenForms(theme);
+			AddOnScreenMessage($"Theme: {theme.Name}");
+		}
+
+		private void ReportThemeFailures()
+		{
+			var failures = ThemeLibrary.Failures;
+			if (failures.Count is 0)
+			{
+				DialogController.ShowMessageBox("Every theme file in the folder loaded.", "Themes");
+				return;
+			}
+			DialogController.ShowMessageBox(
+				string.Join("\n\n", failures.Select(static f => f.Message)),
+				"These theme files were not loaded",
+				EMsgBoxIcon.Error);
+		}
+
+		private void OpenThemesFolder()
+		{
+			try
+			{
+				Directory.CreateDirectory(ThemeLibrary.ThemesDirectory);
+				Process.Start(new ProcessStartInfo(ThemeLibrary.ThemesDirectory) { UseShellExecute = true });
+			}
+			catch (Exception ex)
+			{
+				DialogController.ShowMessageBox($"Could not open {ThemeLibrary.ThemesDirectory}:\n{ex.Message}", "Themes", EMsgBoxIcon.Error);
+			}
+		}
+
+		/// <summary>
+		/// Writes the theme that is on into the themes folder as a file somebody can
+		/// edit - which is how a theme gets contributed without anybody having to
+		/// type ninety colour names from memory.
+		/// </summary>
+		private void ExportCurrentTheme()
+		{
+			var current = ThemeLibrary.Current;
+			// a copy is a theme in its own right, so it is given its own name here
+			// rather than by rewriting the file afterwards - and it does NOT inherit
+			// "desktop", because a theme somebody is about to give colours of its
+			// own has to have them painted
+			Theme theme = new(
+				name: $"{current.Name} copy",
+				description: current.Description,
+				author: current.Author,
+				isDark: current.IsDark,
+				followsDesktop: false,
+				origin: current.Origin,
+				colors: current.ToArray());
+			var path = Path.Combine(ThemeLibrary.ThemesDirectory, $"{theme.Name}{ThemeFile.Extension}");
+			try
+			{
+				Directory.CreateDirectory(ThemeLibrary.ThemesDirectory);
+				File.WriteAllText(path, ThemeFile.Write(theme));
+				DialogController.ShowMessageBox(
+					$"Written to:\n{path}\n\nEdit the colours, change the name inside it, then Config > Theme > Reload Themes.",
+					"Themes");
+			}
+			catch (Exception ex)
+			{
+				DialogController.ShowMessageBox($"Could not write {path}:\n{ex.Message}", "Themes", EMsgBoxIcon.Error);
+			}
+		}
+
 		private void PathsMenuItem_Click(object sender, EventArgs e)
 		{
 			using PathConfig form = new(
@@ -499,22 +620,26 @@ namespace Chimera.Client.GUI
 					};
 					return picker.ShowDialog(this) is DialogResult.OK ? picker.FileName.WithoutWslgMirror() : null;
 				},
-				pickFolder: () =>
+				pickFolder: (ref bool includeSubfolders) =>
 				{
 					using FolderBrowserEx picker = new()
 					{
 						Description = "Scan a folder for firmware files",
 						SelectedPath = Directory.Exists(firmwareFolder) ? firmwareFolder : "",
+						CheckBoxLabel = FolderBrowserEx.ScanSubfoldersLabel,
+						CheckBoxChecked = includeSubfolders,
 					};
-					return picker.ShowDialog(this) is DialogResult.OK ? picker.SelectedPath.WithoutWslgMirror() : null;
+					if (picker.ShowDialog(this) is not DialogResult.OK) return null;
+					includeSubfolders = picker.CheckBoxChecked;
+					return picker.SelectedPath.WithoutWslgMirror();
 				},
-				scanFolder: folder =>
+				scanFolder: (folder, includeSubfolders) =>
 				{
 					// every pinned declaration of every installed core, answered by hash
-					// from the folder and its subfolders; what is found is remembered
-					// where it lies
+					// from the folder and, unless the person said otherwise in the
+					// picker, what is under it; what is found is remembered where it lies
 					var packages = CorePackageDiscovery.ScanFor(Config);
-					var scanned = FirmwareLocator.BuildIndex([ ], ProjectFolderScan.Enumerate(folder).Take(ProjectFolderScan.MaxFiles));
+					var scanned = FirmwareLocator.BuildIndex([ ], ProjectFolderScan.Enumerate(folder, includeSubfolders).Take(ProjectFolderScan.MaxFiles));
 					foreach (var package in packages.Where(static p => p.Error is null))
 					{
 						foreach (var decl in FirmwareSurvey.DeclarationsOf(package.Path).Decls)

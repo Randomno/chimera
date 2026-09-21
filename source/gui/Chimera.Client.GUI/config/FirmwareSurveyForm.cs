@@ -46,8 +46,16 @@ namespace Chimera.Client.GUI
 		private readonly Func<IReadOnlyList<FirmwareSurveyGroup>> _survey;
 		private readonly Action<FirmwareSurveyRow, string?> _remember;
 		private readonly Func<string, string?> _pickFile;
-		private readonly Func<string?>? _pickFolder;
-		private readonly Action<string>? _scanFolder;
+		private readonly PickScanFolder? _pickFolder;
+		private readonly Action<string, bool>? _scanFolder;
+
+		/// <summary>
+		/// Whether Scan Folder walks below the folder it is given. Ticked, which is what this window always
+		/// did; the folder picker offers the choice where it can carry one, and this remembers the answer
+		/// between scans. Where it cannot (Mono's dialog, and the tree fallback) the scan runs on this value,
+		/// which is the behaviour the window had before the option existed.
+		/// </summary>
+		private bool _scanSubfolders = true;
 
 		private List<FirmwareSurveyGroup> _groups = new();
 		private List<FirmwareSurveyRow?> _rowOf = new(); // list index -> row, null for a "more" line
@@ -57,14 +65,14 @@ namespace Chimera.Client.GUI
 		/// <param name="survey">builds the rows from the packages present now (called on open and after every change)</param>
 		/// <param name="remember">remembers (or, for null, forgets) the file chosen for one declaration</param>
 		/// <param name="pickFile">shows a file picker titled for one row; the dialog belongs to the owner</param>
-		/// <param name="pickFolder">shows a folder picker for Scan Folder; null hides the button</param>
-		/// <param name="scanFolder">hashes a folder and remembers what it matched</param>
+		/// <param name="pickFolder">shows a folder picker for Scan Folder, carrying the sub-folders choice; null hides the button</param>
+		/// <param name="scanFolder">hashes a folder (below it too, when told to) and remembers what it matched</param>
 		public FirmwareSurveyForm(
 			Func<IReadOnlyList<FirmwareSurveyGroup>> survey,
 			Action<FirmwareSurveyRow, string?> remember,
 			Func<string, string?> pickFile,
-			Func<string?>? pickFolder = null,
-			Action<string>? scanFolder = null)
+			PickScanFolder? pickFolder = null,
+			Action<string, bool>? scanFolder = null)
 		{
 			_survey = survey;
 			_remember = remember;
@@ -152,26 +160,26 @@ namespace Chimera.Client.GUI
 			}
 			list.Images.Add(Draw(g =>
 			{
-				using Pen pen = new(Color.FromArgb(0, 140, 0), 2.4f);
+				using Pen pen = new(ThemeEngine.Color(ThemeColorRole.GlyphGood), 2.4f);
 				g.DrawLines(pen, new[] { new Point(3, 8), new Point(6, 12), new Point(13, 4) });
 			}));
 			list.Images.Add(Draw(g =>
 			{
-				using SolidBrush fill = new(Color.FromArgb(240, 173, 40));
+				using SolidBrush fill = new(ThemeEngine.Color(ThemeColorRole.GlyphWarning));
 				g.FillPolygon(fill, new[] { new Point(8, 1), new Point(15, 14), new Point(1, 14) });
-				using SolidBrush ink = new(Color.FromArgb(60, 40, 0));
+				using SolidBrush ink = new(ThemeEngine.Color(ThemeColorRole.GlyphWarningInk));
 				g.FillRectangle(ink, 7, 5, 2, 5);
 				g.FillRectangle(ink, 7, 11, 2, 2);
 			}));
 			list.Images.Add(Draw(g =>
 			{
-				using Pen pen = new(Color.FromArgb(190, 40, 40), 2.4f);
+				using Pen pen = new(ThemeEngine.Color(ThemeColorRole.GlyphError), 2.4f);
 				g.DrawLine(pen, 4, 4, 12, 12);
 				g.DrawLine(pen, 12, 4, 4, 12);
 			}));
 			list.Images.Add(Draw(g =>
 			{
-				using Pen pen = new(Color.FromArgb(150, 150, 150), 1.4f);
+				using Pen pen = new(ThemeEngine.Color(ThemeColorRole.GlyphNeutral), 1.4f);
 				g.DrawEllipse(pen, 3, 3, 10, 10);
 			}));
 			return list;
@@ -221,7 +229,7 @@ namespace Chimera.Client.GUI
 				_list.Groups.Add(lvg);
 				if (group.Rows.Count is 0)
 				{
-					ListViewItem none = new("", 3) { Group = lvg, ForeColor = SystemColors.GrayText };
+					ListViewItem none = new("", 3) { Group = lvg, ForeColor = ThemeEngine.Color(ThemeColorRole.DisabledText) };
 					none.SubItems.Add("(needs no firmware)");
 					_list.Items.Add(none);
 					_rowOf.Add(null);
@@ -248,10 +256,10 @@ namespace Chimera.Client.GUI
 						item.SubItems.Add(row.StatusText);
 						item.ForeColor = row.State switch
 						{
-							CoreFirmwareState.Good => Color.DarkGreen,
-							CoreFirmwareState.Unrecognised or CoreFirmwareState.Custom => Color.DarkGoldenrod,
-							CoreFirmwareState.Unreadable => Color.Firebrick,
-							_ => SystemColors.GrayText,
+							CoreFirmwareState.Good => ThemeEngine.Color(ThemeColorRole.AccentGood),
+							CoreFirmwareState.Unrecognised or CoreFirmwareState.Custom => ThemeEngine.Color(ThemeColorRole.AccentWarning),
+							CoreFirmwareState.Unreadable => ThemeEngine.Color(ThemeColorRole.AccentError),
+							_ => ThemeEngine.Color(ThemeColorRole.DisabledText),
 						};
 						if (ReferenceEquals(selected, row) || (selected is not null && SameRow(selected, row))) item.Selected = true;
 						_list.Items.Add(item);
@@ -259,7 +267,7 @@ namespace Chimera.Client.GUI
 					}
 					if (hidden > 0)
 					{
-						ListViewItem more = new("", 3) { Group = lvg, ForeColor = SystemColors.GrayText };
+						ListViewItem more = new("", 3) { Group = lvg, ForeColor = ThemeEngine.Color(ThemeColorRole.DisabledText) };
 						more.SubItems.Add($"… {hidden} more releases of {rows[0].Decl.DisplayName} not on hand; tick \"Show every release\" to see them");
 						_list.Items.Add(more);
 						_rowOf.Add(null);
@@ -321,12 +329,15 @@ namespace Chimera.Client.GUI
 
 		private void ScanFolder()
 		{
-			var folder = _pickFolder?.Invoke();
-			if (folder is null || _scanFolder is null) return;
+			if (_pickFolder is null || _scanFolder is null) return;
+			var recurse = _scanSubfolders;
+			var folder = _pickFolder(ref recurse);
+			if (folder is null) return;
+			_scanSubfolders = recurse;
 			UseWaitCursor = true;
 			try
 			{
-				_scanFolder(folder);
+				_scanFolder(folder, recurse);
 			}
 			finally
 			{

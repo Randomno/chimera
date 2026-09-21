@@ -1,6 +1,7 @@
 ﻿#nullable enable
 
 using System;
+using System.ComponentModel;
 using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
@@ -96,6 +97,9 @@ namespace Chimera.Client.GUI
 
 		// page 3
 		private readonly PropertyGrid _settingsGrid;
+		private readonly Panel _presetRow;
+		private readonly ComboBox _presets;
+		private readonly Button _applyPreset;
 		private WaterboxCoreSettings? _settings;
 		private WaterboxConfig? _cfg;
 
@@ -126,7 +130,15 @@ namespace Chimera.Client.GUI
 		private readonly ListView _firmwareList;
 		private readonly Button _firmwareSetButton;
 		private readonly Button _firmwareClearButton;
-		private readonly Func<string?>? _pickFirmwareFolder;
+
+		/// <summary>
+		/// Whether Scan Folder walks below the folder it is given; ticked. It is the page's memory of the
+		/// choice in every case, and is SHOWN only where the folder picker cannot carry the option itself
+		/// (see <see cref="FolderBrowserEx.CanShowCheckBox"/>) - on Windows the dialog asks, and two
+		/// controls for one setting would be worse than either.
+		/// </summary>
+		private readonly CheckBox _firmwareScanSubfolders;
+		private readonly PickScanFolder? _pickFirmwareFolder;
 		private List<FirmwareNeed> _firmwareNeeds = new();
 		private IReadOnlyList<FirmwareLocator.IndexedFile> _firmwareIndex = [ ];
 
@@ -136,6 +148,16 @@ namespace Chimera.Client.GUI
 			public CoreFirmwareDecl? Decl;
 			public string? ChosenPath; // for a pinned entry, set only when the hash matched exactly
 			public string? ChosenSha1; // the actual hash - equals the pin, or names an unpinned choice
+
+			/// <summary>
+			/// This file was picked BY HAND rather than found. It survives the
+			/// page being rebuilt, because the page is rebuilt every time
+			/// somebody steps back and forward again - and answering the same
+			/// Locate dialog after every trip through the wizard is not a
+			/// thing anybody should have to do. A change that makes the
+			/// requirement itself different drops it; see CarryHandPicked.
+			/// </summary>
+			public bool PickedByHand;
 
 			/// <summary>
 			/// A file was chosen - or the core said it can start without one
@@ -166,7 +188,7 @@ namespace Chimera.Client.GUI
 			Func<ProjectSlotDeclaration.Slot, string[]> pickFiles,
 			Func<string, string?>? pickFirmwareFile = null,
 			IReadOnlyList<string>? firmwareSearchDirs = null,
-			Func<string?>? pickFirmwareFolder = null,
+			PickScanFolder? pickFirmwareFolder = null,
 			Func<string, string, string?>? rememberedFirmwarePath = null,
 			Action<string, IReadOnlyDictionary<string, string>>? rememberFirmwareNow = null,
 			string? configPath = null,
@@ -269,10 +291,10 @@ namespace Chimera.Client.GUI
 			{
 				Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
 				AutoSize = false,
-				ForeColor = SystemColors.GrayText,
 				Location = Pt(110, 138),
 				Size = new(UIHelper.ScaleX(442), UIHelper.ScaleY(46)),
 			};
+			_rendererCaveat.SetForeRole(ThemeColorRole.DisabledText);
 			p1.Controls.Add(_rendererCaveat);
 			p1.Controls.Add(MakeIssuesNotice());
 			_core.SelectedIndexChanged += (_, _) => LoadChosenPackage();
@@ -294,6 +316,42 @@ namespace Chimera.Client.GUI
 			// ---- page 3: settings ------------------------------------------------
 			var p3 = _pages[2];
 			p3.Controls.Add(MakeHeading("Please specify the emulation configuration settings."));
+			// The preset row sits ABOVE the settings, because that is the order the
+			// decisions are made in: pick a machine somebody else has already got
+			// working, then adjust it. It is absent - not disabled, not empty -
+			// for a core that suggests nothing, so no core grows a dead control.
+			_presetRow = new Panel
+			{
+				Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
+				Location = Pt(8, 46),
+				Size = new(UIHelper.ScaleX(544), UIHelper.ScaleY(28)),
+				Visible = false,
+			};
+			var presetLabel = new Label
+			{
+				AutoSize = true,
+				Location = Pt(0, 6),
+				Text = "Preset:",
+			};
+			_presets = new ComboBox
+			{
+				Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
+				DropDownStyle = ComboBoxStyle.DropDownList,
+				Location = Pt(52, 2),
+				Size = new(UIHelper.ScaleX(414), UIHelper.ScaleY(23)),
+			};
+			_applyPreset = new Button
+			{
+				Anchor = AnchorStyles.Top | AnchorStyles.Right,
+				Location = Pt(472, 1),
+				Size = new(UIHelper.ScaleX(72), UIHelper.ScaleY(25)),
+				Text = "Apply",
+			};
+			_applyPreset.Click += (_, _) => ApplySelectedPreset();
+			_presetRow.Controls.Add(presetLabel);
+			_presetRow.Controls.Add(_presets);
+			_presetRow.Controls.Add(_applyPreset);
+			p3.Controls.Add(_presetRow);
 			_settingsGrid = new PropertyGrid
 			{
 				Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right,
@@ -341,7 +399,33 @@ namespace Chimera.Client.GUI
 			Button firmwareScanButton = new() { Anchor = AnchorStyles.Bottom | AnchorStyles.Left, AutoSize = true, Location = Pt(178, 344), Text = "Scan Folder..." };
 			firmwareScanButton.Click += (_, _) => ScanFirmwareFolder();
 			firmwareScanButton.Visible = pickFirmwareFolder is not null;
-			p4.Controls.AddRange([ _firmwareList, _firmwareSetButton, _firmwareClearButton, firmwareScanButton ]);
+			// Ticked, because that is what the scan always did and what somebody
+			// pointing at a firmware folder means. It exists so the behaviour is
+			// visible and so it can be turned OFF: a folder holding a whole
+			// collection takes a while, and stopping at the MaxFiles cap is a
+			// blunter way to end a scan than not descending in the first place.
+			//
+			// Where the folder picker can carry the option itself it is hidden,
+			// not removed: it is still where this page remembers the answer
+			// between scans, and it is what a person sets on a toolkit whose
+			// folder dialog has no room for a control of ours.
+			_firmwareScanSubfolders = new CheckBox
+			{
+				Anchor = AnchorStyles.Bottom | AnchorStyles.Left,
+				AutoSize = true,
+				Checked = true,
+				Text = FolderBrowserEx.ScanSubfoldersLabel,
+				Visible = pickFirmwareFolder is not null && !FolderBrowserEx.CanShowCheckBox,
+			};
+			// Centred on the button rather than placed at a guessed offset: a
+			// check box is shorter than a button, by an amount that depends on
+			// the font and the display's scaling, so any fixed y sits wrong
+			// somewhere. Asked of the controls themselves, it is right everywhere.
+			_firmwareScanSubfolders.Location = new Point(
+				firmwareScanButton.Left + firmwareScanButton.PreferredSize.Width + UIHelper.ScaleX(8),
+				firmwareScanButton.Top
+					+ ((firmwareScanButton.PreferredSize.Height - _firmwareScanSubfolders.PreferredSize.Height) / 2));
+			p4.Controls.AddRange([ _firmwareList, _firmwareSetButton, _firmwareClearButton, firmwareScanButton, _firmwareScanSubfolders ]);
 
 			// ---- page 5: the code the core compiles for this game -----------------
 			var p5 = _pages[4];
@@ -397,10 +481,10 @@ namespace Chimera.Client.GUI
 			{
 				Anchor = AnchorStyles.Bottom | AnchorStyles.Left,
 				AutoEllipsis = true,
-				ForeColor = Color.Firebrick,
 				Location = Pt(8, 386),
 				Size = new(UIHelper.ScaleX(360), UIHelper.ScaleY(16)),
 			};
+			_status.SetForeRole(ThemeColorRole.AccentError);
 			_backButton = MakeNavButton("< Back", GoBack);
 			_nextButton = MakeNavButton("Next >", Advance);
 			Button cancel = MakeNavButton("Cancel", CancelPressed);
@@ -442,12 +526,12 @@ namespace Chimera.Client.GUI
 			{
 				Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right,
 				AutoSize = false,
-				ForeColor = SystemColors.GrayText,
 				LinkBehavior = LinkBehavior.HoverUnderline,
 				Location = Pt(8, 352),
 				Size = new(UIHelper.ScaleX(544), UIHelper.ScaleY(20)),
 				Text = text,
 			};
+			notice.SetForeRole(ThemeColorRole.DisabledText);
 			notice.Links.Clear();
 			notice.Links.Add(text.IndexOf(IssuesUrl, StringComparison.Ordinal), IssuesUrl.Length, IssuesUrl);
 			notice.LinkClicked += static (_, e) => Util.OpenUrlExternal((string) e.Link.LinkData);
@@ -851,6 +935,66 @@ namespace Chimera.Client.GUI
 			ShowPage(0);
 		}
 
+		/// <summary>
+		/// How tall the current page's content wants to be, inside the page, or
+		/// -1 when this page cannot say. Only the two pages whose content is a
+		/// core's rather than the wizard's can outgrow the window: the file form,
+		/// which has a group per declared slot, and the settings grid, which has
+		/// a row per declared setting. A DOSBox-X project has enough of both to
+		/// need a taller window than a quickerNES one, and nobody should have to
+		/// drag the corner to find that out.
+		/// </summary>
+		private int ContentHeightForPage(int page)
+		{
+			if (page is 1 && _slotsHost is not null)
+			{
+				var bottom = 0;
+				foreach (Control child in _slotsHost.Controls) bottom = Math.Max(bottom, child.Bottom);
+				return bottom is 0 ? -1 : _slotsHost.Top + bottom + UIHelper.ScaleY(8);
+			}
+			if (page is 2 && _settingsGrid is not null)
+			{
+				var rows = _settingsGrid.SelectedObject is ICustomTypeDescriptor described
+					? described.GetProperties().Count
+					: 0;
+				if (rows is 0) return -1;
+				// The grid will not say how tall its contents are - it reports a
+				// PreferredSize of zero and exposes no scroll bar to ask - so the
+				// rows are counted and measured. The pitch is the font's height
+				// plus the cell's own padding; erring a little large costs a
+				// slightly taller window, erring small costs the scrolling this
+				// is here to remove.
+				var pitch = _settingsGrid.Font.Height + UIHelper.ScaleY(5);
+				var description = 0;
+				foreach (Control child in _settingsGrid.Controls)
+				{
+					if (child is TextBox) description = Math.Max(description, child.Height);
+				}
+				return _settingsGrid.Top + (rows * pitch) + description + UIHelper.ScaleY(12);
+			}
+			return -1;
+		}
+
+		/// <summary>
+		/// Grow the window so the page fits, never past what the screen holds and
+		/// never smaller than it already is. Only ever grows: stepping between a
+		/// long page and a short one must not make the window jump about, and a
+		/// size somebody has chosen by hand is theirs to keep.
+		/// </summary>
+		private void FitToContent()
+		{
+			var wanted = ContentHeightForPage(_page);
+			if (wanted <= 0) return;
+			var have = _pages[_page].Height;
+			if (wanted <= have) return;
+
+			var grow = wanted - have;
+			var room = Screen.FromControl(this).WorkingArea.Height - UIHelper.ScaleY(80);
+			var target = Math.Min(Height + grow, room);
+			if (target <= Height) return;
+			Height = target;
+		}
+
 		private void ShowPage(int page)
 		{
 			_page = Math.Max(0, Math.Min(_pages.Length - 1, page));
@@ -858,6 +1002,22 @@ namespace Chimera.Client.GUI
 			_backButton.Enabled = _page > 0;
 			_status.Text = "";
 			UpdateNavLabels();
+			FitToContent();
+		}
+
+		/// <summary>
+		/// Go back to a step because something is wrong with it, saying what.
+		/// ShowPage clears the status - it is moving to a fresh step and the last
+		/// step's complaint does not belong there - so a refusal that sets the
+		/// text and THEN calls ShowPage erases its own reason a line later. Every
+		/// create-time failure did exactly that, which is why they arrived as a
+		/// progress bar that flickered and a wizard that went backwards for no
+		/// stated reason.
+		/// </summary>
+		private void ShowPageBecause(int page, string why)
+		{
+			ShowPage(page);
+			_status.Text = why;
 		}
 
 		/// <summary>
@@ -1063,7 +1223,7 @@ namespace Chimera.Client.GUI
 		/// <summary>what the compile step lists right now, for tests: name, hash, present</summary>
 		public IReadOnlyList<(string Name, string Sha1, bool Present)> PrecompileEntries
 			=> _precompileList.Items.Cast<ListViewItem>()
-				.Select(i => (i.SubItems[0].Text, i.SubItems[1].Text, i.ForeColor == Color.ForestGreen))
+				.Select(i => (i.SubItems[0].Text, i.SubItems[1].Text, i.Tag is true))
 				.ToList();
 
 		private void BuildPrecompilePage()
@@ -1101,7 +1261,14 @@ namespace Chimera.Client.GUI
 		/// </summary>
 		private void AddPrecompileRow(string name, string sha1, bool present)
 		{
-			ListViewItem item = new(name) { ForeColor = present ? Color.ForestGreen : Color.Firebrick, ToolTipText = name };
+			// the flag is on the row, not read back out of its colour: the colour is
+			// the theme's to change, and counting greens would then count wrong
+			ListViewItem item = new(name)
+			{
+				ForeColor = ThemeEngine.Color(present ? ThemeColorRole.AccentReady : ThemeColorRole.AccentError),
+				Tag = present,
+				ToolTipText = name,
+			};
 			item.SubItems.Add(sha1);
 			item.SubItems.Add(present ? "Compiled" : "Missing");
 			_precompileList.Items.Add(item);
@@ -1133,7 +1300,7 @@ namespace Chimera.Client.GUI
 		private void UpdatePrecompileStatus()
 		{
 			var total = _precompileList.Items.Count;
-			var green = _precompileList.Items.Cast<ListViewItem>().Count(i => i.ForeColor == Color.ForestGreen);
+			var green = _precompileList.Items.Cast<ListViewItem>().Count(static i => i.Tag is true);
 			// While it runs, a row exists only once its module is compiled, so the
 			// total cannot come from the list - it comes from the sessions, and
 			// only once they have looked at the game. Until then there is nothing
@@ -1149,7 +1316,7 @@ namespace Chimera.Client.GUI
 					: green == total
 						? $"All {total} modules compiled."
 						: $"{total - green} of {total} modules are missing.";
-			_precompileStatus.ForeColor = !_precompiling && total is not 0 && green == total ? Color.ForestGreen : SystemColors.ControlText;
+			_precompileStatus.SetForeRole(!_precompiling && total is not 0 && green == total ? ThemeColorRole.AccentReady : ThemeColorRole.WindowText);
 			// Compile is offered exactly when there is compiling left to do
 			_precompileButton.Enabled = !_precompiling && !PrecompileSatisfied();
 			UpdateCreateEnabled();
@@ -1370,6 +1537,25 @@ namespace Chimera.Client.GUI
 			var index = Array.IndexOf(RendererOptions, name);
 			if (index >= 0) _renderer.SelectedIndex = index;
 		}
+
+		/// <summary>whether the preset selector is on screen at all - for tests</summary>
+		public bool PresetsAreOffered => _presetRow.Visible;
+
+		/// <summary>the presets on offer, as the selector labels them - for tests</summary>
+		public string[] PresetNames
+			=> _presets.Items.Cast<PresetChoice>().Select(static c => c.Decl.DisplayName).ToArray();
+
+		/// <summary>picks a preset by id as the dropdown would - for tests</summary>
+		internal void SelectPreset(string id)
+		{
+			for (var i = 0; i < _presets.Items.Count; i++)
+			{
+				if (((PresetChoice) _presets.Items[i]).Decl.Id == id) { _presets.SelectedIndex = i; return; }
+			}
+		}
+
+		/// <summary>presses Apply - for tests</summary>
+		internal void ApplyPreset() => ApplySelectedPreset();
 
 		/// <summary>the exposed settings, in order, for tests</summary>
 		public string[] ExposedSettingNames
@@ -1738,6 +1924,12 @@ namespace Chimera.Client.GUI
 		/// <summary>The page's live complaint line, for tests.</summary>
 		public string StatusText => _status.Text;
 
+		/// <summary>ShowPage, for the test that checks a clean arrival says nothing</summary>
+		public void ShowPageForTest(int page) => ShowPage(page);
+
+		/// <summary>ShowPageBecause, for the test that checks a refusal survives the page change</summary>
+		public void ShowPageBecauseForTest(int page, string why) => ShowPageBecause(page, why);
+
 		/// <summary>The canonical names in one slot, in order, for tests.</summary>
 		public string[] SlotFileNames(string slotId)
 			=> _slotLists.TryGetValue(slotId, out var list)
@@ -1793,6 +1985,7 @@ namespace Chimera.Client.GUI
 		private void RefreshExposedSettings()
 		{
 			if (_cfg is null || _settings is null) return;
+			RefreshPresets(); // the machine may have moved, and with it what is offered
 			var effective = WaterboxCore.EffectiveSettingsFor(_cfg, _settings);
 			var exposed = Chimera.Emulation.Common.Engine.EngineSettingsGate.Evaluate(
 				_cfg.RawSettingsJson,
@@ -1825,6 +2018,107 @@ namespace Chimera.Client.GUI
 			}
 			_settings.Declarations = declarations;
 			_settingsGrid.Refresh();
+		}
+
+		/// <summary>One preset, as the selector shows it.</summary>
+		private sealed class PresetChoice
+		{
+			public PresetChoice(WaterboxConfig.PresetDecl decl) => Decl = decl;
+
+			public WaterboxConfig.PresetDecl Decl { get; }
+
+			public override string ToString() => Decl.DisplayName;
+		}
+
+		/// <summary>
+		/// Offers the presets the chosen machine has, and nothing at all when it has
+		/// none: the row is hidden and the grid takes the space back, so a core that
+		/// suggests nothing shows no evidence that presets exist.
+		/// </summary>
+		private void RefreshPresets()
+		{
+			var machine = _cfg is null || _settings is null
+				? null
+				: _cfg.MachineFor(WaterboxCore.EffectiveSettingsFor(_cfg, _settings));
+			var offered = _cfg?.PresetsFor(machine) ?? [ ];
+			if (offered.Count is 0)
+			{
+				_presets.Items.Clear();
+				_presetRow.Visible = false;
+				PlaceSettingsGrid(withPresetRow: false);
+				return;
+			}
+			// Rebuild only when the OFFER changed - a machine change can happen while
+			// somebody is reading the list, and a selector that resets itself on every
+			// settings edit would be unusable.
+			var showing = _presets.Items.Cast<PresetChoice>().Select(static c => c.Decl.Id).ToList();
+			if (!showing.SequenceEqual(offered.Select(static p => p.Id)))
+			{
+				var keep = (_presets.SelectedItem as PresetChoice)?.Decl.Id;
+				_presets.BeginUpdate();
+				_presets.Items.Clear();
+				foreach (var decl in offered) _presets.Items.Add(new PresetChoice(decl));
+				_presets.EndUpdate();
+				var again = offered.ToList().FindIndex(p => p.Id == keep);
+				_presets.SelectedIndex = again >= 0 ? again : 0;
+			}
+			_presetRow.Visible = true;
+			PlaceSettingsGrid(withPresetRow: true);
+		}
+
+		/// <summary>Moves the grid down to make room for the preset row, or back up.</summary>
+		private void PlaceSettingsGrid(bool withPresetRow)
+		{
+			var top = UIHelper.ScaleY(withPresetRow ? 80 : 48);
+			if (_settingsGrid.Top == top) return;
+			var bottom = _settingsGrid.Bottom;
+			_settingsGrid.Top = top;
+			_settingsGrid.Height = Math.Max(bottom - top, UIHelper.ScaleY(48));
+		}
+
+		/// <summary>
+		/// Writes the chosen preset's values INTO the settings. Nothing about the
+		/// preset survives the click: what the project pins and the movie cites is
+		/// the values, which are now sitting in the grid where anyone can read them
+		/// and change any of them afterwards.
+		///
+		/// The machine and the renderer are asked on page one and are not a preset's
+		/// to move - changing the machine changes which files the project takes, and
+		/// this page is downstream of that decision.
+		/// </summary>
+		private void ApplySelectedPreset()
+		{
+			if (_cfg is null || _settings is null || _presets.SelectedItem is not PresetChoice chosen) return;
+			var values = chosen.Decl.Values;
+			if (values is null || values.Count is 0) return;
+
+			var effective = WaterboxCore.EffectiveSettingsFor(_cfg, _settings);
+			Dictionary<string, WaterboxConfig.SettingDecl> byName = new(StringComparer.Ordinal);
+			foreach (var decl in _cfg.SettingsFor(_cfg.MachineFor(effective)))
+			{
+				if (decl.Name is { Length: > 0 } name && !byName.ContainsKey(name)) byName[name] = decl;
+			}
+
+			var applied = 0;
+			List<string> ignored = [ ];
+			foreach (var pair in values)
+			{
+				if (pair.Key == RendererSetting || pair.Key == _cfg.MachineSetting) continue;
+				if (!byName.TryGetValue(pair.Key, out var decl)) { ignored.Add(pair.Key); continue; }
+				// through the declaration's own coercion, so a preset written by hand
+				// cannot put a string where the core declared a number
+				_settings.Values[pair.Key] = decl.Coerce(pair.Value);
+				applied++;
+			}
+
+			// a preset's values can gate further settings, so the exposed set is asked again
+			RefreshExposedSettings();
+			_settingsGrid.Refresh();
+			UpdateNavLabels();
+			_status.Text = ignored.Count is 0
+				? $"Applied \"{chosen.Decl.DisplayName}\": {applied} setting{(applied is 1 ? "" : "s")}."
+				: $"Applied \"{chosen.Decl.DisplayName}\": {applied} setting{(applied is 1 ? "" : "s")}; "
+					+ $"this machine has no setting named {string.Join(", ", ignored)}.";
 		}
 
 		/// <summary>Renders given firmware needs directly - the test and screenshot door.</summary>
@@ -1879,9 +2173,34 @@ namespace Chimera.Client.GUI
 			RenderFirmwareRows();
 		}
 
+		/// <summary>
+		/// What the user chose by hand last time this page was built, by id,
+		/// with enough of the requirement to tell whether it is still the same
+		/// requirement. The firmware page is rebuilt on every arrival, because
+		/// which firmware is needed depends on the settings and the files - so
+		/// without this, stepping back to fix one thing and forward again threw
+		/// away every Locate the person had answered.
+		///
+		/// The identity is the declared hash and the declared name: a
+		/// requirement whose pinned hash has changed is a different file, and
+		/// carrying the old answer over would quietly satisfy it with the wrong
+		/// one. A requirement that disappears takes its answer with it.
+		/// </summary>
+		private Dictionary<string, (string Path, string? Sha1, string? DeclSha1, string? DeclName)> HandPickedFirmware()
+		{
+			Dictionary<string, (string, string?, string?, string?)> kept = new();
+			foreach (var need in _firmwareNeeds)
+			{
+				if (!need.PickedByHand || need.ChosenPath is null) continue;
+				kept[need.Id] = (need.ChosenPath, need.ChosenSha1, need.Decl?.Sha1, need.Decl?.Name);
+			}
+			return kept;
+		}
+
 		private void BuildFirmwareNeeds(IReadOnlyList<(string Id, int Index)> needed)
 		{
 			var decls = _cfg?.Firmware ?? [ ];
+			var handPicked = HandPickedFirmware();
 			_firmwareNeeds = needed.Select(entry =>
 			{
 				FirmwareNeed need = new()
@@ -1915,6 +2234,20 @@ namespace Chimera.Client.GUI
 						need.ChosenSha1 = found.Sha1;
 					}
 				}
+
+				// A file the user picked by hand wins over anything found, and
+				// survives this rebuild - unless the requirement is no longer the
+				// same requirement, in which case the old answer is not an answer
+				// to the new question.
+				if (handPicked.TryGetValue(need.Id, out var prior)
+					&& prior.DeclSha1 == need.Decl?.Sha1
+					&& prior.DeclName == need.Decl?.Name
+					&& System.IO.File.Exists(prior.Path))
+				{
+					need.ChosenPath = prior.Path;
+					need.ChosenSha1 = prior.Sha1;
+					need.PickedByHand = true;
+				}
 				return need;
 			}).ToList();
 		}
@@ -1934,7 +2267,7 @@ namespace Chimera.Client.GUI
 				ListViewItem item = new(title)
 				{
 					ToolTipText = need.Decl?.Description ?? "",
-					ForeColor = need.Satisfied ? System.Drawing.Color.DarkGreen : System.Drawing.Color.Firebrick,
+					ForeColor = ThemeEngine.Color(need.Satisfied ? ThemeColorRole.AccentGood : ThemeColorRole.AccentError),
 				};
 				item.SubItems.Add(need.Decl?.Name ?? "");
 				item.SubItems.Add(string.IsNullOrEmpty(need.Decl?.Sha1) ? "(your own dump)" : need.Decl!.Sha1);
@@ -1972,6 +2305,10 @@ namespace Chimera.Client.GUI
 			var path = _pickFirmwareFile($"Locate {need.Decl?.DisplayName ?? need.Id}");
 			if (path is null) return;
 			ProvideFirmware(need.Id, path);
+			if (_firmwareNeeds.FirstOrDefault(n => n.Id == need.Id) is { } chosen)
+			{
+				chosen.PickedByHand = chosen.ChosenPath is not null;
+			}
 		}
 
 		/// <summary>
@@ -2012,20 +2349,27 @@ namespace Chimera.Client.GUI
 
 		/// <summary>
 		/// "My files are somewhere in here": scans a folder (subfolders
-		/// included) and fills every requirement it can. A hash-pinned
-		/// requirement takes only its exact file, any name; an unpinned one
-		/// takes the file bearing its declared name, hashed and recorded like
-		/// any hand-picked choice. What the user already chose is left alone.
+		/// included, unless the person said otherwise) and fills every
+		/// requirement it can. A hash-pinned requirement takes only its exact
+		/// file, any name; an unpinned one takes the file bearing its declared
+		/// name, hashed and recorded like any hand-picked choice. What the user
+		/// already chose is left alone.
 		/// </summary>
 		private void ScanFirmwareFolder()
 		{
-			var folder = _pickFirmwareFolder?.Invoke();
+			if (_pickFirmwareFolder is null) return;
+			// The check box holds the answer whether or not it is on show; the
+			// picker offers it, and hands back whatever the person settled on
+			// (unchanged, when that picker had nowhere to put it).
+			var recurse = _firmwareScanSubfolders?.Checked is not false;
+			var folder = _pickFirmwareFolder(ref recurse);
 			if (folder is null) return;
+			if (_firmwareScanSubfolders is not null) _firmwareScanSubfolders.Checked = recurse;
 			UseWaitCursor = true;
 			try
 			{
 				var found = Chimera.Client.Common.ProjectFolderScan
-					.Enumerate(folder)
+					.Enumerate(folder, recurse: recurse)
 					.Take(Chimera.Client.Common.ProjectFolderScan.MaxFiles)
 					.ToList();
 				// one hashed index answers every pinned requirement
@@ -2101,6 +2445,15 @@ namespace Chimera.Client.GUI
 		public string? ChosenFirmwarePath(string id)
 			=> _firmwareNeeds.FirstOrDefault(n => n.Id == id)?.ChosenPath;
 
+		/// <summary>presses Scan Folder, for tests</summary>
+		public void ScanFirmwareFolderForTest() => ScanFirmwareFolder();
+
+		/// <summary>the sub-folders answer this page holds, shown or not, for tests</summary>
+		public bool FirmwareScanSubfolders => _firmwareScanSubfolders?.Checked is not false;
+
+		/// <summary>whether the page shows a sub-folders box of its own (it does not where the picker carries one), for tests</summary>
+		public bool FirmwareScanSubfoldersVisible => _firmwareScanSubfolders?.Visible is true;
+
 		// ---- creation -------------------------------------------------------------
 
 		private void Create()
@@ -2141,9 +2494,8 @@ namespace Chimera.Client.GUI
 			}
 			catch (InvalidOperationException ex)
 			{
-				_status.Text = ex.Message;
 				project.Dispose();
-				ShowPage(1);
+				ShowPageBecause(1, ex.Message);
 				return;
 			}
 
@@ -2215,9 +2567,8 @@ namespace Chimera.Client.GUI
 			}
 			if (declarationJson is not null && project.Validate(declarationJson) is { } refusal)
 			{
-				_status.Text = refusal;
 				project.Dispose();
-				ShowPage(1);
+				ShowPageBecause(1, refusal);
 				return;
 			}
 

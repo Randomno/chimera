@@ -4031,3 +4031,288 @@ The corollary, learned the same week at the cost of a shipped regression:
 with its own commit body saying no disc on hand used the format, so the fix
 "waits for a game of sprites to prove it". A game of sprites arrived the next
 day and the fix was itself the bug.
+
+## The colours are data, and Light is the ones we had (user-decided, 2026-09-20)
+
+Issue #112: the bright white is a strain on the eyes, and the reporter, who
+does not write code, offered to contribute palettes. The decision was: do it
+everywhere rather than on a subset of windows, ship at least Light and Dark,
+and Light must be pixel-for-pixel what Chimera has today.
+
+The shape follows from the second half of that. If Light has to be today's
+palette, then today's palette has to be written down somewhere, and once it is
+written down there is no reason for it to be the only one. So a theme is one
+colour for every role the frontend paints with - `ThemeColorRole`, about ninety
+of them - and nothing else: a flat JSON object of role name to `#RRGGBB`, read
+from `Themes/` under the data directory, with Light and Dark compiled in as the
+same kind of file. A role that a theme does not answer is an error naming the
+role, not a default: a window that is dark except for one panel is worse to
+look at and much harder to report than one that is not dark at all. `basedOn`
+lets a contributor change five colours instead of ninety, and Config > Theme >
+Write a Copy to Edit hands them a complete file to start from.
+
+Light says `"system:ControlText"` where the code said `SystemColors.ControlText`,
+so it is the desktop's palette rather than a guess at it, and
+`LightThemeBaselineTests` carries the literals copied out of the code they used
+to live in and fails by name if `light.json` moves one.
+
+That was not enough on its own, and finding out why is the useful part. Every
+screenshot the UI tests take was compared pixel by pixel against the same
+window built from the commit before this work, and the first round differed on
+five of them - because assigning a colour is not free even when it is the same
+colour. A Button handed a BackColor stops using visual styles. A sunken 3D
+border redrawn is a line. A menu given a colour table built out of system
+colours stops going through the system renderer. A read-only text box given
+"the read-only background" stops being white, which WinForms never did. Same
+palette, different drawing, and "different" is the one thing Light must not be.
+
+So Light carries `"desktop": true`, and under a theme that says so the walk
+assigns nothing by control type at all: the roles the frontend declared by
+name, the controls that paint themselves, and otherwise the toolkit's own
+drawing untouched - which is also where the Mono beige fix goes back to living,
+in FormBase, exactly where it was. With that, every Light screenshot is
+byte-identical to the one from before the branch, and the property is a
+property of the code rather than of ninety hex values happening to be right.
+
+Applying it is explicit, because WinForms has none of this. One walk sets each
+control's colours from its type; the surfaces a BackColor does not reach are
+handled by name (tool strips through a renderer, DataGridView through its cell
+styles, ListView headers by owner-drawing them, LinkLabel through LinkColor);
+and a control that paints itself takes the theme through `IThemedControl`
+rather than being guessed at. The obligation is carried by the base class -
+every window derives from `ThemedForm`, which runs the walk on handle creation,
+and `ThemingContractTests` fails the build if one is added that does not. That
+is the part that was asked for explicitly: a window added later must be themed
+by existing, not by somebody remembering.
+
+Two rules fell out of doing it. A colour that MEANS something is declared as a
+role (`SetForeRole(ThemeColorRole.AccentError)`) rather than assigned, or the
+walk flattens it back to plain text on the next theme change - and the wizard
+was reading a colour back OUT as state, counting its green rows to say how many
+modules were compiled, which any theme would have broken. And a control made
+after the window opened has to be themed when it arrives: TAStudio's piano
+rolls are built when a project opens, and were the one white thing left on a
+dark window until the walk started hooking the containers it passes.
+
+The defect that came back from review is the one worth keeping: a list's
+chosen row was a beige bar with invisible writing on it, in a screenshot this
+work had itself produced, while every assertion about every control's colours
+passed. A ListView paints its selected row, its column headers and the strip
+past its last column out of the desktop's colours and answers no property
+about any of them - so a test that reads properties cannot see it, and a
+picture nobody looks at is not a witness. The lesson is the same one as the
+gate that went green over an empty game database: a test has to be asked
+whether it would notice.
+
+So the list is drawn here now, in Details view, away from the desktop's
+palette - and the strip past the last column, which no event is raised for and
+nothing can paint over, is removed by growing the last column to the edge. And
+the screenshots are inspected as they are taken, every run: no toolkit colour
+in a header band or behind a chosen row, and a chosen row's text must have
+contrast against what it is written on. Both checks were confirmed against the
+broken drawing before the fix went in, which is the only way to know a test
+bites. On top of that, every role that carries text is paired with the
+background it lands on and held to 3:1 - the accessibility floor - for every
+theme that is not the desktop's, because a contributed theme is ninety numbers
+somebody typed and two of them being the same shade is exactly the failure
+that is invisible on the page and obvious on the screen.
+
+Three follow-ups after Sergio tested the staged build (user-decided,
+2026-09-20). Dark is what a config being created now starts with; a config
+that already existed and had never chosen keeps Light, because changing
+somebody's colours under them on an update is a surprise and the theme is one
+click away either way. Twenty-one menu items had no icon and now have one,
+from one place, with the items that are better bare - anything that can be
+ticked, since the tick lives in the image margin; labels that are not
+commands; Exit - named as decisions rather than omissions. And the title bar,
+written up the round before as unreachable, is reachable: WinForms cannot
+colour it but Windows will, through one DwmSetWindowAttribute call, which
+ThemedForm makes on handle creation and on every theme change. That call
+cannot be exercised anywhere but Windows, so what the tests cover is that
+every window ASKS; whether Windows honours it was checked by hand on the
+Windows side of this box, build 22631, and photographed.
+
+The fourth thing that round taught is the one worth keeping. The Theme menu
+shipped dead - clicking it did nothing at all - while 873 tests were green,
+because a ToolStripMenuItem whose DropDownItems is empty never opens, so the
+handler that fills it never ran. Every one of those tests reached the theme
+engine directly; the only route a USER has to the feature was untested. That
+is the same class as the gate over an empty game database, in a new place: the
+mechanism was covered and the entry point was not. MenuContractTests now reads
+the Designer files and fails on any menu that fills itself when it opens and
+starts with nothing in it, which is the eleven that exist and the twelfth
+somebody writes.
+
+And the fourth report, which is the most instructive of the lot: on the staged
+build, choosing Light while wearing Dark changed the title bar and nothing
+else. The cause was the design decision two paragraphs up. "The desktop theme
+assigns nothing" is right for a window built under it and is exactly wrong for
+a window that is currently dark - there was nothing to put the colours back to,
+because nothing had ever recorded what they were. The title bar changed
+because it is not part of that mechanism at all: it is an unconditional call.
+
+So the first walk over a control now records everything the walk can change -
+colours, border style, visual-style flag, flat appearance, link colours, a
+property grid's six, a data grid's cell styles, a strip's renderer - and the
+desktop theme runs that record backwards. Two things surfaced while fixing it
+that are worth keeping. A ToolStrip handed the renderer it already holds keeps
+the render mode it was put back to, so renderers are made per application now
+rather than shared per theme; and a strip item's colour is the STRIP's until
+somebody sets one, so recording what an item reads back after the strip has
+gone dark records the dark colour - items are reset, not restored.
+
+The test that was green throughout checked that a repaint happened. It now
+checks what the window LOOKS like afterwards, against a window that started in
+that theme, in both directions. That is the third time on this branch that the
+check covered the mechanism and not the state a person actually lands in.
+
+Where a user already had a say, the theme yields to it. TAStudio's palette, the
+hex editor's six colours and the OSD's four follow the theme only while nobody
+has set them; a config from before themes holds the old light values, and those
+are read as "nobody set anything" so an old config follows the theme too.
+
+What no theme reaches, and it is worth being plain about: scroll bars, the tick
+inside a check box, the window's own title bar. Those are drawn by the desktop
+out of the desktop's colours and WinForms offers no way to ask for others. A
+dark Chimera has light scroll bars.
+
+## The sub-folders option belongs to the folder picker (user-decided, 2026-09-20)
+
+Three places in the frontend scan a folder somebody points at: the New Project
+wizard's firmware step, the Firmware Manager, and locating a project's files.
+All three walked sub-folders, which is what a person pointing at a firmware
+folder means and exactly wrong for one pointing at a collection - so the choice
+had to be offerable, and the day before it had appeared as a check box beside
+the wizard's Scan Folder button. One page out of three, with the other two left
+as they were and no reason but which page had been open at the time.
+
+The choice is not the page's. It belongs to the act of choosing a folder, and
+so it now lives in the picker: on Windows, a check button added to the shell's
+own common item dialog through IFileDialogCustomize. Every Scan Folder in the
+frontend gets it, including the two that never had it, and a fourth one written
+next year gets it without anybody remembering to add it.
+
+One delegate carries the answer both ways - the flag goes in as the state to
+open on and comes back as what the person settled on - because a picker that
+only returns a path cannot report a control it does not know about, and a
+picker that returns a pair forces every caller to care. The ref parameter is
+the shape that lets a caller which does not care pass a value it never reads.
+
+Three pickers cannot carry the control: Mono's dialog, the SHBrowseForFolder
+tree, and a Windows whose shell refuses the customisation interface. In all
+three the value comes back exactly as it went in, and that is written down as a
+rule rather than left to fall out of the code, because "unchanged" and "the
+person said no" are the same bits and only the contract tells them apart. So is
+the other case they share with a cancelled dialog: cancel never changes the
+remembered answer.
+
+The wizard's on-page box is hidden where the dialog carries the option, not
+deleted - it is still where that page remembers the answer between scans, and
+it is what a person on Mono actually sets. Exactly one of the two is ever
+visible; two controls for one setting reads as two settings.
+
+What this cost in testing is the point of it. The suite runs on Mono under
+Xvfb and the control is raw COM against a shell that is not there, so every
+Linux test stops at the delegate. Two of them would have been vacuous and are
+not. The check that a page shows a box exactly where the picker cannot carry
+one has two halves, and a test can only ever stand on one platform - so it
+tells FolderBrowserEx what to say about the platform instead of asking the one
+it is standing on, and asks both. And the vtable offsets, where a wrong slot
+calls some other method entirely, are answered by a harness on real Windows
+(tests/ui/windows/folder-picker-checkbox.sh) that finds the control among the
+dialog's child windows, clicks it, and checks what the caller gets back -
+including the cancel case, which is the one a person is most likely to hit and
+the one no Linux test can reach. Both new Linux legs were watched failing
+against a deliberately broken build before being believed. docs/folder-picker.md
+says plainly what the green run does and does not stand for.
+
+## The fault handler gives up its pointers, and never reports twice (chimera#127, 2026-09-21)
+
+A PS3 core died in the main menu of a game. Everything Chimera is built to do
+about that worked: the guest death was caught, the dialog came up naming the
+frame and offering the four ways out, the inputs were safe, the process was
+alive. Ninety-two seconds later the process was gone, and the crash note said
+`stack overflow` at an address in `msvcrt.dll`, with a stack of nothing but
+ntdll and `libminiboxhost.dll` repeating the same four frames fifty times over.
+
+Two faults, and the note named neither.
+
+`minibox-diag.log` had the shape, once it is recognised: one line reporting a
+perfectly ordinary fault in host code - a write the CLR raises and handles
+every day - and then fifteen hundred identical lines, all naming one
+instruction inside `libminiboxhost.dll` reading one address. Disassembling a
+mingw build of the same miniBox commit at the offset the crash note gives
+settles what that instruction is: the first load in `say_region`, reading
+`g_layout` - the pointer the fault handler uses to say which region of the
+guest an address landed in. It sits immediately after the `mb_diag` that
+printed the last line in the log, and after a null check that passed. So the
+handler read the layout, faulted, and Windows called the handler again FOR ITS
+OWN FAULT. A vectored exception handler has no depth limit and no second
+chance; it ends when the stack runs out.
+
+`g_layout` points inside the `mb_host`, and `mb_host_destroy` freed the host
+without taking it back - the same mistake that had already been found and fixed
+one field over, for `mb_guest_ctx`, whose comment two lines above says exactly
+why: a host that is gone must not be what the fault handlers read. On Linux a
+freed chunk usually still reads like itself and the report is merely wrong. On
+Windows it is really gone.
+
+The general rule the second fault leaves behind, which is the part worth
+keeping: **handling a fault may nest; REPORTING one may not.** The guest's own
+fault handler runs guest code, which can trip a clean page and fault again, and
+that must be served. But the report walks the layout, the block list, the bytes
+at `rip` and the guest's stack, and any of those can be the thing that is
+wrong - so a fault arriving while a report is running is now said once, in one
+sentence, and passed straight on. Saying more is exactly what just failed.
+
+Fixed in miniBox (`fix(tripguard): a destroyed machine is not what the fault
+handler reads`), with both legs watched failing first: a destroyed host gives
+its layout back (asserted at both ends, because a NULL that was never set would
+pass on its own), and a Windows-only child that points the layout at an address
+that is not there and counts what the handler managed to write - two lines
+guarded, 659 unguarded, which is the user's log reproduced.
+
+## Guest code keeps nothing below the stack pointer (user-decided, 2026-09-21)
+
+A SysV x86-64 leaf function may keep live values in the 128 bytes below `%rsp`
+- the red zone - because nothing on Linux writes there behind its back: a
+signal handler runs on its own stack. Windows delivers an exception onto the
+interrupted thread's own stack, which during guest execution IS the guest's
+stack, and in a guest process something in that delivery rewrites the bytes
+below `%rsp - 0x28` with their content as of the previous exception's return.
+A guest leaf interrupted by a dirty-page fault then reads back stale spills.
+
+That is not a hypothetical. It is why Flycast's `cpu=jit` produced a wrong
+Dreamcast on Windows whenever the greenzone was on: the CHD decompressor
+spilled its two limits below `%rsp`, a dirty-page fault landed in the middle
+of the routine, the reload came back as zeros, the hunk decode failed, and the
+emulated machine parted from its Linux twin at frame 137 and never came back.
+It was found by restoring those 128 bytes from inside the fault handler, which
+made the machine byte-identical to Linux, and by replaying the Windows bytes
+into the Linux guest, which made Linux diverge the same way.
+
+**The decision: every guest is built with no red zone.** Not per core - in the
+shared toolchain, in the `*cc1` entry of the musl-gcc specs that every core's
+guest compile passes through, in musl's own flags and libstdc++'s, and in the
+Rust guest's target spec, which is where LLVM is told. And it is enforced
+rather than remembered: `check-wbx.sh`, the guest-image check every core
+already runs, counts memory operands with a negative displacement from `%rsp`
+and requires zero, with a named allowlist that currently holds one symbol.
+
+The reason to enforce it rather than trust the flag is the shape of the bug.
+It does not announce itself: no crash, no diagnostic, no wrong pixel - a
+savestate that quietly stops matching, hundreds of frames after the fault that
+caused it, on one host only. A core added next year that finds its own way
+around the specs would reintroduce it silently, and the only thing standing in
+the way is a check that runs on the image rather than on the build recipe.
+
+Cost, measured before the decision was asked for: 1000 frames of the same game
+three times each, means 0.01 s apart on 55.6 s, inside either run's spread. A
+94 MB guest image grew 92 KB.
+
+What is deliberately still open: WHICH component performs the rewrite, and
+what enables it. Plain Windows processes keep the bytes, so do sandbox blocks
+with `%rsp` inside them, so does a thread given real TEB stack bounds, and so
+does one carrying the guest's FS base across the exception. The flag removes
+the exposure; it does not explain it. miniBox `docs/RED-ZONE.md` holds the
+measurements and names the two saved instrument patches for whoever resumes.
