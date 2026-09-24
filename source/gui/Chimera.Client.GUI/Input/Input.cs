@@ -1,5 +1,7 @@
 using System.Linq;
 using System.Collections.Generic;
+using System.Drawing;
+using System.Globalization;
 using System.Threading;
 using System.Windows.Forms;
 
@@ -27,6 +29,24 @@ namespace Chimera.Client.GUI
 		private readonly HashSet<Control> _wantingMouseFocus = new HashSet<Control>();
 		private bool _wantsMouse;
 		private Control/*?*/ _lastControl;
+		private Point _lastMousePos;
+
+		/// <summary>
+		/// Scale applied to fallback relative deltas only (see the XI junk
+		/// comment in UpdateThreadProc). Screen pixels with the OS
+		/// acceleration curve are hotter than the raw device counts XI
+		/// reports where it works; measured ~3x on WSLg (2026-09-24), so the
+		/// default is 0.3. Tunable via CHIMERA_MOUSE_SPEED_SCALE (0.1-4.0);
+		/// the XI path is never scaled.
+		/// </summary>
+		private static readonly float FallbackSpeedScale = GetFallbackSpeedScale();
+
+		private static float GetFallbackSpeedScale()
+		{
+			var s = Environment.GetEnvironmentVariable("CHIMERA_MOUSE_SPEED_SCALE");
+			if (float.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out var v) && v >= 0.1f && v <= 4.0f) return v;
+			return 0.3f;
+		}
 
 #pragma warning disable CA2211 // public field
 		public static Input Instance;
@@ -269,6 +289,10 @@ namespace Chimera.Client.GUI
 						HandleButton("WMouse 1", false, HostInputType.Mouse);
 						HandleButton("WMouse 2", false, HostInputType.Mouse);
 						EnqueueNewEvents(prohibitInput: !_wantsMouse); // if any unpress event were generated, process them even though they probably do nothing
+						// Resync the relative-motion fallback below, so the first
+						// poll after gaining focus doesn't report the whole
+						// unfocused interval as one leap.
+						_lastMousePos = Control.MousePosition;
 					}
 					_lastControl = activeForm;
 					_wantsMouse = newWantsMouse;
@@ -292,8 +316,26 @@ namespace Chimera.Client.GUI
 							_axisValues["WMouse Y"] = mousePos.Y;
 
 							// raw (relative) mouse input
-							_axisValues["RMouse X"] = mouseDeltaX + _axisValues.GetValueOrDefault("RMouse X");
-							_axisValues["RMouse Y"] = mouseDeltaY + _axisValues.GetValueOrDefault("RMouse Y");
+							// WSLg/XWayland reports absolute positions (or junk)
+							// through XI_RawMotion instead of deltas: thousands of px
+							// per 2ms poll, always positive (measured 4000-43000 on
+							// X and 400-6600 on Y, WSLg 2026-09-24). No real motion
+							// exceeds a couple thousand px in one poll. One broken
+							// XI event carries both valuators, so if EITHER axis is
+							// implausible the whole poll is junk: fall back to
+							// differencing absolute positions for BOTH axes (this
+							// also catches Y garbage hiding under the threshold
+							// next to huge X garbage). Differencing cancels any
+							// constant origin error for free, and plausible adapter
+							// values keep flowing untouched (no behavior change
+							// where XI works).
+							const int MaxPlausiblePollDelta = 2000;
+							bool pollJunk = Math.Abs(mouseDeltaX) > MaxPlausiblePollDelta || Math.Abs(mouseDeltaY) > MaxPlausiblePollDelta;
+							int relX = pollJunk ? (int)Math.Round((mousePos.X - _lastMousePos.X) * FallbackSpeedScale) : mouseDeltaX;
+							int relY = pollJunk ? (int)Math.Round((mousePos.Y - _lastMousePos.Y) * FallbackSpeedScale) : mouseDeltaY;
+							_lastMousePos = mousePos;
+							_axisValues["RMouse X"] = relX + _axisValues.GetValueOrDefault("RMouse X");
+							_axisValues["RMouse Y"] = relY + _axisValues.GetValueOrDefault("RMouse Y");
 						}
 					}
 

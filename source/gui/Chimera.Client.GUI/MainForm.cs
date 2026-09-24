@@ -904,13 +904,30 @@ namespace Chimera.Client.GUI
 				// translate mouse coordinates
 				// NOTE: these must go together, because in the case of screen rotation, X and Y are transformed together
 				{
-					var p = DisplayManager.UntransformPoint(new Point(
-						finalHostController.AxisValue("WMouse X"),
-						finalHostController.AxisValue("WMouse Y")));
+					// The RAW values must be read from the input source, not the
+					// coalescer: the translated result is written back into the
+					// same "WMouse X/Y" slots below, so reading those back next
+					// frame would re-normalize our own output.
+					// Pass SCREEN pixels straight to UntransformPoint: it does
+					// the window-relative conversion itself
+					// (GraphicsControlPointToClient), so converting here first
+					// subtracts the window origin twice and rails the axes
+					// whenever the window isn't at the screen origin (the WSLg
+					// pinned-cursor bug; Windows only worked because the window
+					// sat near (0,0)).
+					int rawX = 0, rawY = 0;
+					foreach (var f in Input.Instance.GetAxisValues())
+					{
+						if (f.Key == "WMouse X") rawX = f.Value;
+						else if (f.Key == "WMouse Y") rawY = f.Value;
+					}
+					var p = DisplayManager.UntransformPoint(new Point(rawX, rawY));
 					var x = p.X / (float)_currentVideoProvider.BufferWidth;
 					var y = p.Y / (float)_currentVideoProvider.BufferHeight;
-					finalHostController.AcceptNewAxis("WMouse X", (int)((x * 20000) - 10000));
-					finalHostController.AcceptNewAxis("WMouse Y", (int)((y * 20000) - 10000));
+					var normX = (int)((x * 20000) - 10000);
+					var normY = (int)((y * 20000) - 10000);
+					finalHostController.AcceptNewAxis("WMouse X", normX);
+					finalHostController.AcceptNewAxis("WMouse Y", normY);
 				}
 
 				InputManager.RunControllerChain(Config);
