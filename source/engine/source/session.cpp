@@ -1262,9 +1262,15 @@ ce_session *ce_session_open(
 
 	/* a multi-file game's additional mounts: rom2..romN, support files,
 	 * savedata, rom.name - the engine mounts names, the core gives them
-	 * meaning (the same division firmware uses) */
+	 * meaning (the same division firmware uses). A frontend also lists every
+	 * project file under its canonical name; when a core declares romFile as
+	 * that same name the primary file would be mounted twice. The rom was
+	 * already mounted under cfg.romFile above, so an extra that would
+	 * collide with it is the identical livestream - skip it rather than
+	 * fail the boot with a duplicate mount. */
 	for (int32_t i = 0; i < extra_count; i++)
 	{
+		if (extra_names[i] != nullptr && s->cfg.romFile == extra_names[i]) continue;
 		const char *path = extra_paths != nullptr ? extra_paths[i] : nullptr;
 		if (path != nullptr && path[0] != '\0')
 		{
